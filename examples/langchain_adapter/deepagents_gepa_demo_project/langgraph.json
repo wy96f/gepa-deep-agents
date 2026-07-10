@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "support_router": "./langgraph_agent.py:support_router"
+  }
+}

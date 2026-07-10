@@ -1,0 +1,24 @@
+[experiment]
+name = "credit-approval-expert-experience-demo"
+
+[agent]
+mode = "manual"
+project_root = "../deepagents_gepa_credit_approval_project"
+system_prompt = "You are a credit approval review assistant. Use the credit-risk-review skill and cite the risk methodology before making an approval judgment."
+memory = ["AGENTS.md"]
+skills = ["skills"]
+tools = ["./tools.py:lookup_policy", "./tools.py:record_review_note"]
+
+[surfaces.memory]
+kind = "file"
+path = "AGENTS.md"
+component = "memory:AGENTS.md"
+source_type = "memory"
+
+[surfaces.skills]
+kind = "skill_dir"
+path = "skills"
+
+[dataset]
+source = "golden_jsonl"
+path = "evals/expert_rubrics.jsonl"

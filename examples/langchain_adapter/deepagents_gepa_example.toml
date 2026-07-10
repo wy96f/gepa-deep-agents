@@ -1,0 +1,53 @@
+# Copy this file next to a Deep Agents project and adjust the paths/imports.
+
+[experiment]
+name = "deepagents-skill-self-optimization"
+
+[agent]
+# User-facing modes:
+# - manual: declare files/tools/subagents/MCP surfaces here.
+# - langgraph_cli: point at langgraph.json and a graph name; see deepagents_gepa_configs/langgraph_cli.toml.
+mode = "manual"
+project_root = "."
+system_prompt = "You are a domain agent. Use memory, skills, and tools before final answers."
+memory = ["AGENTS.md"]
+skills = ["skills"]
+tools = ["tools:lookup_company", "tools:search_filings"]
+
+[[agent.subagents]]
+name = "risk-reviewer"
+description = "Use for checking due-diligence risk claims and missing evidence."
+system_prompt = "You review risk evidence. Cite the skill/reference rule that supports each concern."
+tools = ["tools:search_filings"]
+skills = ["subagents/risk-reviewer/skills"]
+
+[surfaces.agents_memory]
+kind = "file"
+path = "AGENTS.md"
+component = "memory:AGENTS.md"
+source_type = "memory"
+
+[surfaces.main_skills]
+kind = "skill_dir"
+path = "skills"
+
+[surfaces.risk_reviewer_skills]
+kind = "skill_dir"
+path = "subagents/risk-reviewer/skills"
+owner = "risk-reviewer"
+
+[[mcp.servers]]
+name = "filing-search"
+transport = "stdio"
+command = "filing-search-mcp"
+
+[[mcp.tools]]
+name = "search_filing_risks"
+server = "filing-search"
+description = "Search filing excerpts for due-diligence risk evidence and source citations."
+
+[dataset]
+# Use golden_jsonl for curated eval, langfuse_experience for online expert-question mining,
+# or langfuse_labeled when traces have explicit scores/accepted outputs.
+source = "golden_jsonl"
+path = "evals/golden.jsonl"

@@ -1,0 +1,46 @@
+[experiment]
+name = "manual-deepagents-demo"
+
+[agent]
+mode = "manual"
+project_root = "../deepagents_gepa_demo_project"
+system_prompt = "You are a support router loaded from manual config."
+memory = ["AGENTS.md"]
+skills = ["skills"]
+tools = ["tools:tag_ticket"]
+
+[[agent.subagents]]
+name = "risk-reviewer"
+description = "Use to review ambiguous routing decisions before finalizing."
+system_prompt = "You review routing risk. Use lookup_policy and the risk-review skill."
+tools = ["tools:lookup_policy"]
+skills = ["subagents/risk-reviewer/skills"]
+
+[surfaces.memory]
+kind = "file"
+path = "AGENTS.md"
+component = "memory:AGENTS.md"
+source_type = "memory"
+
+[surfaces.skills]
+kind = "skill_dir"
+path = "skills"
+
+[surfaces.risk_reviewer_skills]
+kind = "skill_dir"
+path = "subagents/risk-reviewer/skills"
+owner = "risk-reviewer"
+
+[[mcp.servers]]
+name = "routing-risk"
+transport = "stdio"
+command = "python mcp/routing_risk_server.py"
+
+[[mcp.tools]]
+name = "search_routing_risks"
+server = "routing-risk"
+description = "Search routing risk notes for missing evidence and likely misroutes."
+
+[dataset]
+source = "golden_jsonl"
+path = "evals/golden.jsonl"

@@ -1,0 +1,12 @@
+{"input": "I need a copy of my invoice.", "expected": "billing", "rubric": "Money and invoice requests route to billing."}
+{"input": "I was charged twice this month and need a refund.", "expected": "billing", "rubric": "Charges, duplicate billing, and refund requests route to billing."}
+{"input": "Where can I download a receipt for last quarter?", "expected": "billing", "rubric": "Receipt and payment-document requests route to billing."}
+{"input": "I forgot my password and cannot login.", "expected": "account", "rubric": "Login and password issues route to account."}
+{"input": "My two-factor code is not arriving and I am locked out.", "expected": "account", "rubric": "Authentication and locked-account access issues route to account."}
+{"input": "Can you change the owner email on my workspace profile?", "expected": "account", "rubric": "Profile ownership and account identity changes route to account."}
+{"input": "The export button crashes with a 500 error.", "expected": "engineering", "rubric": "Crashes, bugs, and errors route to engineering."}
+{"input": "The dashboard stopped loading after today's release.", "expected": "engineering", "rubric": "Broken workflows and regressions route to engineering."}
+{"input": "The mobile app closes whenever I upload a PDF.", "expected": "engineering", "rubric": "Application crashes and upload failures route to engineering."}
+{"input": "Can you add a Notion integration to the roadmap?", "expected": "product", "rubric": "Feature and integration requests route to product unless they describe a broken workflow."}
+{"input": "We need a Salesforce integration next quarter.", "expected": "product", "rubric": "New integrations and roadmap requests route to product."}
+{"input": "Please support scheduled CSV exports in the product.", "expected": "product", "rubric": "Feature requests and product capability suggestions route to product."}

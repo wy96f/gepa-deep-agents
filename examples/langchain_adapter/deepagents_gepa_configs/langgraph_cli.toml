@@ -1,0 +1,22 @@
+[experiment]
+name = "langgraph-cli-auto-demo"
+
+[agent]
+mode = "langgraph_cli"
+project_root = "../deepagents_gepa_demo_project"
+langgraph_config = "langgraph.json"
+graph = "support_router"
+
+[[mcp.servers]]
+name = "routing-risk"
+transport = "stdio"
+command = "python mcp/routing_risk_server.py"
+
+[[mcp.tools]]
+name = "search_routing_risks"
+server = "routing-risk"
+description = "Search routing risk notes for missing evidence and likely misroutes."
+
+[dataset]
+source = "golden_jsonl"
+path = "evals/golden.jsonl"

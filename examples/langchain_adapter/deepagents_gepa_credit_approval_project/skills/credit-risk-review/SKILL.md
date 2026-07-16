@@ -11,10 +11,13 @@ Use this skill when drafting, checking, or improving a credit approval opinion.
 
 1. Identify the borrower, facility purpose, tenor, amount, source of repayment,
    collateral, guarantees, and requested approval conditions.
-2. Read the relevant reference files before making the risk judgment.
-3. Separate primary repayment capacity from secondary risk mitigants.
-4. Name the strongest approval risks and the evidence that supports them.
-5. Convert unresolved risk into explicit pre-disbursement conditions, covenants,
+2. If the user provides only a borrower name, use available tools to gather or
+   request borrower-specific evidence before judging risk.
+3. Read the relevant reference files before making the risk judgment.
+4. Separate primary repayment capacity from secondary risk mitigants.
+5. Name the strongest approval risks, the evidence that supports them, and the
+   transmission path from fact to repayment or enforceability pressure.
+6. Convert unresolved risk into explicit pre-disbursement conditions, covenants,
    monitoring triggers, or decline rationale.
 
 ## Failure Modes And Guardrails

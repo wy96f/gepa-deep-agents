@@ -183,7 +183,6 @@ class DefaultReflectionTemplateRegistry:
             "- Preserve the component's scope; do not paste unrelated skills, references, tool descriptions, or prompts.\n"
             "- Treat rejected proposal lessons, when present, as negative evidence: fix the failure pattern without copying rejected text.\n"
             "- Prefer reusable instructions, decision criteria, and guardrails over test-specific answers.\n"
-            "- Do not invent file paths, script names, tools, commands, APIs, or runtime capabilities that are not already present.\n"
             "- Keep names, paths, tool names, and output contracts consistent with the current component and feedback.\n"
             "- Respect size and growth constraints; remove duplication before adding new material."
         )
@@ -243,14 +242,14 @@ class DefaultReflectionTemplateRegistry:
         if key == "main:system_prompt":
             return (
                 "- Scope: identity, global policy, tool/skill usage strategy, and final output contract.\n"
-                "- Do not include YAML frontmatter, SKILL.md bodies, reference tables, skill-local file paths, script commands, or copied memory.\n"
+                "- Do not include YAML frontmatter, SKILL.md bodies, reference tables, or copied memory.\n"
                 "- Point the agent toward existing skills/references/tools instead of embedding their full content.\n"
                 "- Keep it short enough that the skill directory remains the source of task knowledge."
             )
         if key.startswith("memory:"):
             return (
                 "- Scope: durable project memory and stable operating preferences.\n"
-                "- Do not include YAML frontmatter, full SKILL.md content, reference files, skill-local file paths, tool descriptions, or subagent prompts.\n"
+                "- Do not include YAML frontmatter, full SKILL.md content, reference files, tool descriptions, or subagent prompts.\n"
                 "- Mention when to consult existing skills/tools; do not duplicate their implementation details."
             )
         if key.endswith(":SKILL.md"):

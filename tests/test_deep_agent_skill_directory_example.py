@@ -9,6 +9,7 @@ import pytest
 
 pytest.importorskip("langchain_core", reason="requires gepa[langchain] extra")
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import ToolMessage
 
 
 class ToolFriendlyFakeChatModel(FakeListChatModel):
@@ -42,6 +43,17 @@ def _load_analyzer_module():
 def _load_runner_module():
     path = Path(__file__).parents[1] / "examples" / "langchain_adapter" / "run_deepagents_gepa_local.py"
     spec = importlib.util.spec_from_file_location("run_deepagents_gepa_local", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_cleaner_module():
+    path = Path(__file__).parents[1] / "examples" / "langchain_adapter" / "clean_credit_risk_dataset.py"
+    spec = importlib.util.spec_from_file_location("clean_credit_risk_dataset", path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -381,32 +393,6 @@ def test_boundary_gate_blocks_bare_candidate_key_in_component_text(tmp_path):
     assert "- constraint_cap: 0.00" in feedback
 
 
-def test_boundary_gate_blocks_script_paths_outside_skill_definition(tmp_path):
-    example = _load_example_module()
-    seed_spec = example.create_seed_workspace(tmp_path)
-    candidate, surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
-    baseline_candidate = dict(candidate)
-    candidate["main:system_prompt"] = "Use route_hint.py whenever routing is ambiguous. Return <route> tags."
-
-    constraints = example.validate_candidate_constraints(candidate, baseline_candidate, surfaces)
-    failure = next(
-        constraint for constraint in constraints if constraint.name == "main:system_prompt:boundary:no_script_paths"
-    )
-    state = {
-        "messages": [example.AIMessage(content="<route>billing</route>")],
-        "baseline_response": "",
-        "candidate_excerpt": candidate,
-        "candidate_constraints": [constraint.__dict__ for constraint in constraints],
-    }
-
-    score, feedback = example.evaluate_response({"input": "I need my invoice.", "expected": "billing"}, state)
-
-    assert failure.passed is False
-    assert "route_hint.py" in failure.message
-    assert score == 0.0
-    assert "- constraint_cap: 0.00" in feedback
-
-
 def test_judge_prompt_treats_expected_as_authoritative(tmp_path):
     example = _load_example_module()
     seed_spec = example.create_seed_workspace(tmp_path)
@@ -430,6 +416,210 @@ def test_judge_prompt_treats_expected_as_authoritative(tmp_path):
     assert "Expected is not `rubric-only`, treat it as the authoritative target" in prompt
     assert "Operational troubleshooting advice instead of the expected label is a failure" in prompt
     assert "Expected: engineering" in prompt
+
+
+def test_judge_prompt_includes_expert_data_and_trace_expectations(tmp_path):
+    example = _load_example_module()
+    seed_spec = example.create_seed_workspace(tmp_path)
+    candidate, surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
+    constraints = example.validate_candidate_constraints(candidate, candidate, surfaces)
+    state = {
+        "messages": [
+            example.AIMessage(content="tool_calls=[{'name': 'lookup_policy', 'args': {'query': '钢铁 行业 周期'}}]"),
+            example.AIMessage(content="识别行业周期风险。"),
+        ],
+        "baseline_response": "",
+        "candidate_excerpt": candidate,
+        "candidate_constraints": [constraint.__dict__ for constraint in constraints],
+    }
+
+    prompt = example.build_judge_prompt(
+        {
+            "input": "华东钢铁集团有限公司",
+            "data": "七、项目风险点\n1、钢铁行业周期性风险",
+            "rubric": "评价相关数据获取和风险点覆盖。",
+            "metadata": {
+                "checkpoints": [{"label": "钢铁行业周期性风险", "keywords": ["行业周期"]}],
+                "trace_expectations": [{"label": "行业周期信息获取", "tool_intent_keywords": ["行业", "周期"]}],
+            },
+        },
+        state,
+        deterministic_score=0.5,
+        deterministic_feedback="partial",
+        failures=[],
+    )
+
+    assert "Expert evaluation data:" in prompt
+    assert "七、项目风险点" in prompt
+    assert "Trace expectations:" in prompt
+    assert "行业周期信息获取" in prompt
+
+
+def test_adaptive_trace_summary_uses_llm_only_after_budget(monkeypatch):
+    example = _load_example_module()
+    messages = [example.AIMessage(content=f"message {index} " + "x" * 100) for index in range(50)]
+    state = {"messages": messages}
+    summary_prompts = []
+
+    def summarizer(prompt):
+        summary_prompts.append(prompt)
+        return "模型生成的旧轨迹摘要"
+
+    monkeypatch.setenv("GEPA_CONTEXT_WINDOW_TOKENS", "200000")
+    monkeypatch.setenv("GEPA_TRACE_CONTEXT_RATIO", "0.12")
+    full_summary = example.summarize_messages(state, summarizer=summarizer)
+
+    assert "<trace_summary>" not in full_summary
+    assert "message 0" in full_summary
+    assert "message 49" in full_summary
+    assert summary_prompts == []
+
+    monkeypatch.setenv("GEPA_TRACE_MIN_CHARS", "300")
+    monkeypatch.setenv("GEPA_TRACE_MAX_CHARS", "300")
+    compressed = example.summarize_messages(state, summarizer=summarizer)
+
+    assert "<trace_summary>" in compressed
+    assert "模型生成的旧轨迹摘要" in compressed
+    assert "<recent_trace>" in compressed
+    assert summary_prompts
+    assert "message 0" in summary_prompts[0]
+    assert "...[message truncated]" not in summary_prompts[0]
+    assert "...[AI message compressed]" not in summary_prompts[0]
+
+
+def test_evaluation_trace_omits_file_mutation_noise_but_keeps_ai_messages():
+    example = _load_example_module()
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="先查询行业数据, 再整理结果。",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {"file_path": "report.md", "content": "very noisy draft"},
+                        "id": "write-1",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "lookup_company_risk",
+                        "args": {"company": "华东钢铁集团有限公司"},
+                        "id": "lookup-1",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            ToolMessage(content="write succeeded with a large patch", tool_call_id="write-1"),
+            ToolMessage(content="库存和债务数据", tool_call_id="lookup-1", name="lookup_company_risk"),
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "edit_file",
+                        "args": {"file_path": "report.md", "old": "a", "new": "b"},
+                        "id": "edit-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            example.AIMessage(content="最终识别出库存减值和短债压力。"),
+        ]
+    }
+
+    trace = example.summarize_messages(state, max_chars=20_000)
+
+    assert "先查询行业数据" in trace
+    assert "lookup_company_risk" in trace
+    assert '"company": "华东钢铁集团有限公司"' in trace
+    assert "库存和债务数据" in trace
+    assert "[no textual content]" in trace
+    assert "最终识别出库存减值和短债压力" in trace
+    assert "write_file" not in trace
+    assert "edit_file" not in trace
+    assert "very noisy draft" not in trace
+    assert "write succeeded" not in trace
+
+
+def test_trace_without_summarizer_is_not_character_truncated():
+    example = _load_example_module()
+    messages = [example.AIMessage(content=f"AI-{index} " + "x" * 300) for index in range(5)]
+
+    trace = example.summarize_messages({"messages": messages}, max_chars=600)
+
+    assert all(f"AI-{index}" in trace for index in range(5))
+    assert "message truncated" not in trace
+    assert "AI message compressed" not in trace
+    assert len(trace) > 600
+
+
+def test_prepared_trace_summary_is_cached_for_reflection_record():
+    example = _load_example_module()
+    state = {
+        "messages": [example.AIMessage(content=f"AI-{index} " + "x" * 300) for index in range(5)],
+        "fitness": {},
+    }
+    calls = []
+
+    def summarizer(prompt):
+        calls.append(prompt)
+        return "保留旧轨迹中的关键查询和风险结论。"
+
+    prepared = example.prepare_evaluation_trace(state, summarizer, max_chars=600)
+    record = example.reflective_record({"input": "测试企业"}, state, 0.5, "feedback")
+
+    assert state["evaluation_trace_mode"] == "llm_summary"
+    assert record["Recent trace"] == prepared
+    assert "保留旧轨迹中的关键查询和风险结论" in record["Recent trace"]
+    assert len(calls) == 1
+
+
+def test_trace_expectation_matching_uses_full_trace_not_tail_only():
+    example = _load_example_module()
+    state = {
+        "messages": [
+            example.AIMessage(content="早期工具结果: 已查询钢铁行业周期和库存减值压力。"),
+            *[example.AIMessage(content=f"后续普通消息 {index}") for index in range(40)],
+        ]
+    }
+    row = {
+        "metadata": {
+            "trace_expectations": [
+                {"label": "行业周期信息获取", "tool_intent_keywords": ["钢铁行业周期", "库存减值"]}
+            ]
+        }
+    }
+
+    matched, missing, coverage = example.trace_expectation_results(row, state)
+
+    assert matched == ["行业周期信息获取"]
+    assert missing == []
+    assert coverage == 1.0
+
+
+def test_data_acquisition_diagnostics_distinguishes_missing_tool_from_skipped_tool():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "trace_expectations": [
+                {"label": "环保安监信息获取", "tool_intent_keywords": ["环保", "安全生产"]},
+                {"label": "债务结构信息获取", "tool_intent_keywords": ["负债", "借款"]},
+            ]
+        }
+    }
+    state = {
+        "messages": [example.AIMessage(content="只输出了结论, 没有调用工具。")],
+        "available_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_debt",
+                "description": "查询企业负债、借款、票据和融资结构。",
+            }
+        ],
+    }
+
+    diagnostics = example.data_acquisition_diagnostics(row, state)
+
+    assert diagnostics["tool_supported_missing_expectations"] == ["债务结构信息获取"]
+    assert diagnostics["tool_capability_gaps"] == ["环保安监信息获取"]
 
 
 def test_reflection_judge_score_is_capped_when_expected_route_is_missing(tmp_path):
@@ -464,6 +654,76 @@ def test_reflection_judge_score_is_capped_when_expected_route_is_missing(tmp_pat
     assert "- judge_score: 0.95" in feedback
     assert "- correctness_cap: 0.40" in feedback
     assert "- final_cap: 0.40" in feedback
+
+
+def test_reflection_judge_score_is_capped_by_missing_rubric_checkpoints(tmp_path):
+    example = _load_example_module()
+    seed_spec = example.create_seed_workspace(tmp_path)
+    candidate, surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
+    constraints = example.validate_candidate_constraints(candidate, candidate, surfaces)
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="该企业现金回款弱化, 放款前需要核验应收账款账龄。"
+            )
+        ],
+        "baseline_response": "Generic approval review.",
+        "candidate_excerpt": candidate,
+        "candidate_constraints": [constraint.__dict__ for constraint in constraints],
+    }
+    rubric_example = {
+        "input": "企业存在负经营现金流、关联方应收款和自评抵押物。",
+        "rubric": "审批专家意见: 覆盖现金回款、关联方应收可回收性和抵押物独立评估。",
+        "metadata": {
+            "checkpoints": [
+                {"label": "现金回款弱化", "keywords": ["现金回款弱化", "负经营现金流"]},
+                {"label": "关联方应收可回收性", "keywords": ["关联方应收", "可回收性"]},
+                {"label": "抵押物独立评估", "keywords": ["独立评估", "第三方评估"]},
+            ]
+        },
+    }
+
+    score, feedback = example.evaluate_response_with_judge(
+        rubric_example,
+        state,
+        lambda _prompt: json.dumps(
+            {
+                "score": 1.0,
+                "failure_classification": "NO_FAILURE",
+                "classification_reason": "looks strong",
+                "suggested_component": "skill:support-router:SKILL.md",
+                "suggested_component_reason": "n/a",
+                "feedback": "n/a",
+                "boundary_assessment": "ok",
+            }
+        ),
+    )
+
+    assert score == 0.45
+    assert "- rubric_cap: 0.45" in feedback
+    assert "- rubric_coverage: 0.33" in feedback
+    assert "- failure_classification: SKILL_DEFECT" in feedback
+    assert "关联方应收可回收性" in feedback
+    assert "抵押物独立评估" in feedback
+
+
+def test_rubric_checkpoint_matching_supports_chinese_keywords():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "checkpoints": [
+                {"label": "现金回款弱化", "keywords": ["经营性现金流连续两年为负", "现金回款弱化"]},
+                {"label": "动产抵押顺位核查", "keywords": ["动产抵押", "抵押顺位"]},
+            ]
+        }
+    }
+    response = "该企业经营性现金流连续两年为负, 且新增动产抵押, 需核查抵押顺位。"
+
+    matched, missing, coverage = example.rubric_checkpoint_results(row, response)
+
+    assert matched == ["现金回款弱化", "动产抵押顺位核查"]
+    assert missing == []
+    assert coverage == 1.0
 
 
 def test_growth_limit_is_advisory_not_hard_gate(tmp_path):
@@ -670,6 +930,33 @@ def test_run_analyzer_counts_missing_proposal_rationale(tmp_path):
     assert any("missing rationale" in note for note in summary["diagnosis"])
 
 
+def test_run_analyzer_handles_windows_style_proposal_dirs(tmp_path):
+    analyzer = _load_analyzer_module()
+    run_dir = tmp_path / "run"
+    (run_dir / "agent_logs").mkdir(parents=True)
+    (run_dir / "proposals" / "0001").mkdir(parents=True)
+    (run_dir / "rejected_proposals").mkdir(parents=True)
+    (run_dir / "result_summary.json").write_text(
+        json.dumps({"best_val_score": 1.0, "val_aggregate_scores": [0.5, 1.0]}),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_logs" / "rollouts.jsonl").write_text("", encoding="utf-8")
+    (run_dir / "proposals" / "0001" / "proposal_rationale.json").write_text(
+        json.dumps({"main:system_prompt": "Proposal rationale: ..."}),
+        encoding="utf-8",
+    )
+    (run_dir / "proposals" / "0001" / "diff_against_parent.patch").write_text("diff", encoding="utf-8")
+    (run_dir / "proposals" / "index.jsonl").write_text(
+        json.dumps({"status": "accepted", "proposal_dir": "proposals\\0001"}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = analyzer.summarize_run(run_dir)
+
+    assert summary["proposal_rationale_files"] == 1
+    assert summary["proposal_diff_files"] == 1
+
+
 def test_local_runner_forces_no_proxy_for_localhost(monkeypatch):
     runner = _load_runner_module()
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
@@ -832,7 +1119,7 @@ def test_repository_toml_examples_load_and_run(config_name, tmp_path):
         assert not hasattr(graph, "gepa_deep_agent_spec")
 
 
-def test_credit_approval_demo_loads_rubric_only_expert_dataset():
+def test_credit_approval_demo_loads_expert_risk_section_dataset():
     example = _load_example_module()
     config_path = (
         Path(__file__).parents[1]
@@ -854,8 +1141,15 @@ def test_credit_approval_demo_loads_rubric_only_expert_dataset():
     assert "skill:credit-risk-review:reference/collateral_and_guarantee.md" in project.candidate
     assert "skill:credit-risk-review:reference/industry_management_and_warnings.md" in project.candidate
     assert all("rubric" in row for row in rows)
+    assert all("data" in row for row in rows)
     assert all("answer" not in row and "expected" not in row for row in rows)
-    assert all("Expert risk opinion" in row["rubric"] for row in rows)
+    assert all("项目风险点" in row["data"] for row in rows)
+    assert all("自主检索" in row["rubric"] for row in rows)
+    assert len(rows) >= 8
+    assert all(row["metadata"].get("checkpoints") for row in rows)
+    assert all(row["metadata"].get("trace_expectations") for row in rows)
+    assert any(row["metadata"].get("scenario") == "钢铁集团授信_项目风险点对齐" for row in rows)
+    assert any(row["input"] == "华东钢铁集团有限公司" for row in rows)
 
 
 def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
@@ -941,7 +1235,13 @@ def test_golden_dataset_supports_rubric_without_expected(tmp_path):
     dataset_path.write_text(
         "\n".join(
             [
-                json.dumps({"input": "Check whether a receipt issue is billing.", "rubric": "Must route money issues."}),
+                json.dumps(
+                    {
+                        "input": "Check whether a receipt issue is billing.",
+                        "data": "Evaluator-only expert material.",
+                        "rubric": "Must route money issues.",
+                    }
+                ),
                 json.dumps({"input": "Reset my password.", "expected": "account", "metadata": {"topic": "auth"}}),
             ]
         ),
@@ -954,9 +1254,81 @@ def test_golden_dataset_supports_rubric_without_expected(tmp_path):
     rows = [record.as_example() for record in example.load_golden_jsonl(config)]
 
     assert rows[0]["rubric"] == "Must route money issues."
+    assert rows[0]["data"] == "Evaluator-only expert material."
     assert "answer" not in rows[0]
     assert rows[1]["answer"] == "account"
     assert rows[1]["metadata"]["topic"] == "auth"
+
+
+def test_golden_dataset_supports_evaluator_only_data_path(tmp_path):
+    example = _load_example_module()
+    project_root = tmp_path / "project"
+    eval_dir = project_root / "evals"
+    eval_dir.mkdir(parents=True)
+    data_path = eval_dir / "risk_section.md"
+    data_path.write_text("七、项目风险点\n1、行业周期性风险\n需要关注库存减值。", encoding="utf-8")
+    dataset_path = eval_dir / "golden.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "input": "华东钢铁集团有限公司",
+                "data_path": "risk_section.md",
+                "rubric": "评价风险点覆盖。",
+                "metadata": {
+                    "trace_expectations": [
+                        {"label": "行业周期信息获取", "tool_intent_keywords": ["行业", "库存"]}
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "deepagents_gepa.toml"
+    _write_config(config_path, project_root, dataset_path)
+
+    config = example.load_deepagents_gepa_config(config_path)
+    row = example.load_golden_jsonl(config)[0].as_example()
+    messages = example.messages_for_example(row)
+
+    assert row["data"].startswith("七、项目风险点")
+    assert row["metadata"]["data_path"] == "risk_section.md"
+    assert messages[0].content == "华东钢铁集团有限公司"
+    assert "项目风险点" not in messages[0].content
+
+
+def test_credit_risk_cleaner_extracts_project_risk_section(tmp_path):
+    cleaner = _load_cleaner_module()
+    source = tmp_path / "华东钢铁集团有限公司风险评价意见书.txt"
+    source.write_text(
+        "\n".join(
+            [
+                "六、项目情况",
+                "企业主营钢铁冶炼加工。",
+                "七、项目风险点",
+                "1、钢铁行业周期性风险",
+                "钢材和铁矿石价格波动, 库存减值压力持续存在。",
+                "2、债务结构压力风险",
+                "短期借款和应付票据规模较大, 财务费用侵蚀利润。",
+                "八、风险评价人意见",
+                "同意提交审议。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cleaned = cleaner.clean_one_file(source)
+
+    assert cleaned is not None
+    assert cleaned.company_name == "华东钢铁集团有限公司"
+    assert cleaned.section_title == "项目风险点"
+    assert "钢铁行业周期性风险" in cleaned.section_text
+    assert "风险评价人意见" not in cleaned.section_text
+    assert [item["label"] for item in cleaned.metadata["checkpoints"]] == [
+        "钢铁行业周期性风险",
+        "债务结构压力风险",
+    ]
+    assert any(item["label"] == "行业周期信息获取" for item in cleaned.metadata["trace_expectations"])
 
 
 def test_langfuse_experience_mines_user_questions_without_trusting_final_answer(tmp_path):

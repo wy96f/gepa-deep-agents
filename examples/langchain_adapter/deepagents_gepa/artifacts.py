@@ -75,6 +75,10 @@ def _state_summary(state: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_constraints": state.get("candidate_constraints", []),
         "candidate_metrics": state.get("candidate_metrics", {}),
         "fitness": state.get("fitness", {}),
+        "available_tools": state.get("available_tools", []),
+        "trace_context_window_tokens": state.get("trace_context_window_tokens"),
+        "trace_context_ratio": state.get("trace_context_ratio"),
+        "evaluation_trace_mode": state.get("evaluation_trace_mode"),
     }
 
 
@@ -344,6 +348,8 @@ class RunArtifactStore:
             "baseline_preview": str(record["baseline_response"])[:500],
             "feedback_preview": feedback[:500],
             "fitness": record["fitness"],
+            "tool_capability_gaps": record["fitness"].get("tool_capability_gaps", []),
+            "tool_supported_missing_expectations": record["fitness"].get("tool_supported_missing_expectations", []),
             "error": record["state"]["error"],
             "detail_file": f"rollouts/{index:06d}.json",
         }

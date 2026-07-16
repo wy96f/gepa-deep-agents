@@ -61,6 +61,21 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         and not constraint.get("passed", True)
         and ":boundary:" in str(constraint.get("name", ""))
     )
+    tool_capability_gaps = Counter(
+        gap
+        for detail in rollout_details
+        for gap in detail.get("fitness", {}).get("tool_capability_gaps", [])
+    )
+    missed_supported_expectations = Counter(
+        gap
+        for detail in rollout_details
+        for gap in detail.get("fitness", {}).get("tool_supported_missing_expectations", [])
+    )
+    missing_trace_expectations = Counter(
+        gap
+        for detail in rollout_details
+        for gap in detail.get("fitness", {}).get("missing_trace_expectations", [])
+    )
     proposal_statuses = Counter(str(row.get("status", "unknown")) for row in proposals)
     proposed_components = Counter(
         component
@@ -103,6 +118,9 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "rollout_score_max": max(scores) if scores else None,
         "runtime_errors": dict(errors),
         "boundary_failures": dict(boundary_failures.most_common()),
+        "tool_capability_gaps": dict(tool_capability_gaps.most_common()),
+        "missed_supported_expectations": dict(missed_supported_expectations.most_common()),
+        "missing_trace_expectations": dict(missing_trace_expectations.most_common()),
         "proposal_statuses": dict(proposal_statuses),
         "proposed_components": dict(proposed_components.most_common()),
         "rejected_components": dict(rejected_components.most_common()),
@@ -117,6 +135,8 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             proposed_components=proposed_components,
             failure_classes=failure_classes,
             boundary_failures=boundary_failures,
+            tool_capability_gaps=tool_capability_gaps,
+            missed_supported_expectations=missed_supported_expectations,
             proposal_artifacts=proposal_artifacts,
         ),
     }
@@ -130,6 +150,8 @@ def diagnose(
     proposed_components: Counter[str],
     failure_classes: Counter[str],
     boundary_failures: Counter[str],
+    tool_capability_gaps: Counter[str],
+    missed_supported_expectations: Counter[str],
     proposal_artifacts: dict[str, int],
 ) -> list[str]:
     notes: list[str] = []
@@ -156,6 +178,18 @@ def diagnose(
     if boundary_failures:
         dominant_gate, count = boundary_failures.most_common(1)[0]
         notes.append(f"Boundary gate failures observed: {dominant_gate} ({count}).")
+    if tool_capability_gaps:
+        dominant_gap, count = tool_capability_gaps.most_common(1)[0]
+        notes.append(
+            f"External tool capability gap likely blocks improvement: {dominant_gap} ({count}). "
+            "Implement or connect a tool for this data source before expecting GEPA text edits to fix it."
+        )
+    if missed_supported_expectations:
+        dominant_miss, count = missed_supported_expectations.most_common(1)[0]
+        notes.append(
+            f"Agent skipped an apparently available data-acquisition path: {dominant_miss} ({count}); "
+            "optimize skill/prompt/tool descriptions to call the existing tool more reliably."
+        )
     if proposed_components:
         dominant_component, count = proposed_components.most_common(1)[0]
         notes.append(f"Most frequently selected component: {dominant_component} ({count}).")
@@ -189,9 +223,11 @@ def proposal_artifact_counts(
     proposals: list[dict[str, Any]],
     rejected_proposals: list[dict[str, Any]],
 ) -> dict[str, int]:
-    proposal_dirs = {run_dir / str(row.get("proposal_dir", "")) for row in proposals if row.get("proposal_dir")}
+    proposal_dirs = {run_dir / artifact_relative_path(row.get("proposal_dir", "")) for row in proposals if row.get("proposal_dir")}
     rejected_dirs = {
-        run_dir / str(row.get("proposal_dir", "")) for row in rejected_proposals if row.get("proposal_dir")
+        run_dir / artifact_relative_path(row.get("proposal_dir", ""))
+        for row in rejected_proposals
+        if row.get("proposal_dir")
     }
     all_dirs = proposal_dirs | rejected_dirs
     return {
@@ -205,6 +241,10 @@ def proposal_artifact_counts(
             if (path / "diff_against_parent.patch").exists() or (path / "diff_against_seed.patch").exists()
         ),
     }
+
+
+def artifact_relative_path(value: Any) -> Path:
+    return Path(str(value).replace("\\", "/"))
 
 
 def rollout_error(row: dict[str, Any]) -> str:
@@ -227,6 +267,9 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Rollouts: {summary['rollout_count']}")
     print(f"Runtime errors: {summary['runtime_errors']}")
     print(f"Boundary failures: {summary['boundary_failures']}")
+    print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
+    print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
+    print(f"Missing trace expectations: {summary['missing_trace_expectations']}")
     print(f"Proposal statuses: {summary['proposal_statuses']}")
     print(f"Rejected proposals: {summary['rejected_proposal_count']}")
     print(f"Proposal rationale files: {summary['proposal_rationale_files']}")

@@ -44,11 +44,14 @@ def parse_args() -> argparse.Namespace:
         help="Path to a Deep Agents GEPA TOML config. Use langgraph_cli.toml for LangGraph CLI auto-discovery.",
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8080/v1")
-    parser.add_argument("--model", default="local-qwen3-1.7b")
+    parser.add_argument("--model", default="local-chat-model")
     parser.add_argument("--api-key", default="no-key")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--task-max-tokens", type=int, default=64 * 1024)
     parser.add_argument("--reflection-max-tokens", type=int, default=128 * 1024)
+    parser.add_argument("--context-window-tokens", type=int, default=200_000)
+    parser.add_argument("--trace-context-ratio", type=float, default=0.12)
+    parser.add_argument("--trace-keep-ratio", type=float, default=0.10)
     parser.add_argument("--timeout", type=float, default=2400)
     parser.add_argument("--max-metric-calls", type=int, default=2)
     parser.add_argument("--reflection-minibatch-size", type=int, default=1)
@@ -173,6 +176,9 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
 def main() -> None:
     args = parse_args()
     os.environ.setdefault("LANGCHAIN_OPENAI_TCP_KEEPALIVE", "0")
+    os.environ["GEPA_CONTEXT_WINDOW_TOKENS"] = str(args.context_window_tokens)
+    os.environ["GEPA_TRACE_CONTEXT_RATIO"] = str(args.trace_context_ratio)
+    os.environ["GEPA_TRACE_KEEP_RATIO"] = str(args.trace_keep_ratio)
     configure_logging(args)
     configure_local_no_proxy(args.base_url, keep_proxy_env=args.keep_proxy_env)
 

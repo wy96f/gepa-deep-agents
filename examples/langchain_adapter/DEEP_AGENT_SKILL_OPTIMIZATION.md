@@ -68,7 +68,7 @@ Its golden dataset intentionally includes multiple examples for each support
 route (`billing`, `account`, `engineering`, `product`) so small train/validation
 splits do not leave an entire class represented by only one held-out example.
 
-There is also a rubric-only credit approval demo:
+There is also a credit approval expert-risk-section demo:
 
 ```text
 examples/langchain_adapter/deepagents_gepa_credit_approval_project/
@@ -95,7 +95,13 @@ It is not the primary demo config used by tests. Use `manual.toml` or
 ## Credit Approval Demo
 
 The credit approval demo is designed for expert-experience distillation rather
-than exact-answer routing. Its skill directory contains reusable methodology:
+than exact-answer routing. Each row gives the agent only a borrower name as
+`input`. The approval officer's "project risk points" section is stored in
+`data`, which is evaluator-only material: it is visible to the judge and
+reflection step, but it is not passed to the agent during rollout. The judge
+compares the agent trace/output with the expert risk section and asks whether
+the agent gathered the right data, covered the risk points, and explained the
+risk logic. Its skill directory contains reusable methodology:
 
 ```text
 skills/credit-risk-review/SKILL.md
@@ -105,16 +111,41 @@ skills/credit-risk-review/reference/collateral_and_guarantee.md
 skills/credit-risk-review/reference/industry_management_and_warnings.md
 ```
 
-The dataset is rubric-only. Each row has an application summary and an approval
-officer's risk opinion:
+The dataset shape is:
 
 ```json
-{"input": "Borrower summary...", "rubric": "Expert risk opinion: ..."}
+{
+  "input": "华东钢铁集团有限公司",
+  "data": "七、项目风险点\n1、钢铁行业周期性风险...",
+  "rubric": "评价 agent 是否自主获取相关信息, 覆盖专家风险点, 并讲清风险逻辑。",
+  "metadata": {
+    "checkpoints": [
+      {"label": "钢铁行业周期性风险", "keywords": ["钢铁行业", "周期", "库存减值"]},
+      {"label": "高负债规模与债务结构压力风险", "keywords": ["资产负债率", "短贷长投"]}
+    ],
+    "trace_expectations": [
+      {"label": "行业周期信息获取", "tool_intent_keywords": ["行业", "钢铁", "周期"]},
+      {"label": "债务结构信息获取", "tool_intent_keywords": ["负债", "借款", "融资"]}
+    ]
+  }
+}
 ```
 
 There is no `expected` answer. The reflection judge evaluates whether the agent
-captured the expert's risk logic and recommends which text surface should absorb
-the lesson, usually `SKILL.md` or a focused `reference/*.md` file.
+trace shows relevant data acquisition, whether the final output covers the
+expert risk points, and whether the output explains the risk transmission logic.
+`metadata` is optional, but useful. `metadata.checkpoints` acts as a stricter
+coverage checklist for the final answer. `metadata.trace_expectations` is a
+soft diagnostic shown to the judge and feedback; it is not a deterministic hard
+gate because real tool traces vary by project.
+
+To clean many approval opinions into this format:
+
+```bash
+python examples/langchain_adapter/clean_credit_risk_dataset.py \
+  --input-dir /path/to/risk-opinions \
+  --output examples/langchain_adapter/deepagents_gepa_credit_approval_project/evals/project_risk_sections.jsonl
+```
 
 Run it with:
 
@@ -122,7 +153,9 @@ Run it with:
 python examples/langchain_adapter/run_deepagents_gepa_local.py \
   --config examples/langchain_adapter/deepagents_gepa_configs/credit_approval.toml \
   --base-url http://127.0.0.1:8080/v1 \
-  --model local-qwen3-1.7b \
+  --model local-chat-model \
+  --context-window-tokens 200000 \
+  --trace-context-ratio 0.12 \
   --max-metric-calls 10 \
   --num-threads 1 \
   --artifact-dir examples/langchain_adapter/runs \
@@ -390,12 +423,14 @@ and returns LangChain tools to append to the Deep Agents runtime.
 Golden examples use JSONL rows:
 
 ```json
-{"input": "...", "expected": "...", "rubric": "...", "metadata": {"topic": "..."}}
+{"input": "...", "data": "...", "expected": "...", "rubric": "...", "metadata": {"topic": "..."}}
 ```
 
 Fields mean:
 
 - `input`: the user task or question.
+- `data`: optional evaluator-only expert material, such as an approval
+  officer's project-risk section. It is not passed to the agent during rollout.
 - `expected`: optional known answer, route, label, or structured result.
 - `rubric`: optional evaluation guidance for open-ended tasks.
 - `metadata`: optional grouping, topic, difficulty, source, or trace metadata.
@@ -403,6 +438,35 @@ Fields mean:
 For deterministic tasks, `expected` is useful. For open-ended work such as due
 diligence report generation, `rubric` is usually more valuable than exact-match
 text.
+
+For expert-experience distillation, `data` can hold the expert section and
+`metadata.checkpoints` can make open-ended examples harder and less prone to
+score saturation:
+
+```json
+{
+  "input": "江北化工新材料股份有限公司",
+  "data": "七、项目风险点\n1、技改项目合规闭环风险...",
+  "rubric": "评价 agent 是否自主获取相关信息, 覆盖专家风险点, 并讲清风险逻辑。",
+  "metadata": {
+    "checkpoints": [
+      {"label": "环评安评提款前置", "keywords": ["环评", "安全验收", "提款前置"]},
+      {"label": "客户集中压力测试", "keywords": ["三家大型客户", "客户集中", "集中度压力测试"]}
+    ],
+    "trace_expectations": [
+      {"label": "环保安监信息获取", "tool_intent_keywords": ["环保", "安全生产", "环评"]},
+      {"label": "客户交易信息获取", "tool_intent_keywords": ["客户", "订单", "回款"]}
+    ]
+  }
+}
+```
+
+Each checkpoint is a reusable expert judgment point. The evaluator reports
+matched and missing checkpoints, caps open-ended scores when checkpoints are
+missing, and pushes feedback toward the most specific skill/reference component
+that should preserve the lesson. Trace expectations are softer: they are shown
+to the judge and feedback as data-acquisition diagnostics, but they are not a
+hard deterministic gate because tool traces vary by project.
 
 Langfuse import supports two dataset styles:
 
@@ -474,7 +538,6 @@ explicit foreign-runtime text is absent
 non-skill prompt/description did not paste SKILL.md frontmatter
 component did not paste candidate-excerpt labels such as "### skill:..."
 component did not paste bare candidate keys such as "main:system_prompt"
-prompt, memory, and descriptions did not introduce `.py` script paths
 ```
 
 Advisory checks are recorded for the judge but do not hard-fail a candidate:
@@ -504,9 +567,13 @@ If an example has an `expected` answer but the agent does not produce the
 required structured answer, the deterministic fallback caps the composite score.
 The reflection judge is also capped by that correctness rule, so a fluent answer
 that does not return the expected route/label cannot be accepted as a high-score
-improvement. If a hard deterministic gate fails, the final judge score is capped
-to zero. Advisory notes do not cap the score by themselves; they are fed to the
-judge so it can decide whether the issue actually matters.
+improvement. For expert-data rows with `metadata.checkpoints`, the judge
+is also capped by checkpoint coverage; missing expert points are classified as
+`SKILL_DEFECT` so the next proposal is encouraged to update `SKILL.md` or a
+focused `reference/*.md` file. If a hard deterministic gate fails, the final
+judge score is capped to zero. Advisory notes do not cap the score by
+themselves; they are fed to the judge so it can decide whether the issue
+actually matters.
 
 Hard boundary gates catch only high-confidence bad proposals, including:
 
@@ -514,7 +581,6 @@ Hard boundary gates catch only high-confidence bad proposals, including:
 system_prompt contains SKILL.md YAML frontmatter
 component includes "### skill:..." candidate-excerpt labels
 component starts with or contains a bare candidate key line such as "main:system_prompt"
-system_prompt, AGENTS.md, or a tool description introduces `route_hint.py` or another `.py` script path
 ```
 
 Other boundary questions, such as whether a prompt is too verbose or whether a
@@ -528,7 +594,8 @@ Feedback includes:
 - gate failures
 - with-candidate output
 - baseline output
-- recent trace summary
+- adaptive trace summary
+- trace expectation and tool capability diagnostics
 - weakest dimension
 - failure classification
 - recommended component key
@@ -592,7 +659,9 @@ source .venv/bin/activate
 python examples/langchain_adapter/run_deepagents_gepa_local.py \
   --config examples/langchain_adapter/deepagents_gepa_configs/manual.toml \
   --base-url http://127.0.0.1:8080/v1 \
-  --model local-qwen3-1.7b \
+  --model local-chat-model \
+  --context-window-tokens 200000 \
+  --trace-context-ratio 0.12 \
   --max-metric-calls 10 \
   --num-threads 1 \
   --artifact-dir examples/langchain_adapter/runs
@@ -604,7 +673,9 @@ Run LangGraph CLI auto-discovery mode:
 python examples/langchain_adapter/run_deepagents_gepa_local.py \
   --config examples/langchain_adapter/deepagents_gepa_configs/langgraph_cli.toml \
   --base-url http://127.0.0.1:8080/v1 \
-  --model local-qwen3-1.7b \
+  --model local-chat-model \
+  --context-window-tokens 200000 \
+  --trace-context-ratio 0.12 \
   --max-metric-calls 10 \
   --num-threads 1 \
   --artifact-dir examples/langchain_adapter/runs
@@ -626,6 +697,40 @@ The local runner defaults to large completion budgets:
 ```text
 --task-max-tokens 65536
 --reflection-max-tokens 131072
+```
+
+Trace handling is adaptive and follows the same staged idea as Deep Agents'
+summarization middleware, without rewriting the live agent state. Full raw
+rollout messages are always saved under `agent_logs/rollouts/*.json`. The
+judge/reflection copy first removes low-value `write_file` and `edit_file`
+calls, arguments, and tool results. It retains AI message text and useful tool
+calls with their query arguments. Only after that final evaluation trace
+exceeds its budget does the reflection model summarize the older messages; a
+recent whole-message tail is appended unchanged. There is no character slicing
+of individual AI messages or tool results. If the summarizer is unavailable,
+the framework keeps the complete filtered trace instead of silently truncating
+it. By default the trace can use about 12% of a 200k-token context window and
+keeps the most recent 10% of that trace budget verbatim:
+
+```text
+--context-window-tokens 200000
+--trace-context-ratio 0.12
+--trace-keep-ratio 0.10
+```
+
+The same values can be set through environment variables:
+
+```text
+GEPA_CONTEXT_WINDOW_TOKENS=200000
+GEPA_TRACE_CONTEXT_RATIO=0.12
+GEPA_TRACE_KEEP_RATIO=0.10
+```
+
+The default noise-tool list can be overridden when a project treats file
+mutation as evaluation evidence:
+
+```text
+GEPA_TRACE_OMIT_TOOL_NAMES=edit_file,write_file
 ```
 
 It also uses the reflection model as the evaluation judge by default. Disable
@@ -727,9 +832,17 @@ best candidate back into the source project automatically.
 
 `agent_logs/` records each rollout: input, expected answer or rubric, final
 agent response, baseline response, score, fitness dimensions, constraints, and a
-serializable message trace. `proposals/` records every reflective proposal,
-including the rendered reflection prompt, raw LLM output, explicit proposal
-rationale, and diffs against both the parent candidate and the seed candidate.
+serializable raw message trace. It also records the available tool inventory,
+matched/missing trace expectations, and likely tool capability gaps. The
+feedback prompt uses the filtered, adaptive evaluation trace, while the raw
+trace remains in the detailed rollout artifact for audit. Saving that raw file
+is not part of runtime summarization and is not required by the reflection
+model; it exists only when artifacts are enabled and is intended for human or
+offline analysis.
+
+`proposals/` records every reflective proposal, including the rendered
+reflection prompt, raw LLM output, explicit proposal rationale, and diffs
+against both the parent candidate and the seed candidate.
 If the reflection model starts directly with the final fenced block and omits
 the review rationale, the proposal is marked with
 `proposal_rationale_missing.json` and `missing_proposal_rationale` metadata.
@@ -757,9 +870,17 @@ python examples/langchain_adapter/analyze_deepagents_gepa_run.py \
 
 The analyzer reports baseline score, best score, improvement, proposal status
 counts, rejected proposal patterns, missing proposal-rationale markers, runtime
-errors, and whether the run is valid for algorithm-effectiveness analysis. If
-every rollout failed with a local-model connection error, it says so explicitly
-instead of treating the scores as useful.
+errors, missing trace expectations, tool capability gaps, and whether the run is
+valid for algorithm-effectiveness analysis. If every rollout failed with a
+local-model connection error, it says so explicitly instead of treating the
+scores as useful.
+
+Tool capability gaps mean the evaluator expected a data-acquisition direction
+but the current available tool names/descriptions did not appear to cover it.
+Those gaps are outside GEPA's text-only optimization surface: use them as a
+backlog for new tools or MCP integrations. "Missed supported expectations" are
+different: the tool seems available, but the agent did not call it reliably, so
+skill/prompt/tool-description optimization can plausibly help.
 
 The base artifact directory also gets:
 
@@ -789,7 +910,9 @@ Manual mode parameters:
 ```text
 --config examples/langchain_adapter/deepagents_gepa_configs/manual.toml
 --base-url http://127.0.0.1:8080/v1
---model local-qwen3-1.7b
+--model local-chat-model
+--context-window-tokens 200000
+--trace-context-ratio 0.12
 --max-metric-calls 10
 --num-threads 1
 --artifact-dir examples/langchain_adapter/runs
@@ -800,7 +923,9 @@ LangGraph CLI mode parameters:
 ```text
 --config examples/langchain_adapter/deepagents_gepa_configs/langgraph_cli.toml
 --base-url http://127.0.0.1:8080/v1
---model local-qwen3-1.7b
+--model local-chat-model
+--context-window-tokens 200000
+--trace-context-ratio 0.12
 --max-metric-calls 10
 --num-threads 1
 --artifact-dir examples/langchain_adapter/runs
@@ -843,7 +968,7 @@ It covers:
 
 - manual config loading
 - LangGraph CLI config loading
-- credit approval rubric-only demo loading
+- credit approval expert-risk-section demo loading
 - Python hook overrides for dataset, evaluator, templates, selector, and constraints
 - auto-discovery from a `create_deep_agent(...)` graph
 - candidate discovery for `AGENTS.md`
@@ -861,9 +986,9 @@ It covers:
 - repeated-component cooldown
 - correctness score caps
 - reflection-judge correctness caps
+- rubric checkpoint coverage caps
 - component-boundary hard gates
 - bare candidate-key boundary gates
-- script-path boundary gates outside SKILL.md
 - advisory constraints that do not hard-fail candidates
 - reflection judge JSON fallback behavior
 - memory reflection template anti-copy guidance
@@ -881,7 +1006,7 @@ python -m pytest tests/test_deep_agent_skill_directory_example.py -q
 Expected result:
 
 ```text
-33 passed
+44 passed
 ```
 
 ## Production Notes

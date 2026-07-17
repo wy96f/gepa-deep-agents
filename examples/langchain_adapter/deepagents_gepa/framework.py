@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from math import isclose
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -128,7 +129,8 @@ class DefaultFeedbackComponentSelector:
             )
             for component in ranked_components:
                 if not self._is_cooled_down(candidate_idx, component):
-                    return [self._record_selection(candidate_idx, component)]
+                    selected = self._record_selection(candidate_idx, component)
+                    return self._with_component_dependencies(selected, candidate)
             return [
                 self._record_selection(
                     candidate_idx,
@@ -138,6 +140,20 @@ class DefaultFeedbackComponentSelector:
         if (capability_gap_trajectories or no_failure_trajectories) and not actionable_trajectories:
             return []
         return [self._record_selection(candidate_idx, self._round_robin_fallback(candidate_idx, candidate))]
+
+    @staticmethod
+    def _with_component_dependencies(component: str, candidate: Mapping[str, str]) -> list[str]:
+        """Keep learned knowledge and the workflow that routes to it in one proposal."""
+        selected = [component]
+        if ":reference/" not in component:
+            return selected
+        reference_name = component.rsplit(":reference/", maxsplit=1)[-1].lower()
+        if not any(marker in reference_name for marker in ("learned", "expert", "experience")):
+            return selected
+        skill_component = component.split(":reference/", maxsplit=1)[0] + ":SKILL.md"
+        if skill_component in candidate:
+            selected.append(skill_component)
+        return selected
 
     @staticmethod
     def _failure_classification(feedback: str) -> str | None:
@@ -314,6 +330,8 @@ class DefaultReflectionTemplateRegistry:
                 "- You may reference local reference/*.md and scripts/*.py paths that actually belong to this skill.\n"
                 "- Keep domain catalogs and industry-specific risk patterns in reference/*.md; route to them from the "
                 "workflow instead of accumulating them in SKILL.md.\n"
+                "- When evaluation evidence points to a learned expert reference, add a concrete applicability trigger "
+                "and lookup step for that reference without copying its domain rules into SKILL.md.\n"
                 "- Add a domain rule here only when it is invariant across the skill's intended use cases.\n"
                 "- Do not paste AGENTS.md, system prompts, tool descriptions, or unrelated subagent skills."
             )
@@ -322,6 +340,8 @@ class DefaultReflectionTemplateRegistry:
                 "- Scope: reusable domain facts, rules, rubrics, examples, and lookup material.\n"
                 "- Do not write agent persona, delegation instructions, tool descriptions, or workflow prose here.\n"
                 "- Keep references structured for lookup and reuse by a skill.\n"
+                "- For a learned reference, merge evidence by shared economic mechanism and add the smallest number "
+                "of reusable patterns; do not append one section per evaluation example, company, or industry.\n"
                 "- Scope each learned pattern by observable signals or business model. Include non-applicability "
                 "conditions so an improvement for one sector does not become a global rule.\n"
                 "- Make each rule concrete enough to execute: evidence source, comparison or calculation, risk "
@@ -344,6 +364,27 @@ class DefaultReflectionTemplateRegistry:
                 "- Do not copy full SKILL.md or reference files; tell the subagent when to consult them."
             )
         return "- Preserve the selected component's runtime role and do not paste unrelated components into it."
+
+
+def select_deployment_candidate_index(result: Any, *, score_tolerance: float = 1e-12) -> int | None:
+    """Select the newest accepted candidate when validation scores are tied.
+
+    GEPA reports the first maximum as ``best_idx``. Deep Agents deployment
+    prefers the newest candidate on a validation tie because candidates only
+    enter ``result.candidates`` after acceptance.
+    """
+    scores = list(getattr(result, "val_aggregate_scores", []) or [])
+    candidates = list(getattr(result, "candidates", []) or [])
+    usable_count = min(len(scores), len(candidates))
+    if usable_count == 0:
+        return None
+    best_score = max(float(score) for score in scores[:usable_count])
+    tied_indices = [
+        index
+        for index, score in enumerate(scores[:usable_count])
+        if isclose(float(score), best_score, rel_tol=0.0, abs_tol=max(0.0, score_tolerance))
+    ]
+    return max(tied_indices)
 
 
 class Constraint(Protocol):

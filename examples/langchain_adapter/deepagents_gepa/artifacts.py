@@ -536,17 +536,41 @@ class RunArtifactStore:
         _write_json(self.run_dir / "final_test" / "summary.json", comparison)
         return comparison
 
-    def write_result_summary(self, result: Any, final_test: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        best_candidate = getattr(result, "best_candidate", {})
+    def write_result_summary(
+        self,
+        result: Any,
+        final_test: Mapping[str, Any] | None = None,
+        *,
+        best_idx: int | None = None,
+    ) -> dict[str, Any]:
+        gepa_best_idx = getattr(result, "best_idx", None)
+        selected_best_idx = gepa_best_idx if best_idx is None else best_idx
+        candidates = list(getattr(result, "candidates", []) or [])
+        best_candidate = (
+            candidates[selected_best_idx]
+            if selected_best_idx is not None and 0 <= selected_best_idx < len(candidates)
+            else getattr(result, "best_candidate", {})
+        )
+        val_scores = list(getattr(result, "val_aggregate_scores", []) or [])
+        tied_best_indices: list[int] = []
+        if val_scores:
+            max_score = max(float(score) for score in val_scores)
+            tied_best_indices = [
+                index for index, score in enumerate(val_scores) if abs(float(score) - max_score) <= 1e-12
+            ]
         summary = {
             "result_type": type(result).__name__,
-            "best_idx": getattr(result, "best_idx", None),
+            "best_idx": selected_best_idx,
+            "gepa_best_idx": gepa_best_idx,
+            "tie_break_applied": selected_best_idx != gepa_best_idx,
+            "selection_policy": "latest_accepted_on_validation_tie",
+            "tied_best_indices": tied_best_indices,
             "best_val_score": (
-                result.val_aggregate_scores[result.best_idx]
-                if hasattr(result, "val_aggregate_scores") and hasattr(result, "best_idx")
+                val_scores[selected_best_idx]
+                if selected_best_idx is not None and 0 <= selected_best_idx < len(val_scores)
                 else None
             ),
-            "val_aggregate_scores": getattr(result, "val_aggregate_scores", None),
+            "val_aggregate_scores": val_scores,
             "parents": getattr(result, "parents", None),
             "discovery_eval_counts": getattr(result, "discovery_eval_counts", None),
             "total_metric_calls": getattr(result, "total_metric_calls", None),
@@ -561,12 +585,12 @@ class RunArtifactStore:
         _write_json(self.run_dir / "result_summary.json", summary)
         return summary
 
-    def write_result_candidates(self, result: Any) -> None:
+    def write_result_candidates(self, result: Any, *, best_idx: int | None = None) -> None:
         candidates = getattr(result, "candidates", [])
         val_scores = list(getattr(result, "val_aggregate_scores", []) or [])
-        best_idx = getattr(result, "best_idx", None)
+        selected_best_idx = getattr(result, "best_idx", None) if best_idx is None else best_idx
         for index, candidate in enumerate(candidates):
-            label = "best_candidate" if index == best_idx else None
+            label = "best_candidate" if index == selected_best_idx else None
             parent_candidate = self._parent_candidate_for_result(index, candidates, getattr(result, "parents", []) or [])
             self.write_candidate(index, candidate, label=label, parent_candidate=parent_candidate)
             metadata = {
@@ -575,10 +599,10 @@ class RunArtifactStore:
                 "parent_indices": (getattr(result, "parents", []) or [[]])[index]
                 if index < len(getattr(result, "parents", []) or [])
                 else [],
-                "status": "best" if index == best_idx else "rejected_or_non_best",
+                "status": "best" if index == selected_best_idx else "accepted_non_best",
             }
             _write_json(self.run_dir / "candidates" / f"{index:04d}" / "metadata.json", metadata)
-            if index != best_idx:
+            if index != selected_best_idx:
                 rejected_dir = self.run_dir / "rejected_candidates" / f"{index:04d}"
                 rejected_dir.mkdir(parents=True, exist_ok=True)
                 _write_json(rejected_dir / "metadata.json", metadata)
@@ -609,8 +633,14 @@ class RunArtifactStore:
         result: Any,
         project: Any,
         apply_candidate: Callable[[Any, Mapping[str, str], Path], Any],
+        best_idx: int | None = None,
     ) -> None:
-        best_candidate = getattr(result, "best_candidate", None)
+        candidates = list(getattr(result, "candidates", []) or [])
+        best_candidate = (
+            candidates[best_idx]
+            if best_idx is not None and 0 <= best_idx < len(candidates)
+            else getattr(result, "best_candidate", None)
+        )
         if not isinstance(best_candidate, Mapping):
             return
         materialized_dir = self.run_dir / "materialized_best_candidate"
@@ -623,10 +653,16 @@ class RunArtifactStore:
         project: Any,
         apply_candidate: Callable[[Any, Mapping[str, str], Path], Any],
         final_test: Mapping[str, Any] | None = None,
+        best_idx: int | None = None,
     ) -> dict[str, Any]:
-        self.write_result_candidates(result)
-        self.materialize_best_candidate(result=result, project=project, apply_candidate=apply_candidate)
-        return self.write_result_summary(result, final_test=final_test)
+        self.write_result_candidates(result, best_idx=best_idx)
+        self.materialize_best_candidate(
+            result=result,
+            project=project,
+            apply_candidate=apply_candidate,
+            best_idx=best_idx,
+        )
+        return self.write_result_summary(result, final_test=final_test, best_idx=best_idx)
 
 
 class RunArtifactCallback:

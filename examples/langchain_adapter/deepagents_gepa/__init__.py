@@ -14,6 +14,7 @@ from examples.langchain_adapter.deepagents_gepa.framework import (
     DefaultReflectionTemplateRegistry,
     Evaluator,
     ReflectionTemplateRegistry,
+    select_deployment_candidate_index,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "ReflectionTemplateRegistry",
     "RunArtifactCallback",
     "RunArtifactStore",
+    "select_deployment_candidate_index",
 ]

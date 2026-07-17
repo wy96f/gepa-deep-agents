@@ -516,8 +516,8 @@ evaluate_final_test = true
 Explicit split labels take precedence. Unlabeled rows are distributed by the
 configured strata using a stable hash, so JSONL ordering does not place whole
 industries only in train or test. After GEPA finishes, the harness evaluates
-seed and best on the held-out test split. This final test does not influence
-optimization, acceptance, or Pareto selection.
+seed and the deployment candidate on the held-out test split. This final test
+does not influence optimization, acceptance, or Pareto selection.
 
 Langfuse import supports two dataset styles:
 
@@ -698,6 +698,14 @@ the same component is repeatedly selected for the same candidate without
 producing an accepted improvement, it cools that component down and tries
 another surface. If no valid key is found, it falls back to round-robin
 selection. `TOOL_CAPABILITY_GAP` trajectories are excluded from this vote.
+
+When the selected component is an explicitly managed learned/expert/experience
+reference, the selector mutates that reference together with its owning
+`SKILL.md`. The reference proposal captures scoped domain knowledge; the skill
+proposal adds or repairs the applicability trigger and lookup step that makes
+the runtime agent consult it. Ordinary reference files remain single-component
+mutations. This avoids accepting domain knowledge that is never read without
+turning every proposal into an unrestricted whole-project rewrite.
 
 The default reflection minibatch size is `3`, so a proposal normally sees more
 than one trajectory and must explain evidence across examples. For small,
@@ -902,6 +910,13 @@ result_summary.json
 `materialized_best_candidate/` is a temporary-project-style export of the best
 candidate. It is meant for review and diffing. The framework does not write the
 best candidate back into the source project automatically.
+
+GEPA's `best_idx` chooses the first candidate with the maximum validation
+score. For deployment artifacts, this harness chooses the newest accepted
+candidate when multiple candidates tie at that maximum. `result_summary.json`
+records the deployment choice as `best_idx`, preserves GEPA's original choice
+as `gepa_best_idx`, and includes `tie_break_applied` and `tied_best_indices`.
+The tie-break never changes scores and never consults the held-out test set.
 
 `agent_logs/` records each rollout: input, expected answer or rubric, final
 agent response, baseline response, score, fitness dimensions, constraints, and a

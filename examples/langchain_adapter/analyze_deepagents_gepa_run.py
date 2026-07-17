@@ -120,6 +120,10 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "best_val_score": best_val_score,
         "baseline_val_score": baseline_score,
         "improvement": improvement,
+        "best_idx": summary.get("best_idx"),
+        "gepa_best_idx": summary.get("gepa_best_idx", summary.get("best_idx")),
+        "tie_break_applied": bool(summary.get("tie_break_applied", False)),
+        "tied_best_indices": summary.get("tied_best_indices", []),
         "num_candidates": summary.get("num_candidates"),
         "total_metric_calls": summary.get("total_metric_calls"),
         "num_full_val_evals": summary.get("num_full_val_evals"),
@@ -149,6 +153,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             improvement=improvement,
             connection_blocked=connection_blocked,
             rejected_proposals=rejected_proposals,
+            proposal_statuses=proposal_statuses,
             proposed_components=proposed_components,
             failure_classes=failure_classes,
             boundary_failures=boundary_failures,
@@ -176,6 +181,7 @@ def diagnose(
     improvement: float | None,
     connection_blocked: bool,
     rejected_proposals: list[dict[str, Any]],
+    proposal_statuses: Counter[str],
     proposed_components: Counter[str],
     failure_classes: Counter[str],
     boundary_failures: Counter[str],
@@ -230,7 +236,12 @@ def diagnose(
         )
     if proposal_artifacts.get("proposal_diff_files", 0):
         notes.append(f"Proposal diff files: {proposal_artifacts['proposal_diff_files']}.")
-    if not rejected_proposals and improvement == 0:
+    if proposal_statuses.get("accepted", 0) and improvement == 0:
+        notes.append(
+            "An accepted candidate tied the baseline aggregate validation score; inspect per-example deltas and "
+            "the deployment tie-break rather than treating this as a missing proposal."
+        )
+    elif not rejected_proposals and not proposal_statuses:
         notes.append("If no proposal text was generated, inspect proposals/*/metadata.json for reflection/runtime failures.")
     return notes
 
@@ -295,6 +306,11 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Best val score: {summary['best_val_score']}")
     print(f"Baseline val score: {summary['baseline_val_score']}")
     print(f"Improvement: {summary['improvement']}")
+    print(
+        "Candidate selection: "
+        f"deployment={summary['best_idx']} gepa={summary['gepa_best_idx']} "
+        f"tie_break={summary['tie_break_applied']}"
+    )
     print(f"Metric calls: {summary['total_metric_calls']}")
     print(f"Candidates: {summary['num_candidates']}")
     print(f"Rollouts: {summary['rollout_count']}")

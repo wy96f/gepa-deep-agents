@@ -56,6 +56,7 @@ try:
         DefaultReflectionTemplateRegistry,
         Evaluator,
         ReflectionTemplateRegistry,
+        select_deployment_candidate_index,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -72,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution.
         DefaultReflectionTemplateRegistry,
         Evaluator,
         ReflectionTemplateRegistry,
+        select_deployment_candidate_index,
     )
 
 try:
@@ -3510,6 +3512,17 @@ def run_configured_skill_optimization(
         callbacks=[artifact_callback] if artifact_callback is not None else None,
         seed=seed,
     )
+    deployment_best_idx = select_deployment_candidate_index(result)
+    deployment_candidate = (
+        result.candidates[deployment_best_idx] if deployment_best_idx is not None else result.best_candidate
+    )
+    if deployment_best_idx is not None and deployment_best_idx != result.best_idx:
+        LOGGER.info(
+            "deployment candidate tie-break selected candidate=%d instead of gepa_best=%d at val_score=%.3f",
+            deployment_best_idx,
+            result.best_idx,
+            result.val_aggregate_scores[deployment_best_idx],
+        )
     final_test_result: dict[str, Any] | None = None
     should_evaluate_test = config.dataset.evaluate_final_test if evaluate_final_test is None else evaluate_final_test
     if should_evaluate_test and test_set:
@@ -3518,12 +3531,12 @@ def run_configured_skill_optimization(
             seed_candidate,
             capture_traces=False,
         )
-        if result.best_candidate == seed_candidate:
+        if deployment_candidate == seed_candidate:
             best_test = seed_test
         else:
             best_test = adapter.evaluate(
                 examples_for_evaluation_phase(test_set, "final_test_best"),
-                result.best_candidate,
+                deployment_candidate,
                 capture_traces=False,
             )
         final_test_result = final_test_summary(seed_test, best_test)
@@ -3548,6 +3561,7 @@ def run_configured_skill_optimization(
             project=project,
             apply_candidate=apply_candidate_to_deep_agent_project,
             final_test=final_test_result,
+            best_idx=deployment_best_idx,
         )
     return result
 

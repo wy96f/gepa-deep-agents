@@ -22,7 +22,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from examples.langchain_adapter.deep_agent_skill_directory import run_configured_skill_optimization
+from examples.langchain_adapter.deep_agent_skill_directory import (
+    run_configured_skill_optimization,
+    select_deployment_candidate_index,
+)
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 PROXY_ENV_VARS = (
@@ -152,7 +155,21 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
         return
     summary_path = Path(args.summary_file)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    best_candidate = getattr(result, "best_candidate", {})
+    gepa_best_idx = getattr(result, "best_idx", None)
+    best_idx = select_deployment_candidate_index(result)
+    candidates = list(getattr(result, "candidates", []) or [])
+    val_scores = list(getattr(result, "val_aggregate_scores", []) or [])
+    tied_best_indices: list[int] = []
+    if val_scores:
+        max_score = max(float(score) for score in val_scores)
+        tied_best_indices = [
+            index for index, score in enumerate(val_scores) if abs(float(score) - max_score) <= 1e-12
+        ]
+    best_candidate = (
+        candidates[best_idx]
+        if best_idx is not None and 0 <= best_idx < len(candidates)
+        else getattr(result, "best_candidate", {})
+    )
     final_test = None
     latest_run = Path(args.artifact_dir) / "latest_run.txt" if args.artifact_dir else None
     if latest_run is not None and latest_run.exists():
@@ -161,13 +178,17 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
             final_test = json.loads(final_test_path.read_text(encoding="utf-8"))
     summary = {
         "result_type": type(result).__name__,
-        "best_idx": getattr(result, "best_idx", None),
+        "best_idx": best_idx,
+        "gepa_best_idx": gepa_best_idx,
+        "tie_break_applied": best_idx != gepa_best_idx,
+        "selection_policy": "latest_accepted_on_validation_tie",
+        "tied_best_indices": tied_best_indices,
         "best_val_score": (
-            result.val_aggregate_scores[result.best_idx]
-            if hasattr(result, "val_aggregate_scores") and hasattr(result, "best_idx")
+            result.val_aggregate_scores[best_idx]
+            if best_idx is not None and hasattr(result, "val_aggregate_scores")
             else None
         ),
-        "val_aggregate_scores": getattr(result, "val_aggregate_scores", None),
+        "val_aggregate_scores": val_scores,
         "parents": getattr(result, "parents", None),
         "discovery_eval_counts": getattr(result, "discovery_eval_counts", None),
         "total_metric_calls": getattr(result, "total_metric_calls", None),
@@ -209,8 +230,10 @@ def main() -> None:
     write_summary(args, result)
 
     print(f"Result type: {type(result).__name__}")
-    if hasattr(result, "val_aggregate_scores") and hasattr(result, "best_idx"):
-        print(f"Best val score: {result.val_aggregate_scores[result.best_idx]}")
+    deployment_best_idx = select_deployment_candidate_index(result)
+    if hasattr(result, "val_aggregate_scores") and deployment_best_idx is not None:
+        print(f"Deployment candidate: {deployment_best_idx}")
+        print(f"Best val score: {result.val_aggregate_scores[deployment_best_idx]}")
     if hasattr(result, "total_metric_calls"):
         print(f"Total metric calls: {result.total_metric_calls}")
     if args.artifact_dir:
@@ -227,9 +250,15 @@ def main() -> None:
                     f"best={final_test['best_mean']:.3f} "
                     f"improvement={final_test['improvement']:.3f}"
                 )
-    if hasattr(result, "best_candidate"):
+    candidates = list(getattr(result, "candidates", []) or [])
+    deployment_candidate = (
+        candidates[deployment_best_idx]
+        if deployment_best_idx is not None and 0 <= deployment_best_idx < len(candidates)
+        else getattr(result, "best_candidate", {})
+    )
+    if isinstance(deployment_candidate, dict):
         print("Best candidate components:")
-        for name, text in result.best_candidate.items():
+        for name, text in deployment_candidate.items():
             print(f"- {name}: {len(text)} chars")
 
 

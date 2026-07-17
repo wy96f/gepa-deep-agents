@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -381,6 +382,64 @@ def test_component_selector_ignores_no_failure_votes(tmp_path):
 
     assert selected == ["memory:AGENTS.md"]
     assert selector(None, [{"score": 1.0, "feedback": no_failure_feedback}], [1.0], 1, candidate) == []
+
+
+def test_component_selector_mutates_learned_reference_with_owning_skill():
+    example = _load_example_module()
+    learned_key = "skill:credit-risk-review:reference/learned_expert_patterns.md"
+    skill_key = "skill:credit-risk-review:SKILL.md"
+    ordinary_reference_key = "skill:credit-risk-review:reference/cashflow_and_repayment.md"
+    candidate = {
+        learned_key: "# Learned",
+        skill_key: "---\nname: credit-risk-review\n---\n# Workflow",
+        ordinary_reference_key: "# Cash flow",
+    }
+    selector = example.DarwinFeedbackComponentSelector()
+
+    selected = selector(
+        None,
+        [
+            {
+                "score": 0.2,
+                "feedback": "Scores:\n"
+                "- failure_classification: SKILL_DEFECT\n"
+                f"- suggested_component: {learned_key}",
+            }
+        ],
+        [0.2],
+        0,
+        candidate,
+    )
+    ordinary_selected = selector(
+        None,
+        [
+            {
+                "score": 0.2,
+                "feedback": "Scores:\n"
+                "- failure_classification: SKILL_DEFECT\n"
+                f"- suggested_component: {ordinary_reference_key}",
+            }
+        ],
+        [0.2],
+        1,
+        candidate,
+    )
+
+    assert selected == [learned_key, skill_key]
+    assert ordinary_selected == [ordinary_reference_key]
+
+
+def test_deployment_candidate_selection_prefers_latest_validation_tie():
+    example = _load_example_module()
+    result = SimpleNamespace(
+        candidates=[{"prompt": "seed"}, {"prompt": "accepted"}, {"prompt": "lower"}],
+        val_aggregate_scores=[1.0, 1.0, 0.8],
+        best_idx=0,
+    )
+
+    assert example.select_deployment_candidate_index(result) == 1
+    result.val_aggregate_scores = [1.0, 1.0 + 1e-8, 0.8]
+    assert example.select_deployment_candidate_index(result) == 1
 
 
 def test_default_evaluator_writes_fitness_back_to_original_state():
@@ -1133,6 +1192,8 @@ def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
     assert "non-applicability" in template
     assert "risk transmission" in template
     assert "borrower-specific acquisition plan" in template
+    assert "shared economic mechanism" in template
+    assert "do not append one section per evaluation example" in template
 
 
 def test_artifact_callback_writes_agent_logs_and_rejected_proposals(tmp_path):
@@ -1242,6 +1303,55 @@ def test_artifact_callback_marks_missing_proposal_rationale(tmp_path):
     assert metadata["missing_proposal_rationale"] == ["main:system_prompt"]
     assert (tmp_path / "run" / "proposals" / "0002" / "proposal_rationale_missing.json").exists()
     assert not (tmp_path / "run" / "proposals" / "0002" / "proposal_rationale.json").exists()
+
+
+def test_artifacts_materialize_selected_candidate_on_validation_tie(tmp_path):
+    example = _load_example_module()
+    run_dir = tmp_path / "run"
+    store = example.RunArtifactStore(run_dir)
+    seed_candidate = {"memory:AGENTS.md": "Seed memory."}
+    accepted_candidate = {"memory:AGENTS.md": "Accepted improved memory."}
+    project = SimpleNamespace(candidate=seed_candidate, surfaces={})
+    result = SimpleNamespace(
+        candidates=[seed_candidate, accepted_candidate],
+        parents=[[None], [0]],
+        val_aggregate_scores=[1.0, 1.0],
+        discovery_eval_counts=[0, 4],
+        total_metric_calls=5,
+        num_full_val_evals=2,
+        num_candidates=2,
+        best_idx=0,
+        best_candidate=seed_candidate,
+    )
+    store.write_run_inputs(
+        config_path=tmp_path / "missing.toml",
+        config={},
+        project=project,
+        train_set=[],
+        val_set=[],
+        test_set=[],
+    )
+
+    def materialize(_project, candidate, destination):
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "selected.txt").write_text(candidate["memory:AGENTS.md"], encoding="utf-8")
+
+    summary = store.finalize(
+        result=result,
+        project=project,
+        apply_candidate=materialize,
+        best_idx=1,
+    )
+    best_candidate = json.loads((run_dir / "best_candidate" / "candidate.json").read_text(encoding="utf-8"))
+
+    assert summary["best_idx"] == 1
+    assert summary["gepa_best_idx"] == 0
+    assert summary["tie_break_applied"] is True
+    assert summary["tied_best_indices"] == [0, 1]
+    assert best_candidate == accepted_candidate
+    assert (run_dir / "materialized_best_candidate" / "selected.txt").read_text(
+        encoding="utf-8"
+    ) == "Accepted improved memory."
 
 
 def test_run_analyzer_flags_connection_blocked_experiment(tmp_path):
@@ -1385,6 +1495,7 @@ def test_run_analyzer_deduplicates_proposal_lifecycle_events(tmp_path):
     assert summary["proposal_statuses"] == {"accepted": 1}
     assert summary["proposed_components"] == {"main:system_prompt": 1}
     assert summary["proposal_rationale_files"] == 1
+    assert any("accepted candidate tied" in note for note in summary["diagnosis"])
 
 
 def test_local_runner_forces_no_proxy_for_localhost(monkeypatch):

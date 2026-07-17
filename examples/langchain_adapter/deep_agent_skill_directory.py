@@ -2420,6 +2420,8 @@ def evaluate_response_with_judge(
         judged_classification = TOOL_CAPABILITY_GAP
         suggested = ""
         classification_reason = "required evidence is unavailable from current tools: " + ", ".join(tool_gaps[:3])
+    elif judged_classification == NO_FAILURE:
+        suggested = ""
     if judged_classification != TOOL_CAPABILITY_GAP and suggested not in candidate:
         suggested = suggest_component_to_update(
             state,
@@ -2513,6 +2515,8 @@ def build_judge_prompt(
         "same example also misses reusable expert checkpoints or skips a supported tool, keep the text-actionable "
         "classification and suggest the owning text component; report the tool gap separately and never claim that "
         "the text edit supplies the missing data.\n"
+        "For NO_FAILURE, leave suggested_component empty. Successful examples are regression constraints and positive "
+        "evidence; they must not vote to mutate a component.\n"
         "If Expected is not `rubric-only`, treat it as the authoritative target label, route, answer, or structured "
         "result. Do not reinterpret the task as solving the user's underlying real-world problem unless the rubric "
         "explicitly asks for that. For routing or classification tasks, score the final response by whether it returns "
@@ -2530,7 +2534,7 @@ def build_judge_prompt(
         '  "score": 0.0,\n'
         f'  "failure_classification": "{SKILL_DEFECT}|{EXECUTION_LAPSE}|{TOOL_CAPABILITY_GAP}|{NO_FAILURE}",\n'
         '  "classification_reason": "short reason",\n'
-        '  "suggested_component": "one key from allowed_components, or empty for TOOL_CAPABILITY_GAP",\n'
+        '  "suggested_component": "one key from allowed_components, or empty for TOOL_CAPABILITY_GAP/NO_FAILURE",\n'
         '  "suggested_component_reason": "short reason",\n'
         '  "knowledge_scope": "global_policy|invariant_workflow|scoped_domain_rule|tool_semantics",\n'
         '  "applicability_scope": "observable triggers, relevant scopes, and exclusions",\n'
@@ -2923,7 +2927,7 @@ def suggest_component_to_update(
     expected_route: str = "",
 ) -> str:
     candidate = state.get("candidate_excerpt", {})
-    if failure_classification == TOOL_CAPABILITY_GAP:
+    if failure_classification in {TOOL_CAPABILITY_GAP, NO_FAILURE}:
         return ""
     if failure_classification == EXECUTION_LAPSE:
         return prompt_or_memory_component(candidate)

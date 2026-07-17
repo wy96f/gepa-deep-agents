@@ -92,6 +92,7 @@ class DefaultFeedbackComponentSelector:
         suggested: dict[str, dict[str, float]] = {}
         actionable_trajectories = 0
         capability_gap_trajectories = 0
+        no_failure_trajectories = 0
         sorted_trajectories = sorted(
             trajectories or [],
             key=lambda item: float(item.get("score", 0.0)) if isinstance(item, dict) else 0.0,
@@ -101,8 +102,12 @@ class DefaultFeedbackComponentSelector:
                 continue
             score = float(trajectory.get("score", 0.0))
             feedback = str(trajectory.get("feedback", ""))
-            if self._failure_classification(feedback) == "TOOL_CAPABILITY_GAP":
+            failure_classification = self._failure_classification(feedback)
+            if failure_classification == "TOOL_CAPABILITY_GAP":
                 capability_gap_trajectories += 1
+                continue
+            if failure_classification == "NO_FAILURE":
+                no_failure_trajectories += 1
                 continue
             actionable_trajectories += 1
             component = self._component_from_feedback(feedback, candidate)
@@ -130,7 +135,7 @@ class DefaultFeedbackComponentSelector:
                     self._round_robin_fallback(candidate_idx, candidate, excluded=set(ranked_components)),
                 )
             ]
-        if capability_gap_trajectories and not actionable_trajectories:
+        if (capability_gap_trajectories or no_failure_trajectories) and not actionable_trajectories:
             return []
         return [self._record_selection(candidate_idx, self._round_robin_fallback(candidate_idx, candidate))]
 

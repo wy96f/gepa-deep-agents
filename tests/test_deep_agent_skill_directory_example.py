@@ -351,6 +351,38 @@ def test_component_selector_skips_text_mutation_for_tool_capability_only_batch(t
     assert selected == []
 
 
+def test_component_selector_ignores_no_failure_votes(tmp_path):
+    example = _load_example_module()
+    seed_spec = example.create_seed_workspace(tmp_path)
+    candidate, _surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
+    selector = example.DarwinFeedbackComponentSelector()
+    no_failure_feedback = (
+        "Scores:\n"
+        "- failure_classification: NO_FAILURE\n"
+        "- suggested_component: skill:support-router:reference/routing.md"
+    )
+    execution_feedback = (
+        "Scores:\n"
+        "- failure_classification: EXECUTION_LAPSE\n"
+        "- suggested_component: memory:AGENTS.md"
+    )
+
+    selected = selector(
+        None,
+        [
+            {"score": 1.0, "feedback": no_failure_feedback},
+            {"score": 1.0, "feedback": no_failure_feedback},
+            {"score": 0.0, "feedback": execution_feedback},
+        ],
+        [1.0, 1.0, 0.0],
+        0,
+        candidate,
+    )
+
+    assert selected == ["memory:AGENTS.md"]
+    assert selector(None, [{"score": 1.0, "feedback": no_failure_feedback}], [1.0], 1, candidate) == []
+
+
 def test_default_evaluator_writes_fitness_back_to_original_state():
     example = _load_example_module()
     state = {"messages": []}
@@ -927,6 +959,39 @@ def test_reflection_judge_score_is_capped_when_expected_route_is_missing(tmp_pat
     assert "- judge_score: 0.95" in feedback
     assert "- correctness_cap: 0.40" in feedback
     assert "- final_cap: 0.40" in feedback
+
+
+def test_reflection_judge_clears_suggestion_for_no_failure(tmp_path):
+    example = _load_example_module()
+    seed_spec = example.create_seed_workspace(tmp_path)
+    candidate, surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
+    constraints = example.validate_candidate_constraints(candidate, candidate, surfaces)
+    state = {
+        "messages": [example.AIMessage(content="<route>billing</route>")],
+        "baseline_response": "<route>billing</route>",
+        "candidate_excerpt": candidate,
+        "candidate_constraints": [constraint.__dict__ for constraint in constraints],
+    }
+
+    score, feedback = example.evaluate_response_with_judge(
+        {"input": "Where is my invoice?", "expected": "billing"},
+        state,
+        lambda _prompt: json.dumps(
+            {
+                "score": 1.0,
+                "failure_classification": "NO_FAILURE",
+                "classification_reason": "correct route",
+                "suggested_component": "skill:support-router:reference/routing.md",
+                "suggested_component_reason": "unnecessary refinement",
+                "feedback": "correct",
+                "boundary_assessment": "ok",
+            }
+        ),
+    )
+
+    assert score == 1.0
+    assert state["fitness"]["failure_classification"] == "NO_FAILURE"
+    assert "- suggested_component: none" in feedback
 
 
 def test_reflection_judge_score_is_capped_by_missing_rubric_checkpoints(tmp_path):

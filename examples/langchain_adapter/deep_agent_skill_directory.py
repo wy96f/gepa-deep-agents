@@ -2130,11 +2130,14 @@ def expectation_supported_by_tools(expectation: Any, inventory: Sequence[Mapping
     inventory_text = normalize_for_keyword_match(tool_inventory_text(inventory))
     if not inventory_text:
         return False
-    return any(
-        normalized_keyword and normalized_keyword in inventory_text
+    normalized_keywords = {
+        normalized_keyword
         for keyword in trace_expectation_keywords(expectation)
         if (normalized_keyword := normalize_for_keyword_match(keyword))
-    )
+    }
+    matched_keywords = {keyword for keyword in normalized_keywords if keyword in inventory_text}
+    required_matches = min(2, len(normalized_keywords))
+    return bool(required_matches) and len(matched_keywords) >= required_matches
 
 
 def data_acquisition_diagnostics(example: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
@@ -2398,17 +2401,32 @@ def evaluate_response_with_judge(
     if judged_classification not in {SKILL_DEFECT, EXECUTION_LAPSE, TOOL_CAPABILITY_GAP, NO_FAILURE}:
         judged_classification = failure_classification
     classification_reason = str(payload.get("classification_reason") or default_reason)
-    tool_gaps = list(fitness.get("tool_capability_gaps") or [])
-    if tool_gaps:
+    tool_gaps = [str(item) for item in fitness.get("tool_capability_gaps") or []]
+    supported_missing = [str(item) for item in fitness.get("tool_supported_missing_expectations") or []]
+    _matched, missing_checkpoints, _coverage = rubric_checkpoint_results(example, response)
+    if failures:
+        judged_classification = SKILL_DEFECT
+    elif missing_checkpoints and not expected:
+        judged_classification = SKILL_DEFECT
+        classification_reason = "rubric-only output missed expert checkpoints: " + ", ".join(missing_checkpoints[:3])
+        if tool_gaps:
+            classification_reason += "; separate tool capability gaps: " + ", ".join(tool_gaps[:3])
+    elif supported_missing and not expected:
+        judged_classification = EXECUTION_LAPSE
+        classification_reason = "agent skipped available data-acquisition paths for: " + ", ".join(
+            supported_missing[:3]
+        )
+    elif tool_gaps:
         judged_classification = TOOL_CAPABILITY_GAP
         suggested = ""
         classification_reason = "required evidence is unavailable from current tools: " + ", ".join(tool_gaps[:3])
-    elif rubric_cap_value < 1.0 and not expected:
-        _matched, missing_checkpoints, _coverage = rubric_checkpoint_results(example, response)
-        judged_classification = SKILL_DEFECT
-        classification_reason = "rubric-only output missed expert checkpoints: " + ", ".join(missing_checkpoints[:3])
-    if failures:
-        judged_classification = SKILL_DEFECT
+    if judged_classification != TOOL_CAPABILITY_GAP and suggested not in candidate:
+        suggested = suggest_component_to_update(
+            state,
+            weakest_dimension(fitness, failures),
+            judged_classification,
+            expected,
+        )
     fitness["failure_classification"] = judged_classification
     fitness["classification_reason"] = classification_reason
     state["fitness"] = fitness
@@ -2490,8 +2508,11 @@ def build_judge_prompt(
         "model. Keep unsupported or uncollected evidence as a hypothesis. Reject vague advice that lacks these elements.\n"
         "Data-acquisition expectations are satisfied only by paired, successful tool-call results whose declared seed "
         "capability matches the expectation. Keywords in prompts, skills, AI prose, or final answers are not acquisition "
-        "evidence. If required evidence has no matching current tool capability, classify TOOL_CAPABILITY_GAP, leave "
-        "suggested_component empty, and recommend a concrete new tool capability instead of a text mutation.\n"
+        "evidence. If missing tool capability is the only actionable failure, classify TOOL_CAPABILITY_GAP, leave "
+        "suggested_component empty, and recommend a concrete new tool capability instead of a text mutation. If the "
+        "same example also misses reusable expert checkpoints or skips a supported tool, keep the text-actionable "
+        "classification and suggest the owning text component; report the tool gap separately and never claim that "
+        "the text edit supplies the missing data.\n"
         "If Expected is not `rubric-only`, treat it as the authoritative target label, route, answer, or structured "
         "result. Do not reinterpret the task as solving the user's underlying real-world problem unless the rubric "
         "explicitly asks for that. For routing or classification tasks, score the final response by whether it returns "
@@ -2696,20 +2717,36 @@ def classify_failure(
         return SKILL_DEFECT, "candidate text failed one or more hard gates"
 
     tool_gaps = list(fitness.get("tool_capability_gaps") or [])
-    if tool_gaps:
-        return (
-            TOOL_CAPABILITY_GAP,
-            "current tools cannot obtain required evidence for: " + ", ".join(str(item) for item in tool_gaps[:3]),
-        )
+    supported_missing = list(fitness.get("tool_supported_missing_expectations") or [])
 
     expected = example.get("answer") or example.get("expected") or ""
     if not expected:
         _matched, missing, _coverage = rubric_checkpoint_results(example, response)
         if missing:
-            return SKILL_DEFECT, f"rubric-only output missed expert checkpoints: {', '.join(missing[:3])}"
+            reason = f"rubric-only output missed expert checkpoints: {', '.join(missing[:3])}"
+            if tool_gaps:
+                reason += "; separate tool capability gaps: " + ", ".join(str(item) for item in tool_gaps[:3])
+            return SKILL_DEFECT, reason
+        if supported_missing:
+            return (
+                EXECUTION_LAPSE,
+                "agent skipped available data-acquisition paths for: "
+                + ", ".join(str(item) for item in supported_missing[:3]),
+            )
+        if tool_gaps:
+            return (
+                TOOL_CAPABILITY_GAP,
+                "current tools cannot obtain required evidence for: "
+                + ", ".join(str(item) for item in tool_gaps[:3]),
+            )
         if response.strip():
             return NO_FAILURE, "rubric-only output covered the expert checkpoints"
         return EXECUTION_LAPSE, "rubric-only example did not produce a usable answer"
+    if tool_gaps:
+        return (
+            TOOL_CAPABILITY_GAP,
+            "current tools cannot obtain required evidence for: " + ", ".join(str(item) for item in tool_gaps[:3]),
+        )
     if float(fitness.get("hard", 0.0)) >= 1.0:
         return NO_FAILURE, "candidate produced the expected route"
     predicted = extract_route(response)
@@ -2890,6 +2927,8 @@ def suggest_component_to_update(
         return ""
     if failure_classification == EXECUTION_LAPSE:
         return prompt_or_memory_component(candidate)
+    if failure_classification == SKILL_DEFECT and state.get("fitness", {}).get("missing_rubric_checkpoints"):
+        weakest = "effect"
 
     failures = hard_constraint_failures(state)
     if failures:

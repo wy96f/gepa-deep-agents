@@ -734,6 +734,35 @@ def test_data_acquisition_diagnostics_distinguishes_missing_tool_from_skipped_to
     assert diagnostics["tool_capability_gaps"] == ["环保安监信息获取"]
 
 
+def test_policy_topic_overlap_does_not_claim_borrower_data_capability():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "trace_expectations": [
+                {
+                    "label": "财务现金流信息获取",
+                    "tool_intent_keywords": ["财务", "现金流", "银行流水"],
+                }
+            ]
+        }
+    }
+    state = {
+        "messages": [example.AIMessage(content="尚未取得企业现金流数据。")],
+        "available_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_policy",
+                "description": "按主题查询内部信贷审查政策; 主题可为现金流、抵质押、保证或行业.",
+            }
+        ],
+    }
+
+    diagnostics = example.data_acquisition_diagnostics(row, state)
+
+    assert diagnostics["tool_supported_missing_expectations"] == []
+    assert diagnostics["tool_capability_gaps"] == ["财务现金流信息获取"]
+
+
 def test_missing_data_tool_is_classified_as_tool_capability_gap():
     example = _load_example_module()
     row = {
@@ -761,6 +790,109 @@ def test_missing_data_tool_is_classified_as_tool_capability_gap():
     assert state["fitness"]["tool_capability_gaps"] == ["环保安监信息获取"]
     assert "- failure_classification: TOOL_CAPABILITY_GAP" in feedback
     assert "- suggested_component: none" in feedback
+
+
+def test_mixed_checkpoint_and_tool_gap_still_selects_learned_reference():
+    example = _load_example_module()
+    config_path = (
+        Path(__file__).parents[1]
+        / "examples"
+        / "langchain_adapter"
+        / "deepagents_gepa_configs"
+        / "credit_approval.toml"
+    )
+    project = example.build_candidate_from_deep_agent_project(example.load_deepagents_gepa_config(config_path))
+    row = {
+        "input": "示例制造企业",
+        "rubric": "覆盖客户集中风险并取得客户交易证据。",
+        "metadata": {
+            "checkpoints": [{"label": "客户集中风险", "keywords": ["客户集中", "回款集中"]}],
+            "trace_expectations": [
+                {
+                    "label": "客户交易信息获取",
+                    "tool_intent_keywords": ["客户", "合同", "回款"],
+                }
+            ],
+        },
+    }
+    state = {
+        "messages": [example.AIMessage(content="当前资料不足, 暂不作结论.")],
+        "baseline_response": "",
+        "candidate_excerpt": project.candidate,
+        "candidate_constraints": [],
+        "available_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_policy",
+                "description": "查询内部授信政策。",
+            }
+        ],
+    }
+
+    _score, feedback = example.evaluate_response(row, state)
+
+    assert state["fitness"]["failure_classification"] == "SKILL_DEFECT"
+    assert state["fitness"]["tool_capability_gaps"] == ["客户交易信息获取"]
+    assert "- suggested_component: skill:credit-risk-review:reference/learned_expert_patterns.md" in feedback
+    assert "separate tool capability gaps" in feedback
+
+
+def test_reflection_judge_keeps_mixed_gap_text_actionable():
+    example = _load_example_module()
+    config_path = (
+        Path(__file__).parents[1]
+        / "examples"
+        / "langchain_adapter"
+        / "deepagents_gepa_configs"
+        / "credit_approval.toml"
+    )
+    project = example.build_candidate_from_deep_agent_project(example.load_deepagents_gepa_config(config_path))
+    row = {
+        "input": "示例制造企业",
+        "rubric": "覆盖客户集中风险并取得客户交易证据。",
+        "metadata": {
+            "checkpoints": [{"label": "客户集中风险", "keywords": ["客户集中", "回款集中"]}],
+            "trace_expectations": [
+                {
+                    "label": "客户交易信息获取",
+                    "tool_intent_keywords": ["客户", "合同", "回款"],
+                }
+            ],
+        },
+    }
+    state = {
+        "messages": [example.AIMessage(content="当前资料不足, 暂不作结论.")],
+        "baseline_response": "",
+        "candidate_excerpt": project.candidate,
+        "candidate_constraints": [],
+        "available_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_policy",
+                "description": "查询内部授信政策。",
+            }
+        ],
+    }
+
+    _score, feedback = example.evaluate_response_with_judge(
+        row,
+        state,
+        lambda _prompt: json.dumps(
+            {
+                "score": 0.1,
+                "failure_classification": "TOOL_CAPABILITY_GAP",
+                "classification_reason": "missing customer data tool",
+                "suggested_component": "",
+                "suggested_component_reason": "no text component can retrieve data",
+                "feedback": "add a customer data tool",
+                "boundary_assessment": "ok",
+            }
+        ),
+    )
+
+    assert state["fitness"]["failure_classification"] == "SKILL_DEFECT"
+    assert "- suggested_component: skill:credit-risk-review:reference/learned_expert_patterns.md" in feedback
+    assert "separate tool capability gaps" in feedback
 
 
 def test_reflection_judge_score_is_capped_when_expected_route_is_missing(tmp_path):

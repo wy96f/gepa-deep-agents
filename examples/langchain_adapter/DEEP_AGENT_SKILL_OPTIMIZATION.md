@@ -151,7 +151,13 @@ skills/credit-risk-review/reference/learned_expert_patterns.md
 出现成对的成功工具调用与结果，且种子工具能力与该期望匹配时才算完成。提示词、
 SKILL.md、智能体文字和最终答案中的关键词都不能作为已取得证据。已知目标工具时可
 设置 `tool_names`；否则框架使用种子工具名称、描述和 `tool_intent_keywords` 进行
-保守匹配。
+保守匹配。模糊匹配至少需要两个独立能力关键词，避免把内部政策查询误判为企业数据
+查询。
+
+工具能力缺口与文本缺陷可以同时存在。案例既缺少外部数据工具、又漏掉可复用的专家
+分析方法时，框架仍允许优化相应 reference，同时在 feedback 和运行产物中保留
+`TOOL_CAPABILITY_GAP` 供工具开发排期。只有不存在可优化文本问题的纯工具缺口才跳过
+文本 mutation。
 
 批量清洗审批意见：
 

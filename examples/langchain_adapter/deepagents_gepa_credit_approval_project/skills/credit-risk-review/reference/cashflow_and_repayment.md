@@ -1,22 +1,31 @@
-# Cash Flow And Repayment Capacity
+# 现金流与偿债能力
 
-Primary repayment capacity should come from recurring operating cash flow or a
-verified project cash-flow waterfall.
+第一还款来源应来自经过验证的持续经营现金流，或具有可核验闭环的项目现金流。不同商业模式使用不同证据和比较口径，不预设统一指标阈值。
 
-Useful checks:
+## 经营周转类融资
 
-- DSCR should be tested under base and downside cases.
-- For project loans, match construction milestones, sales collection, escrow
-  control, and repayment schedule.
-- For working-capital loans, compare facility amount with genuine operating
-  cycle funding needs.
-- Customer concentration can turn reported revenue into collection risk.
-- A repayment source that depends on refinancing should be treated as weak
-  unless takeout financing is committed.
+- 触发信号：授信用于采购、备货、生产或账期周转。
+- 取得证据：采购和销售合同、发票、库存、银行流水、应收账龄、经营周期及历史授信使用记录。
+- 分析方法：还原真实资金周转周期和峰值缺口，比较申请金额与可验证的经营资金需求，排除挪用于长期资产、关联方或偿还其他融资。
+- 审批使用：将额度、提款条件和回款归集与真实周转需求相匹配。
 
-Approval conditions:
+## 项目现金流融资
 
-- Require escrow or controlled collection accounts when repayment depends on
-  designated project cash flow.
-- Require covenant monitoring when leverage, DSCR, or inventory turnover is near
-  risk thresholds.
+- 触发信号：还款依赖项目建设、销售、收费或特定合同回款。
+- 取得证据：建设进度、预算和超支安排、销售或收费计划、合同履约、监管账户及还款计划。
+- 分析方法：在基准和不利情景下测算现金流覆盖；只有预测基础可靠时才使用偿债备付率（DSCR），阈值应来自适用政策和项目风险，不得臆造。
+- 审批使用：根据现金流节点设置提款、资本金到位、监管账户、分期还款和触发性保护条件。
+
+## 客户集中与回款质量
+
+- 触发信号：收入或应收高度集中于少数客户，或客户信用、结算方式和账期发生变化。
+- 取得证据：客户清单、合同、验收、发票、历史回款、逾期和争议记录。
+- 分析方法：比较账面收入、已验收交易和实际回款，评价核心客户变化对现金流的影响。
+- 审批使用：必要时设置付款方核验、应收确权、回款专户或集中度监控。
+
+## 再融资依赖
+
+- 触发信号：现有债务偿还依赖续贷、借新还旧、资产处置或尚未落实的外部资金。
+- 取得证据：到期债务、已承诺融资、提款前提、资产处置进度和备用流动性。
+- 分析方法：区分已落实资金与意向性资金，并在续贷或处置延迟情景下测试流动性缺口。
+- 审批使用：未落实的再融资不能作为确定还款来源，应转化为放款前提、额度压降或否决考虑。

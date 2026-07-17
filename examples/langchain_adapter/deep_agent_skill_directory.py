@@ -81,7 +81,7 @@ except ImportError:  # pragma: no cover - Python 3.10 fallback when tomli is ins
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool, tool
 
 from gepa import optimize
@@ -121,7 +121,12 @@ COMPONENT_LABEL_RE = re.compile(r"(?m)^#{1,6}\s*(?:main:|memory:|skill:|subagent
 YAML_FRONTMATTER_RE = re.compile(r"(?s)^\s*---\s*\n.*?\bname\s*:.*?\bdescription\s*:.*?\n---")
 SKILL_DEFECT = "SKILL_DEFECT"
 EXECUTION_LAPSE = "EXECUTION_LAPSE"
+TOOL_CAPABILITY_GAP = "TOOL_CAPABILITY_GAP"
 NO_FAILURE = "NO_FAILURE"
+TOOL_FAILURE_PATTERN = re.compile(
+    r"(?is)^\s*(?:error|exception|failed|failure|tool error|执行失败|调用失败|工具失败)\b|"
+    r"\btraceback \(most recent call last\)"
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -211,6 +216,13 @@ class DatasetConfig:
     split: str = "train"
     limit: int | None = None
     query: dict[str, Any] = field(default_factory=dict)
+    split_strategy: str = "stratified"
+    train_ratio: float = 0.60
+    val_ratio: float = 0.20
+    test_ratio: float = 0.20
+    stratify_by: tuple[str, ...] = ("metadata.difficulty",)
+    seed: int = 0
+    evaluate_final_test: bool = True
 
 
 @dataclass(frozen=True)
@@ -437,6 +449,13 @@ def _parse_dataset_config(raw_dataset: dict[str, Any]) -> DatasetConfig:
         split=str(raw_dataset.get("split", "train")),
         limit=int(raw_dataset["limit"]) if raw_dataset.get("limit") is not None else None,
         query=dict(raw_dataset.get("query", {})),
+        split_strategy=str(raw_dataset.get("split_strategy", "stratified")),
+        train_ratio=float(raw_dataset.get("train_ratio", 0.60)),
+        val_ratio=float(raw_dataset.get("val_ratio", 0.20)),
+        test_ratio=float(raw_dataset.get("test_ratio", 0.20)),
+        stratify_by=_as_tuple(raw_dataset.get("stratify_by"), ("metadata.difficulty",)),
+        seed=int(raw_dataset.get("seed", 0)),
+        evaluate_final_test=bool(raw_dataset.get("evaluate_final_test", True)),
     )
 
 
@@ -782,6 +801,33 @@ def tool_inventory_text(inventory: Sequence[Mapping[str, str]]) -> str:
     for item in inventory:
         lines.append(f"{item.get('owner', 'main')}::{item.get('name', '')}: {item.get('description', '')}")
     return "\n".join(lines)
+
+
+def stable_tool_inventory(
+    runtime_inventory: Sequence[Mapping[str, str]],
+    baseline_candidate: Mapping[str, str],
+) -> list[dict[str, str]]:
+    """Use seed descriptions for capability diagnosis.
+
+    Tool descriptions are optimizable text. Capability-gap detection must not
+    let a proposal claim that an unchanged tool implementation gained a new
+    data source merely by rewriting its description.
+    """
+    stable: list[dict[str, str]] = []
+    for raw_item in runtime_inventory:
+        item = {str(key): str(value) for key, value in raw_item.items()}
+        owner = item.get("owner", "main")
+        name = item.get("name", "")
+        candidate_keys = [
+            f"main:tool:{name}:description" if owner == "main" else f"subagent:{owner}:tool:{name}:description",
+            f"mcp:tool:{name}:description",
+        ]
+        for key in candidate_keys:
+            if key in baseline_candidate:
+                item["description"] = str(baseline_candidate[key])
+                break
+        stable.append(item)
+    return stable
 
 
 def _copy_tool_with_description(tool_obj: BaseTool | Callable | dict[str, Any], description: str):
@@ -1261,10 +1307,13 @@ def rollout(
             baseline_candidate,
             surfaces,
         ).check(candidate, {"materialized_root": temp_root})
+        runtime_inventory = tool_inventory_from_kwargs(application.kwargs)
         state_extras = {
-            "available_tools": tool_inventory_from_kwargs(application.kwargs),
+            "available_tools": runtime_inventory,
+            "capability_tools": stable_tool_inventory(runtime_inventory, baseline_candidate),
             "trace_context_window_tokens": trace_context_window_tokens(),
             "trace_context_ratio": trace_context_ratio(),
+            "evaluation_phase": example.get("evaluation_phase", "optimization"),
         }
         try:
             agent = create_deep_agent_from_application(application, llm)
@@ -1311,10 +1360,13 @@ def configured_rollout(
             )
         ).check(candidate, {"materialized_root": temp_root})
         runtime_application = configured_runtime_application(application, mcp_loader)
+        runtime_inventory = tool_inventory_from_kwargs(runtime_application.kwargs)
         state_extras = {
-            "available_tools": tool_inventory_from_kwargs(runtime_application.kwargs),
+            "available_tools": runtime_inventory,
+            "capability_tools": stable_tool_inventory(runtime_inventory, baseline_candidate),
             "trace_context_window_tokens": trace_context_window_tokens(),
             "trace_context_ratio": trace_context_ratio(),
+            "evaluation_phase": example.get("evaluation_phase", "optimization"),
         }
         try:
             agent = create_deep_agent_from_application(runtime_application, llm)
@@ -1758,6 +1810,14 @@ def skill_script_reference_constraints(
 def skill_structure_constraints(key: str, text: str) -> list[ConstraintResult]:
     frontmatter = text[:600]
     lowered = text.lower()
+    has_ordered_workflow = "workflow" in lowered or "工作流程" in text or re.search(r"^\s*1[.、]", text, re.M) is not None
+    has_failure_modes = (
+        any(marker in lowered for marker in ["failure", "fallback", "if "])
+        or any(marker in text for marker in ["失败模式", "异常处理", "如果", "若", "当"])
+    )
+    has_guardrails = any(
+        marker in lowered for marker in ["do not", "never", "avoid", "guardrail", "blacklist"]
+    ) or any(marker in text for marker in ["不得", "禁止", "避免", "约束", "护栏", "不应"])
     return [
         ConstraintResult(text.strip().startswith("---"), f"{key}:frontmatter", "SKILL.md starts with YAML frontmatter"),
         ConstraintResult(
@@ -1766,19 +1826,19 @@ def skill_structure_constraints(key: str, text: str) -> list[ConstraintResult]:
             "frontmatter includes name and description",
         ),
         ConstraintResult(
-            "workflow" in lowered or re.search(r"^\s*1\.", text, re.M) is not None,
+            has_ordered_workflow,
             f"{key}:workflow",
             "skill includes ordered workflow",
             "advisory",
         ),
         ConstraintResult(
-            "failure" in lowered or "fallback" in lowered or "if " in lowered,
+            has_failure_modes,
             f"{key}:failure_modes",
             "skill includes failure modes or if-then branches",
             "advisory",
         ),
         ConstraintResult(
-            any(marker in lowered for marker in ["do not", "never", "avoid", "guardrail", "blacklist"]),
+            has_guardrails,
             f"{key}:risk_blacklist",
             "skill includes do-not/guardrail guidance",
             "advisory",
@@ -1914,28 +1974,159 @@ def trace_expectation_keywords(expectation: Any) -> list[str]:
     return [str(expectation)]
 
 
+def trace_expectation_tool_names(expectation: Any) -> list[str]:
+    if not isinstance(expectation, Mapping):
+        return []
+    raw_names = expectation.get("tool_names") or expectation.get("tools") or expectation.get("required_tools") or []
+    if isinstance(raw_names, str):
+        raw_names = [raw_names]
+    return [str(name).strip() for name in raw_names if str(name).strip()]
+
+
+def tool_result_is_successful(message: Any) -> tuple[bool, str]:
+    status = getattr(message, "status", None)
+    additional_kwargs = getattr(message, "additional_kwargs", {}) or {}
+    status = status or additional_kwargs.get("status")
+    normalized_status = str(status or "").strip().lower()
+    content = message_content_text(getattr(message, "content", "")).strip()
+    if normalized_status in {"error", "failed", "failure"}:
+        return False, normalized_status
+    if not content:
+        return False, normalized_status or "empty_result"
+    if TOOL_FAILURE_PATTERN.search(content):
+        return False, normalized_status or "error_result"
+    return True, normalized_status or "success"
+
+
+def trace_tool_evidence(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return paired tool calls/results; AI prose never counts as acquisition."""
+    calls_by_id: dict[str, dict[str, Any]] = {}
+    evidence: list[dict[str, Any]] = []
+    omitted_tools = trace_omit_tool_names()
+    for message in state.get("messages") or []:
+        for call in getattr(message, "tool_calls", None) or []:
+            call_id = trace_tool_call_id(call)
+            if call_id is None:
+                continue
+            if isinstance(call, Mapping):
+                args = call.get("args")
+            else:
+                args = getattr(call, "args", None)
+            calls_by_id[call_id] = {
+                "tool_call_id": call_id,
+                "name": trace_tool_call_name(call),
+                "args": args,
+            }
+        if not isinstance(message, ToolMessage) and type(message).__name__ != "ToolMessage":
+            continue
+        tool_call_id = str(getattr(message, "tool_call_id", "") or "")
+        call = calls_by_id.get(tool_call_id, {})
+        name = str(getattr(message, "name", None) or call.get("name") or "unknown_tool")
+        if name in omitted_tools:
+            continue
+        success, status = tool_result_is_successful(message)
+        evidence.append(
+            {
+                "tool_call_id": tool_call_id or None,
+                "name": name,
+                "args": call.get("args"),
+                "result": message_content_text(getattr(message, "content", "")),
+                "success": success,
+                "status": status,
+            }
+        )
+    return evidence
+
+
+def tool_name_matches(actual: str, expected: str) -> bool:
+    actual_normalized = actual.strip().lower()
+    expected_normalized = expected.strip().lower()
+    return actual_normalized == expected_normalized or actual_normalized.endswith(
+        (f"::{expected_normalized}", f".{expected_normalized}", f"/{expected_normalized}")
+    )
+
+
+def inventory_for_tool(
+    tool_name: str,
+    inventory: Sequence[Mapping[str, str]],
+) -> list[Mapping[str, str]]:
+    return [item for item in inventory if tool_name_matches(str(item.get("name", "")), tool_name)]
+
+
+def tool_evidence_matches_expectation(
+    expectation: Any,
+    evidence: Mapping[str, Any],
+    inventory: Sequence[Mapping[str, str]],
+) -> bool:
+    if not evidence.get("success"):
+        return False
+    tool_name = str(evidence.get("name") or "")
+    explicit_names = trace_expectation_tool_names(expectation)
+    if explicit_names:
+        return any(tool_name_matches(tool_name, expected_name) for expected_name in explicit_names)
+
+    matching_inventory = inventory_for_tool(tool_name, inventory)
+    if not expectation_supported_by_tools(expectation, matching_inventory):
+        return False
+    evidence_text = normalize_for_keyword_match(
+        " ".join(
+            [
+                tool_name,
+                json.dumps(evidence.get("args"), ensure_ascii=False, default=str),
+                str(evidence.get("result") or ""),
+            ]
+        )
+    )
+    return any(
+        normalized_keyword and normalized_keyword in evidence_text
+        for keyword in trace_expectation_keywords(expectation)
+        if (normalized_keyword := normalize_for_keyword_match(keyword))
+    )
+
+
+def trace_expectation_matches(
+    example: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[list[str], list[str], dict[str, list[str]], list[dict[str, Any]]]:
+    expectations = trace_expectations(example)
+    inventory = list(state.get("capability_tools") or state.get("available_tools") or [])
+    tool_evidence = trace_tool_evidence(state)
+    matched: list[str] = []
+    missing: list[str] = []
+    evidence_by_expectation: dict[str, list[str]] = {}
+    for expectation in expectations:
+        label = trace_expectation_label(expectation)
+        matching_tools = [
+            str(item.get("name") or "unknown_tool")
+            for item in tool_evidence
+            if tool_evidence_matches_expectation(expectation, item, inventory)
+        ]
+        if matching_tools:
+            matched.append(label)
+            evidence_by_expectation[label] = sorted(set(matching_tools))
+        else:
+            missing.append(label)
+    return matched, missing, evidence_by_expectation, tool_evidence
+
+
 def trace_expectation_results(example: dict[str, Any], state: dict[str, Any]) -> tuple[list[str], list[str], float]:
     expectations = trace_expectations(example)
     if not expectations:
         return [], [], 1.0
-    trace_text = normalize_for_keyword_match(full_trace_text(state))
-    matched: list[str] = []
-    missing: list[str] = []
-    for expectation in expectations:
-        label = trace_expectation_label(expectation)
-        if any(
-            normalize_for_keyword_match(keyword) and normalize_for_keyword_match(keyword) in trace_text
-            for keyword in trace_expectation_keywords(expectation)
-        ):
-            matched.append(label)
-        else:
-            missing.append(label)
+    matched, missing, _evidence_by_expectation, _tool_evidence = trace_expectation_matches(example, state)
     return matched, missing, len(matched) / max(1, len(expectations))
 
 
 def expectation_supported_by_tools(expectation: Any, inventory: Sequence[Mapping[str, str]]) -> bool:
     if not inventory:
         return False
+    explicit_names = trace_expectation_tool_names(expectation)
+    if explicit_names:
+        return any(
+            tool_name_matches(str(item.get("name", "")), expected_name)
+            for item in inventory
+            for expected_name in explicit_names
+        )
     inventory_text = normalize_for_keyword_match(tool_inventory_text(inventory))
     if not inventory_text:
         return False
@@ -1955,10 +2146,14 @@ def data_acquisition_diagnostics(example: dict[str, Any], state: dict[str, Any])
             "trace_expectation_coverage": 1.0,
             "tool_supported_missing_expectations": [],
             "tool_capability_gaps": [],
+            "trace_expectation_evidence": {},
+            "successful_tool_evidence": [],
+            "failed_tool_evidence": [],
         }
-    matched, missing, coverage = trace_expectation_results(example, state)
+    matched, missing, evidence_by_expectation, tool_evidence = trace_expectation_matches(example, state)
+    coverage = len(matched) / max(1, len(expectations))
     missing_set = set(missing)
-    inventory = list(state.get("available_tools") or [])
+    inventory = list(state.get("capability_tools") or state.get("available_tools") or [])
     tool_supported: list[str] = []
     capability_gaps: list[str] = []
     for expectation in expectations:
@@ -1975,7 +2170,36 @@ def data_acquisition_diagnostics(example: dict[str, Any], state: dict[str, Any])
         "trace_expectation_coverage": coverage,
         "tool_supported_missing_expectations": tool_supported,
         "tool_capability_gaps": capability_gaps,
+        "trace_expectation_evidence": evidence_by_expectation,
+        "successful_tool_evidence": [
+            {
+                **item,
+                "result": str(item.get("result") or "")[:1200],
+            }
+            for item in tool_evidence
+            if item.get("success")
+        ],
+        "failed_tool_evidence": [
+            {
+                **item,
+                "result": str(item.get("result") or "")[:1200],
+            }
+            for item in tool_evidence
+            if not item.get("success")
+        ],
     }
+
+
+def tool_evidence_text(evidence: Sequence[Mapping[str, Any]], limit: int = 12) -> str:
+    lines = []
+    for item in evidence[:limit]:
+        args = json.dumps(item.get("args"), ensure_ascii=False, default=str)
+        result = str(item.get("result") or "").replace("\n", " ")[:300]
+        lines.append(
+            f"- {item.get('name', 'unknown_tool')} status={item.get('status', 'unknown')} "
+            f"args={args} result={result}"
+        )
+    return "\n".join(lines) or "- none"
 
 
 def rubric_coverage_cap(example: dict[str, Any], response: str) -> float:
@@ -2105,6 +2329,9 @@ def evaluate_response(example: dict[str, Any], state: dict) -> tuple[float, str]
         "eval_mode": eval_mode,
         "composite": composite,
     }
+    failure_classification, classification_reason = classify_failure(example, state, response, failures, fitness)
+    fitness["failure_classification"] = failure_classification
+    fitness["classification_reason"] = classification_reason
     state["fitness"] = fitness
     feedback = build_feedback(example, state, response, baseline_response, failures, fitness)
     return composite, feedback
@@ -2137,7 +2364,9 @@ def evaluate_response_with_judge(
     expected = example.get("answer") or example.get("expected") or ""
     failure_classification, default_reason = classify_failure(example, state, response, failures, state.get("fitness", {}))
     suggested = str(payload.get("suggested_component") or "").strip()
-    if suggested not in candidate:
+    if failure_classification == TOOL_CAPABILITY_GAP:
+        suggested = ""
+    elif suggested not in candidate:
         suggested = suggest_component_to_update(
             state,
             weakest_dimension(state.get("fitness", {}), failures),
@@ -2166,18 +2395,23 @@ def evaluate_response_with_judge(
     state["fitness"] = fitness
 
     judged_classification = str(payload.get("failure_classification") or failure_classification).strip()
-    if judged_classification not in {SKILL_DEFECT, EXECUTION_LAPSE, NO_FAILURE}:
+    if judged_classification not in {SKILL_DEFECT, EXECUTION_LAPSE, TOOL_CAPABILITY_GAP, NO_FAILURE}:
         judged_classification = failure_classification
     classification_reason = str(payload.get("classification_reason") or default_reason)
-    if rubric_cap_value < 1.0 and not expected:
+    tool_gaps = list(fitness.get("tool_capability_gaps") or [])
+    if tool_gaps:
+        judged_classification = TOOL_CAPABILITY_GAP
+        suggested = ""
+        classification_reason = "required evidence is unavailable from current tools: " + ", ".join(tool_gaps[:3])
+    elif rubric_cap_value < 1.0 and not expected:
         _matched, missing_checkpoints, _coverage = rubric_checkpoint_results(example, response)
-        tool_gaps = fitness.get("tool_capability_gaps", [])
         judged_classification = SKILL_DEFECT
         classification_reason = "rubric-only output missed expert checkpoints: " + ", ".join(missing_checkpoints[:3])
-        if tool_gaps:
-            classification_reason += "; possible external tool capability gaps: " + ", ".join(tool_gaps[:3])
     if failures:
         judged_classification = SKILL_DEFECT
+    fitness["failure_classification"] = judged_classification
+    fitness["classification_reason"] = classification_reason
+    state["fitness"] = fitness
     return score, build_judge_feedback(
         example=example,
         state=state,
@@ -2235,12 +2469,29 @@ def build_judge_prompt(
     tool_capability_gap_lines = "\n".join(
         f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]
     ) or "- none"
+    successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
+    failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
     available_tools = tool_inventory_text(state.get("available_tools") or []) or "- none"
     return (
         "You are the evaluator for a Deep Agents GEPA text-surface optimization run.\n"
         "Use hard constraints as non-negotiable validity rules. Treat advisory notes as hints, not automatic failures.\n"
         "Score whether the candidate behavior and text surfaces improved for the task, then recommend the single best "
         "component to edit next.\n"
+        "Choose the component by ownership: AGENTS.md/system prompts hold stable global execution policy; SKILL.md holds "
+        "invariant workflow, resource routing, failure modes, and guardrails; reference/*.md holds scoped domain "
+        "methodology, industry patterns, calculations, and expert knowledge; tool descriptions hold invocation semantics "
+        "and capability boundaries. Prefer the most specific existing reference component for domain knowledge. Do not "
+        "grow SKILL.md into an industry catalog.\n"
+        "Treat a single example as evidence for a candidate rule, not proof of a universal rule. Recommend explicit "
+        "applicability signals and exclusions whenever a change could help one industry or business model but harm "
+        "another. A useful rule must be operational: trigger, evidence, analysis/comparison, risk transmission, and "
+        "approval or verification action. A trigger is a conditional observable signal, not a universal checklist; "
+        "evidence is a borrower-specific acquisition plan whose source and comparison baseline may vary by business "
+        "model. Keep unsupported or uncollected evidence as a hypothesis. Reject vague advice that lacks these elements.\n"
+        "Data-acquisition expectations are satisfied only by paired, successful tool-call results whose declared seed "
+        "capability matches the expectation. Keywords in prompts, skills, AI prose, or final answers are not acquisition "
+        "evidence. If required evidence has no matching current tool capability, classify TOOL_CAPABILITY_GAP, leave "
+        "suggested_component empty, and recommend a concrete new tool capability instead of a text mutation.\n"
         "If Expected is not `rubric-only`, treat it as the authoritative target label, route, answer, or structured "
         "result. Do not reinterpret the task as solving the user's underlying real-world problem unless the rubric "
         "explicitly asks for that. For routing or classification tasks, score the final response by whether it returns "
@@ -2250,14 +2501,20 @@ def build_judge_prompt(
         "credit requires covering all required expert judgment points in the response, and useful optimization should "
         "move missing reusable expertise into the most specific skill or reference component. If Expert evaluation data "
         "is present, treat it as evaluator-only material: the agent should not see or quote it, but its output and trace "
-        "should align with the risk points, data-acquisition needs, and risk logic expressed there.\n\n"
+        "should align with the risk points, data-acquisition needs, and risk logic expressed there. Never recommend that "
+        "the runtime agent read Expert data, rubrics, checkpoints, or evaluator feedback; those fields are hidden during "
+        "rollout.\n\n"
         "Return JSON only, with this schema:\n"
         "{\n"
         '  "score": 0.0,\n'
-        f'  "failure_classification": "{SKILL_DEFECT}|{EXECUTION_LAPSE}|{NO_FAILURE}",\n'
+        f'  "failure_classification": "{SKILL_DEFECT}|{EXECUTION_LAPSE}|{TOOL_CAPABILITY_GAP}|{NO_FAILURE}",\n'
         '  "classification_reason": "short reason",\n'
-        '  "suggested_component": "one key from allowed_components",\n'
+        '  "suggested_component": "one key from allowed_components, or empty for TOOL_CAPABILITY_GAP",\n'
         '  "suggested_component_reason": "short reason",\n'
+        '  "knowledge_scope": "global_policy|invariant_workflow|scoped_domain_rule|tool_semantics",\n'
+        '  "applicability_scope": "observable triggers, relevant scopes, and exclusions",\n'
+        '  "cross_case_regression_risk": "how the change could hurt other examples and how to contain it",\n'
+        '  "operational_rule": "trigger -> evidence -> analysis -> transmission -> action",\n'
         '  "feedback": "concise actionable feedback",\n'
         '  "boundary_assessment": "whether the edit respects component roles"\n'
         "}\n\n"
@@ -2275,6 +2532,8 @@ def build_judge_prompt(
         f"Missing trace expectations:\n{missing_trace_expectation_lines}\n"
         f"Missing expectations with apparent tool support:\n{tool_supported_missing_lines}\n"
         f"Tool capability gaps:\n{tool_capability_gap_lines}\n"
+        f"Successful tool evidence:\n{successful_tool_evidence_lines}\n"
+        f"Failed tool evidence:\n{failed_tool_evidence_lines}\n"
         f"Available tools:\n{available_tools[:2500]}\n\n"
         f"Candidate output:\n{last_message_text(state)}\n\n"
         f"Baseline output:\n{state.get('baseline_response', '')}\n\n"
@@ -2344,6 +2603,10 @@ def build_judge_feedback(
 ) -> str:
     failure_lines = "\n".join(f"- {f['name']}: {f['message']}" for f in failures[:20]) or "- none"
     suggested_reason = str(payload.get("suggested_component_reason") or "reflection judge recommendation")
+    knowledge_scope = str(payload.get("knowledge_scope") or "not provided").strip()
+    applicability_scope = str(payload.get("applicability_scope") or "not provided").strip()
+    regression_risk = str(payload.get("cross_case_regression_risk") or "not provided").strip()
+    operational_rule = str(payload.get("operational_rule") or "not provided").strip()
     feedback_text = str(payload.get("feedback") or "").strip()
     boundary_assessment = str(payload.get("boundary_assessment") or "").strip()
     matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(example, response)
@@ -2361,6 +2624,8 @@ def build_judge_feedback(
     tool_capability_gap_lines = "\n".join(
         f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]
     ) or "- none"
+    successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
+    failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
     return (
         "Reflection-judge Deep Agents text-surface evaluation.\n"
         f"Task: {example.get('input', '')}\n"
@@ -2379,8 +2644,12 @@ def build_judge_feedback(
         f"- eval_mode: llm_judge\n"
         f"- failure_classification: {failure_classification}\n"
         f"- classification_reason: {classification_reason}\n"
-        f"- suggested_component: {suggested}\n"
-        f"- suggested_component_reason: {suggested_reason}\n\n"
+        f"- suggested_component: {suggested or 'none'}\n"
+        f"- suggested_component_reason: {suggested_reason}\n"
+        f"- knowledge_scope: {knowledge_scope}\n"
+        f"- applicability_scope: {applicability_scope}\n"
+        f"- cross_case_regression_risk: {regression_risk}\n"
+        f"- operational_rule: {operational_rule}\n\n"
         "Gate failures:\n"
         f"{failure_lines}\n\n"
         "Matched rubric checkpoints:\n"
@@ -2395,6 +2664,10 @@ def build_judge_feedback(
         f"{tool_supported_missing_lines}\n\n"
         "Tool capability gaps:\n"
         f"{tool_capability_gap_lines}\n\n"
+        "Successful tool evidence:\n"
+        f"{successful_tool_evidence_lines}\n\n"
+        "Failed tool evidence:\n"
+        f"{failed_tool_evidence_lines}\n\n"
         "Judge feedback:\n"
         f"{feedback_text or 'n/a'}\n\n"
         "Boundary assessment:\n"
@@ -2422,17 +2695,17 @@ def classify_failure(
     if failures:
         return SKILL_DEFECT, "candidate text failed one or more hard gates"
 
+    tool_gaps = list(fitness.get("tool_capability_gaps") or [])
+    if tool_gaps:
+        return (
+            TOOL_CAPABILITY_GAP,
+            "current tools cannot obtain required evidence for: " + ", ".join(str(item) for item in tool_gaps[:3]),
+        )
+
     expected = example.get("answer") or example.get("expected") or ""
     if not expected:
         _matched, missing, _coverage = rubric_checkpoint_results(example, response)
         if missing:
-            tool_gaps = fitness.get("tool_capability_gaps", [])
-            if tool_gaps:
-                return (
-                    SKILL_DEFECT,
-                    "rubric-only output missed expert checkpoints and available tools may not cover: "
-                    + ", ".join(tool_gaps[:3]),
-                )
             return SKILL_DEFECT, f"rubric-only output missed expert checkpoints: {', '.join(missing[:3])}"
         if response.strip():
             return NO_FAILURE, "rubric-only output covered the expert checkpoints"
@@ -2493,6 +2766,8 @@ def build_feedback(
         f"- {item}" for item in fitness.get("tool_supported_missing_expectations", [])
     ) or "- none"
     tool_capability_gap_lines = "\n".join(f"- {item}" for item in fitness.get("tool_capability_gaps", [])) or "- none"
+    successful_tool_evidence_lines = tool_evidence_text(fitness.get("successful_tool_evidence", []))
+    failed_tool_evidence_lines = tool_evidence_text(fitness.get("failed_tool_evidence", []))
     return (
         "Darwin-style Deep Agents text-surface evaluation.\n"
         f"Task: {example['input']}\n"
@@ -2520,7 +2795,7 @@ def build_feedback(
         f"- weakest_dimension: {weakest}\n"
         f"- failure_classification: {failure_classification}\n"
         f"- classification_reason: {classification_reason}\n"
-        f"- suggested_component: {suggested}\n"
+        f"- suggested_component: {suggested or 'none'}\n"
         f"- suggested_component_reason: {suggested_reason}\n\n"
         "Gate failures:\n"
         f"{failure_lines}\n\n"
@@ -2536,6 +2811,10 @@ def build_feedback(
         f"{tool_supported_missing_lines}\n\n"
         "Tool capability gaps:\n"
         f"{tool_capability_gap_lines}\n\n"
+        "Successful tool evidence:\n"
+        f"{successful_tool_evidence_lines}\n\n"
+        "Failed tool evidence:\n"
+        f"{failed_tool_evidence_lines}\n\n"
         "Optimization guidance:\n"
         f"{guidance}\n\n"
         "With candidate output:\n"
@@ -2574,9 +2853,21 @@ def optimization_guidance(
             "- do_not: do not duplicate task knowledge that already lives in SKILL.md or reference/*.md.\n"
             "- expected_change: make the agent call or consult existing resources more reliably."
         )
+    if failure_classification == TOOL_CAPABILITY_GAP:
+        return (
+            "- primary_action: do not mutate a text component to simulate unavailable data access.\n"
+            "- framework_action: preserve the missing expectation as a TOOL_CAPABILITY_GAP artifact for tool backlog "
+            "planning.\n"
+            "- do_not: do not invent facts, tools, endpoints, or claim that a rewritten description changes tool code."
+        )
     return (
         f"- primary_action: add or sharpen reusable task knowledge in `{suggested}`.\n"
         "- do_not: do not write a test-specific answer.\n"
+        "- scope_requirement: state observable applicability signals and exclusions; do not turn one industry example "
+        "into an unconditional global rule.\n"
+        "- operational_requirement: encode a conditional trigger, borrower-specific evidence plan, analysis, risk "
+        "transmission, and approval or verification action; adapt sources and comparisons to the business model, and "
+        "avoid vague reminders.\n"
         "- expected_change: improve routing evidence, failure modes, or decision criteria."
     )
 
@@ -2595,6 +2886,8 @@ def suggest_component_to_update(
     expected_route: str = "",
 ) -> str:
     candidate = state.get("candidate_excerpt", {})
+    if failure_classification == TOOL_CAPABILITY_GAP:
+        return ""
     if failure_classification == EXECUTION_LAPSE:
         return prompt_or_memory_component(candidate)
 
@@ -2609,6 +2902,13 @@ def suggest_component_to_update(
             for key, text in candidate.items():
                 if ":reference/" in key and route in text.lower():
                     return key
+        component = first_component_matching(
+            candidate,
+            lambda key, _text: ":reference/" in key
+            and any(marker in key.lower() for marker in ["learned_", "expert_pattern", "experience"]),
+        )
+        if component is not None:
+            return component
         component = first_component_matching(candidate, lambda key, _text: key.endswith(":SKILL.md"))
         if component is not None:
             return component
@@ -2661,6 +2961,8 @@ def suggested_component_reason(
     weakest: str,
     failures: list[dict[str, Any]],
 ) -> str:
+    if failure_classification == TOOL_CAPABILITY_GAP:
+        return "no current text component can add the missing external data capability"
     if failure_classification == EXECUTION_LAPSE:
         return f"{suggested} can remind the agent to use already-available skills, references, and tools"
     if failures:
@@ -2674,10 +2976,10 @@ def suggested_component_reason(
 
 def reflective_record(example: dict[str, Any], state: dict, score: float, feedback: str) -> dict[str, Any]:
     return {
-        "Input": example["input"],
+        "Runtime input": example["input"],
         "Expected": example.get("answer") or example.get("expected"),
         "Rubric": example.get("rubric"),
-        "Expert data": example.get("data"),
+        "Evaluator-only expert evidence (never shown to runtime agent)": example.get("data"),
         "Agent response": last_message_text(state),
         "Baseline response": state.get("baseline_response", ""),
         "Score": score,
@@ -2760,7 +3062,15 @@ def load_dataset_from_config(
     examples = [record.as_example() for record in records]
     if config.dataset.limit is not None:
         examples = examples[: config.dataset.limit]
-    return split_examples(examples)
+    return split_examples(
+        examples,
+        split_strategy=config.dataset.split_strategy,
+        train_ratio=config.dataset.train_ratio,
+        val_ratio=config.dataset.val_ratio,
+        test_ratio=config.dataset.test_ratio,
+        stratify_by=config.dataset.stratify_by,
+        seed=config.dataset.seed,
+    )
 
 
 def load_golden_jsonl(config: DeepAgentsGepaConfig) -> list[EvalRecord]:
@@ -2783,6 +3093,10 @@ def normalize_eval_record(
 ) -> EvalRecord:
     merged_metadata = dict(metadata or {})
     merged_metadata.update(payload.get("metadata", {}))
+    if payload.get("split") is not None:
+        merged_metadata["split"] = str(payload["split"])
+    if payload.get("stratum") is not None:
+        merged_metadata["stratum"] = str(payload["stratum"])
     messages = tuple(_normalize_message(message) for message in payload.get("messages", []))
     data = payload.get("data") or payload.get("expert_risk_section") or payload.get("expert_opinion")
     data_path = payload.get("data_path") or payload.get("expert_risk_section_path") or payload.get("expert_opinion_path")
@@ -2909,12 +3223,156 @@ def classify_user_experience(message: dict[str, str]) -> str:
     return "expert_task"
 
 
-def split_examples(examples: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def split_examples(
+    examples: list[dict[str, Any]],
+    *,
+    split_strategy: str = "stratified",
+    train_ratio: float = 0.60,
+    val_ratio: float = 0.20,
+    test_ratio: float = 0.20,
+    stratify_by: Sequence[str] = ("metadata.difficulty",),
+    seed: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     if not examples:
         return [], [], []
-    train_end = max(1, int(len(examples) * 0.7))
-    val_end = max(train_end, int(len(examples) * 0.85))
-    return examples[:train_end], examples[train_end:val_end] or examples[:1], examples[val_end:] or examples[-1:]
+    if len(examples) == 1:
+        only = tag_dataset_split(examples[0], "train", stratum=dataset_stratum(examples[0], stratify_by))
+        validation_copy = tag_dataset_split(
+            examples[0],
+            "val",
+            stratum=dataset_stratum(examples[0], stratify_by),
+            fallback="single_example_reused_for_validation",
+        )
+        return [only], [validation_copy], []
+
+    split_names = ("train", "val", "test")
+    buckets: dict[str, list[dict[str, Any]]] = {name: [] for name in split_names}
+    unassigned: list[dict[str, Any]] = []
+    for example in examples:
+        metadata = example.get("metadata") if isinstance(example.get("metadata"), Mapping) else {}
+        explicit_split = str(metadata.get("split") or metadata.get("dataset_split") or "").strip().lower()
+        if explicit_split in buckets:
+            buckets[explicit_split].append(
+                tag_dataset_split(example, explicit_split, stratum=dataset_stratum(example, stratify_by))
+            )
+        else:
+            unassigned.append(example)
+    if split_strategy == "explicit" and unassigned:
+        raise ValueError("dataset split_strategy=explicit requires every example to declare split=train|val|test")
+
+    targets = dataset_split_targets(len(examples), train_ratio, val_ratio, test_ratio)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for example in unassigned:
+        grouped.setdefault(dataset_stratum(example, stratify_by), []).append(example)
+    ordered_groups = sorted(grouped.items(), key=lambda item: stable_split_key(item[0], seed))
+    for stratum, rows in ordered_groups:
+        for example in sorted(rows, key=lambda row: stable_split_key(str(row.get("input", "")), seed)):
+            destination = max(
+                split_names,
+                key=lambda name: (
+                    targets[name] - len(buckets[name]),
+                    targets[name],
+                    -split_names.index(name),
+                ),
+            )
+            buckets[destination].append(tag_dataset_split(example, destination, stratum=stratum))
+
+    if not buckets["train"]:
+        buckets["train"].append(buckets["val"].pop() if buckets["val"] else buckets["test"].pop())
+    if not buckets["val"]:
+        source = buckets["train"] if len(buckets["train"]) > 1 else buckets["test"]
+        if source:
+            moved = source.pop()
+            buckets["val"].append(tag_dataset_split(moved, "val", stratum=dataset_stratum(moved, stratify_by)))
+    return buckets["train"], buckets["val"], buckets["test"]
+
+
+def dataset_split_targets(total: int, train_ratio: float, val_ratio: float, test_ratio: float) -> dict[str, int]:
+    ratios = [max(0.0, float(value)) for value in (train_ratio, val_ratio, test_ratio)]
+    ratio_sum = sum(ratios)
+    if ratio_sum <= 0:
+        raise ValueError("dataset split ratios must contain at least one positive value")
+    normalized = [value / ratio_sum for value in ratios]
+    if total == 2:
+        return {"train": 1, "val": 1, "test": 0}
+    val_count = max(1, round(total * normalized[1]))
+    test_count = max(1, round(total * normalized[2]))
+    train_count = total - val_count - test_count
+    while train_count < 1:
+        if test_count >= val_count and test_count > 1:
+            test_count -= 1
+        elif val_count > 1:
+            val_count -= 1
+        else:
+            break
+        train_count = total - val_count - test_count
+    return {"train": train_count, "val": val_count, "test": test_count}
+
+
+def dataset_stratum(example: Mapping[str, Any], stratify_by: Sequence[str]) -> str:
+    values = []
+    for path in stratify_by:
+        value: Any = example
+        for part in str(path).split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                value = None
+                break
+            value = value[part]
+        if value not in (None, "", [], {}):
+            values.append(f"{path}={value}")
+    metadata = example.get("metadata") if isinstance(example.get("metadata"), Mapping) else {}
+    if metadata.get("stratum"):
+        values.insert(0, f"metadata.stratum={metadata['stratum']}")
+    return "|".join(values) or "__all__"
+
+
+def stable_split_key(value: str, seed: int) -> str:
+    return hashlib.sha256(f"{seed}:{value}".encode()).hexdigest()
+
+
+def tag_dataset_split(
+    example: Mapping[str, Any],
+    split: str,
+    *,
+    stratum: str,
+    fallback: str | None = None,
+) -> dict[str, Any]:
+    tagged = dict(example)
+    metadata = dict(example.get("metadata") or {})
+    metadata["dataset_split"] = split
+    metadata["dataset_stratum"] = stratum
+    if fallback:
+        metadata["dataset_split_fallback"] = fallback
+    tagged["metadata"] = metadata
+    return tagged
+
+
+def examples_for_evaluation_phase(
+    examples: Sequence[Mapping[str, Any]],
+    phase: str,
+) -> list[dict[str, Any]]:
+    return [{**dict(example), "evaluation_phase": phase} for example in examples]
+
+
+def final_test_summary(seed_evaluation: Any, best_evaluation: Any) -> dict[str, Any]:
+    seed_scores = [float(score) for score in list(getattr(seed_evaluation, "scores", []) or [])]
+    best_scores = [float(score) for score in list(getattr(best_evaluation, "scores", []) or [])]
+    seed_mean = sum(seed_scores) / len(seed_scores) if seed_scores else 0.0
+    best_mean = sum(best_scores) / len(best_scores) if best_scores else 0.0
+    return {
+        "count": max(len(seed_scores), len(best_scores)),
+        "seed_mean": seed_mean,
+        "best_mean": best_mean,
+        "improvement": best_mean - seed_mean,
+        "per_example": [
+            {
+                "seed_score": seed_score,
+                "best_score": best_score,
+                "delta": best_score - seed_score,
+            }
+            for seed_score, best_score in zip(seed_scores, best_scores, strict=False)
+        ],
+    }
 
 
 def run_configured_skill_optimization(
@@ -2932,12 +3390,13 @@ def run_configured_skill_optimization(
     mcp_loader: Callable[[Sequence[MCPServerConfig], dict[str, str]], Sequence[BaseTool | Callable | dict[str, Any]]]
     | None = None,
     max_metric_calls: int = 10,
-    reflection_minibatch_size: int = 1,
+    reflection_minibatch_size: int = 3,
     num_threads: int = 1,
     seed: int = 0,
     artifact_dir: str | Path | None = None,
     artifact_run_name: str | None = None,
     use_reflection_judge: bool = True,
+    evaluate_final_test: bool | None = None,
 ) -> Any:
     """End-to-end config-driven optimization entry point."""
     config = load_deepagents_gepa_config(config_path)
@@ -3008,11 +3467,44 @@ def run_configured_skill_optimization(
         callbacks=[artifact_callback] if artifact_callback is not None else None,
         seed=seed,
     )
+    final_test_result: dict[str, Any] | None = None
+    should_evaluate_test = config.dataset.evaluate_final_test if evaluate_final_test is None else evaluate_final_test
+    if should_evaluate_test and test_set:
+        seed_test = adapter.evaluate(
+            examples_for_evaluation_phase(test_set, "final_test_seed"),
+            seed_candidate,
+            capture_traces=False,
+        )
+        if result.best_candidate == seed_candidate:
+            best_test = seed_test
+        else:
+            best_test = adapter.evaluate(
+                examples_for_evaluation_phase(test_set, "final_test_best"),
+                result.best_candidate,
+                capture_traces=False,
+            )
+        final_test_result = final_test_summary(seed_test, best_test)
+        if artifact_store is not None:
+            final_test_result = artifact_store.write_final_test(
+                examples=test_set,
+                seed_evaluation=seed_test,
+                best_evaluation=best_test,
+            )
+        LOGGER.info(
+            "final_test count=%d seed_mean=%.3f best_mean=%.3f improvement=%.3f",
+            final_test_result["count"],
+            final_test_result["seed_mean"],
+            final_test_result["best_mean"],
+            final_test_result["improvement"],
+        )
+    elif should_evaluate_test:
+        LOGGER.warning("final_test skipped because the configured dataset has no held-out test examples")
     if artifact_store is not None:
         artifact_store.finalize(
             result=result,
             project=project,
             apply_candidate=apply_candidate_to_deep_agent_project,
+            final_test=final_test_result,
         )
     return result
 
@@ -3025,12 +3517,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reflection-model", default="openai:gpt-5-mini")
     parser.add_argument("--reflection-model-kwargs", type=json.loads, default={"reasoning_effort": "medium"})
     parser.add_argument("--max-metric-calls", type=int, default=50)
-    parser.add_argument("--reflection-minibatch-size", type=int, default=2)
+    parser.add_argument("--reflection-minibatch-size", type=int, default=3)
     parser.add_argument("--num-threads", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--artifact-dir", help="Optional base directory for run artifacts.")
     parser.add_argument("--artifact-run-name", help="Optional run directory name under --artifact-dir.")
     parser.add_argument("--no-reflection-judge", action="store_true", help="Use deterministic eval instead of LLM judge.")
+    parser.add_argument("--skip-final-test", action="store_true", help="Do not evaluate seed and best on held-out test.")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--skip-optimize", action="store_true")
     return parser.parse_args()
@@ -3053,6 +3546,7 @@ def main():
             artifact_dir=args.artifact_dir,
             artifact_run_name=args.artifact_run_name,
             use_reflection_judge=not args.no_reflection_judge,
+            evaluate_final_test=not args.skip_final_test,
         )
         print(f"\nBest val score: {result.val_aggregate_scores[result.best_idx]}")
         print("\nOptimized components:")

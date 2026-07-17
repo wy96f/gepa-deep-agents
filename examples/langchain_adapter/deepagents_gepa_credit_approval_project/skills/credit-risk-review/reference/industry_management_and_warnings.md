@@ -1,22 +1,24 @@
-# Industry, Management, And Warning Signals
+# 行业、管理与预警信号
 
-Industry and management risk should shape approval tenor, pricing, covenants,
-and monitoring.
+行业和管理特征用于形成核验假设，并影响授信期限、额度、定价、条件和监控。行业名称本身不是风险结论。
 
-Industry checks:
+## 行业与商业模式
 
-- Cyclical industries require downside cash-flow stress and shorter review
-  cycles.
-- Policy-restricted sectors require checking compliance permits and regulatory
-  exposure.
-- Fast expansion in a declining industry is a warning signal, not automatic
-  strength.
+- 触发信号：产品价格或需求明显波动、政策准入和监管要求较强、扩张速度与行业景气背离，或上下游集中度较高。
+- 取得证据：企业产品和客户结构、产销量价、订单、库存、行业供需、政策许可、环保安监和主要上下游信用变化。
+- 分析方法：把企业经营指标与自身历史、可比企业、上下游和压力情景比较，判断冲击如何传导至毛利、库存、回款和现金流。
+- 审批使用：根据证据调整期限、额度、还款节奏、承诺条款和复审频率；不能因企业属于某行业就机械套用结论。
 
-Management and conduct checks:
+## 管理与信息可靠性
 
-- Frequent changes in shareholders, controllers, finance staff, or auditors
-  weaken information reliability.
-- Prior covenant breaches, delayed interest, tax arrears, lawsuits, or abnormal
-  bank-account flows require explicit explanation.
-- A borrower that avoids providing bank statements, tax records, or customer
-  contracts should be treated as having unresolved verification risk.
+- 触发信号：股东、实际控制人、核心管理层、财务负责人或审计机构频繁变化，报表口径不一致，或关键资料迟延提供。
+- 取得证据：工商变更、公司治理和授权、审计报告、纳税申报、银行流水、合同及管理访谈。
+- 分析方法：比较不同来源和期间的数据，核验控制关系、经营决策、资金归集和信息披露的一致性。
+- 审批使用：无法解释的不一致应作为待核实风险，并通过补充资料、交叉验证、限制提款或加强贷后监控处理。
+
+## 负面事件与行为信号
+
+- 触发信号：出现违约、欠息、欠税、诉讼执行、账户异常、行政处罚、许可整改或历史承诺未履行。
+- 取得证据：事件时间线、金额和状态、整改和解除资料、资金流水、外部查询及对经营和融资的实际影响。
+- 分析方法：区分已解决、持续和重复发生的事件，验证管理层解释，并分析其对经营持续性、回款、融资和资产可执行性的传导。
+- 审批使用：把未消除事项转化为明确的补充核验、放款前提、监控触发、额度调整或否决理由。

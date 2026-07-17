@@ -1,18 +1,31 @@
-# Financial Statement Analysis
+# 财务报表分析
 
-Review the borrower through trend, structure, and cash conversion.
+从趋势、结构和现金转化三个视角审查企业。以下内容是条件化核验模式，只有相关信号出现时才启动，不能仅凭行业标签下结论。
 
-- Revenue growth is weak evidence if receivables, inventory, or contract assets
-  grow faster than sales.
-- Profit improvement is weak evidence if it is driven by non-recurring gains,
-  subsidies, asset disposals, or accounting reclassification.
-- High related-party transactions require checking commercial substance,
-  pricing fairness, payment terms, and collectability.
-- Short-term debt funding long-term assets indicates maturity mismatch.
-- Continuous negative operating cash flow should override simple profit-based
-  comfort.
+## 收入增长与营运资金占用
 
-Expert review habit:
+- 触发信号：应收账款、存货或合同资产增速明显快于收入，或周转效率持续下降。
+- 取得证据：近三年及近期财务报表、账龄和存货明细、主要合同、发票、出入库记录及期后回款流水。
+- 分析方法：比较收入与营运资金科目增速、周转天数、减值计提和期后回款，核验增长是否形成可用于偿债的现金。
+- 审批使用：证据不能解释资金占用时，调低对收入增长的评价，并设置回款归集、压降占用或补充核验条件。
 
-- Ask what changed in the statements, why it changed, and whether the change
-  improves cash available for debt service.
+## 利润与现金流背离
+
+- 触发信号：利润改善但经营现金流未同步，或非经常性损益占比较高。
+- 取得证据：经营现金流明细、政府补助、资产处置、投资收益、资本化项目和会计政策变更资料。
+- 分析方法：剔除一次性和非现金因素，比较核心利润、经营现金流与债务偿付安排。
+- 审批使用：不能把一次性收益或会计重分类形成的利润直接视为稳定偿债来源。
+
+## 关联交易与往来
+
+- 触发信号：关联交易或关联方应收、预付、其他应收规模较大，账龄增长或资金往返异常。
+- 取得证据：关联关系图谱、合同、定价依据、结算条款、发票、资金流水及期后回款。
+- 分析方法：核验商业实质、定价公允性、交易闭环、资金最终去向和可回收性。
+- 审批使用：未经核实的关联方资金占用应从可用流动性中审慎扣除，并设置清收或限制新增占用的条件。
+
+## 债务期限错配
+
+- 触发信号：短期债务增长并支撑长期资产、长期投资或固定资产扩张。
+- 取得证据：有息债务期限表、授信到期安排、长期资产投入、资金用途及可动用现金。
+- 分析方法：比较未来十二个月到期债务、稳定经营现金流、可动用授信和资产变现约束。
+- 审批使用：发现期限错配时，应评价再融资依赖，并考虑期限调整、额度控制或分期还款安排。

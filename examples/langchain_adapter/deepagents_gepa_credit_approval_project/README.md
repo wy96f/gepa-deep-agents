@@ -1,36 +1,30 @@
-# Credit Approval GEPA Demo Project
+# 信贷审批 GEPA 示例项目
 
-This demo shows expert-risk-section optimization for a Chinese corporate-credit
-approval agent.
+本示例用于优化中国规上企业信贷审批智能体的“项目风险点”分析能力。
 
-Each dataset row gives the agent only a borrower name as `input`. The
-approval-officer "project risk points" section is stored in `data`, which is
-visible to the evaluator and reflection step but not passed to the agent during
-rollout. GEPA should use the gap between the agent trace/output and the expert
-section to improve reusable methodology in `skills/credit-risk-review/SKILL.md`
-and `reference/*.md`.
+每条数据只把企业名称作为 `input` 交给智能体。审批官风险评价意见中的“项目风险点”章节保存在 `data`，仅供评估器和反思步骤使用，不会在智能体运行时泄露。GEPA 根据智能体轨迹、输出与审批官意见之间的差距，优化 `skills/credit-risk-review/SKILL.md` 和 `reference/*.md` 中可复用的方法。
 
-The evaluator checks three things:
+`SKILL.md` 保存稳定的审查流程。限定行业、商业模式或交易结构的经验应进入最具体的 reference；没有合适分类时进入 `reference/learned_expert_patterns.md`。经验模式描述的是条件化假设：应包含适用信号、排除条件、动态取证计划、分析方法、状态判定、风险传导和审批应用。行业只是机制示例，不是硬编码白名单。
 
-- whether the trace shows enough relevant data acquisition
-- whether the final output covers the expert risk points
-- whether the output explains the risk facts and transmission logic
+评估器重点判断：
 
-If a trace expectation is missed, the evaluator also checks the available tool
-names and descriptions. Missing expectations with tool support point to
-skill/prompt/tool-description optimization. Tool capability gaps point to
-external work: add or connect a tool before expecting GEPA text edits to fix
-that data gap.
+- 轨迹是否显示智能体成功取得了足够的相关企业证据；
+- 最终输出是否覆盖审批官指出的核心风险；
+- 输出是否说明事实依据、比较过程和风险传导；
+- 缺少工具能力时，是否准确识别为 `TOOL_CAPABILITY_GAP`。
 
-The goal is experience distillation:
+信息获取只认可工具调用与成功结果成对出现。提示词、技能、智能体文字或最终答案中出现关键词，都不能证明已取得证据。工具能力判断使用种子版本的工具描述，避免通过修改描述虚构工具实现并不存在的数据源。
 
-- strengthen risk dimensions
-- add missing failure modes
-- encode approval conditions
-- preserve the separation between skill workflow and reference methodology
+优化目标是萃取审批经验：
 
-The tool functions are placeholders for a real credit platform. The example
-optimizes their descriptions, not their implementation.
+- 补充缺失的风险假设和失败模式；
+- 明确应取得的企业专属证据及比较方法；
+- 将未解决风险转化为可执行的审批条件；
+- 保持稳定流程与有适用范围的专业经验相分离；
+- 避免针对单一企业或单一行业过拟合。
 
-Use `examples/langchain_adapter/clean_credit_risk_dataset.py` to turn many
-approval-opinion files into this JSONL shape.
+示例工具是信贷平台的占位实现。GEPA 可以优化工具描述，但不会修改工具实现。`TOOL_CAPABILITY_GAP` 表示仅靠文本优化无法补齐数据，需另行开发或接入工具。
+
+可使用 `examples/langchain_adapter/clean_credit_risk_dataset.py` 将多份审批意见清洗为本示例的 JSONL 格式。
+
+配置会按难度进行确定性的分层训练集、验证集和测试集划分。优化结束后，框架自动在留出的测试集上比较种子与最佳候选，并将结果保存在运行目录的 `final_test/` 中。

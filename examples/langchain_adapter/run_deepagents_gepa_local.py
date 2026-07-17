@@ -54,10 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-keep-ratio", type=float, default=0.10)
     parser.add_argument("--timeout", type=float, default=2400)
     parser.add_argument("--max-metric-calls", type=int, default=2)
-    parser.add_argument("--reflection-minibatch-size", type=int, default=1)
+    parser.add_argument("--reflection-minibatch-size", type=int, default=3)
     parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-reflection-judge", action="store_true", help="Use deterministic eval instead of LLM judge.")
+    parser.add_argument("--skip-final-test", action="store_true", help="Skip held-out seed/best test evaluation.")
     parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--log-file", help="Optional file path for detailed Python logs.")
     parser.add_argument("--summary-file", help="Optional JSON file path for a compact GEPA run summary.")
@@ -152,6 +153,12 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
     summary_path = Path(args.summary_file)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     best_candidate = getattr(result, "best_candidate", {})
+    final_test = None
+    latest_run = Path(args.artifact_dir) / "latest_run.txt" if args.artifact_dir else None
+    if latest_run is not None and latest_run.exists():
+        final_test_path = Path(latest_run.read_text(encoding="utf-8").strip()) / "final_test" / "summary.json"
+        if final_test_path.exists():
+            final_test = json.loads(final_test_path.read_text(encoding="utf-8"))
     summary = {
         "result_type": type(result).__name__,
         "best_idx": getattr(result, "best_idx", None),
@@ -169,6 +176,7 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
         "component_lengths": (
             {name: len(text) for name, text in best_candidate.items()} if isinstance(best_candidate, dict) else None
         ),
+        "final_test": final_test,
     }
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -196,6 +204,7 @@ def main() -> None:
         artifact_dir=args.artifact_dir,
         artifact_run_name=args.artifact_run_name,
         use_reflection_judge=not args.no_reflection_judge,
+        evaluate_final_test=not args.skip_final_test,
     )
     write_summary(args, result)
 
@@ -207,7 +216,17 @@ def main() -> None:
     if args.artifact_dir:
         latest_run = Path(args.artifact_dir) / "latest_run.txt"
         if latest_run.exists():
-            print(f"Artifacts: {latest_run.read_text(encoding='utf-8').strip()}")
+            run_dir = Path(latest_run.read_text(encoding="utf-8").strip())
+            print(f"Artifacts: {run_dir}")
+            final_test_path = run_dir / "final_test" / "summary.json"
+            if final_test_path.exists():
+                final_test = json.loads(final_test_path.read_text(encoding="utf-8"))
+                print(
+                    "Final test: "
+                    f"seed={final_test['seed_mean']:.3f} "
+                    f"best={final_test['best_mean']:.3f} "
+                    f"improvement={final_test['improvement']:.3f}"
+                )
     if hasattr(result, "best_candidate"):
         print("Best candidate components:")
         for name, text in result.best_candidate.items():

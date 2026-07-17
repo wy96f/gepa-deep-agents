@@ -8,7 +8,7 @@ component selection, constraints, materialization, and runner behavior.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -53,7 +53,8 @@ class DefaultEvaluator:
     evaluate_fn: Callable[[dict[str, Any], dict[str, Any]], tuple[float, str]]
 
     def evaluate(self, example: Mapping[str, Any], state: Mapping[str, Any]) -> tuple[float, str]:
-        return self.evaluate_fn(dict(example), dict(state))
+        mutable_state = state if isinstance(state, MutableMapping) else dict(state)
+        return self.evaluate_fn(dict(example), mutable_state)
 
 
 class ComponentSelector(Protocol):
@@ -89,6 +90,8 @@ class DefaultFeedbackComponentSelector:
     ) -> list[str]:
         del state, subsample_scores
         suggested: dict[str, dict[str, float]] = {}
+        actionable_trajectories = 0
+        capability_gap_trajectories = 0
         sorted_trajectories = sorted(
             trajectories or [],
             key=lambda item: float(item.get("score", 0.0)) if isinstance(item, dict) else 0.0,
@@ -97,7 +100,12 @@ class DefaultFeedbackComponentSelector:
             if not isinstance(trajectory, dict):
                 continue
             score = float(trajectory.get("score", 0.0))
-            component = self._component_from_feedback(str(trajectory.get("feedback", "")), candidate)
+            feedback = str(trajectory.get("feedback", ""))
+            if self._failure_classification(feedback) == "TOOL_CAPABILITY_GAP":
+                capability_gap_trajectories += 1
+                continue
+            actionable_trajectories += 1
+            component = self._component_from_feedback(feedback, candidate)
             if component is not None:
                 vote = suggested.setdefault(component, {"count": 0.0, "weight": 0.0, "min_score": 1.0})
                 vote["count"] += 1
@@ -122,7 +130,14 @@ class DefaultFeedbackComponentSelector:
                     self._round_robin_fallback(candidate_idx, candidate, excluded=set(ranked_components)),
                 )
             ]
+        if capability_gap_trajectories and not actionable_trajectories:
+            return []
         return [self._record_selection(candidate_idx, self._round_robin_fallback(candidate_idx, candidate))]
+
+    @staticmethod
+    def _failure_classification(feedback: str) -> str | None:
+        match = re.search(r"(?m)^-\s*failure_classification:\s*(\S+)\s*$", feedback)
+        return match.group(1).strip().rstrip(".,;") if match else None
 
     def _component_from_feedback(self, feedback: str, candidate: dict[str, str]) -> str | None:
         for match in SUGGESTED_COMPONENT_RE.finditer(feedback):
@@ -183,7 +198,26 @@ class DefaultReflectionTemplateRegistry:
             "- Preserve the component's scope; do not paste unrelated skills, references, tool descriptions, or prompts.\n"
             "- Treat rejected proposal lessons, when present, as negative evidence: fix the failure pattern without copying rejected text.\n"
             "- Prefer reusable instructions, decision criteria, and guardrails over test-specific answers.\n"
+            "- Expert data, rubrics, checkpoints, and evaluator feedback are hidden from the runtime agent. Distill "
+            "reusable lessons from them, but never tell the runtime agent to read or respond to those hidden fields.\n"
+            "- Evaluation data under <side_info> is optimizer-only evidence. It was not part of the runtime conversation. "
+            "Do not claim the agent saw it, failed to read it, or should request it as a named runtime field.\n"
+            "- A TOOL_CAPABILITY_GAP means no current text component can obtain the missing evidence. Do not invent a "
+            "tool, imply that a prompt adds the capability, or encode unavailable facts as instructions.\n"
+            "- Do not universalize a rule from one example. State observable applicability signals, relevant industries "
+            "or business models, and non-applicable cases. Use examples to clarify scope, not as a closed hardcoded list.\n"
+            "- Applicability signals are conditional observations, not one universal checklist. Evidence to obtain is a "
+            "borrower-specific acquisition plan, not a fixed value known in advance. Adapt both to the current business "
+            "model, mark unsupported acquisition as TOOL_CAPABILITY_GAP, and keep an unverified risk as a hypothesis.\n"
+            "- Check cross-example regression risk. If a rule helps one scope but may hurt another, make the condition "
+            "explicit instead of applying the rule globally.\n"
+            "- Every added rule must be operational: include a trigger, evidence to obtain, analysis or comparison, "
+            "risk transmission, and an approval action or verification consequence.\n"
+            "- Avoid empty guidance such as 'analyze comprehensively', 'strengthen attention', or 'verify as needed' "
+            "unless it is followed by concrete evidence, method, and decision criteria.\n"
             "- Keep names, paths, tool names, and output contracts consistent with the current component and feedback.\n"
+            "- Preserve the natural language used by the current component unless the feedback explicitly requires a "
+            "language change.\n"
             "- Respect size and growth constraints; remove duplication before adding new material."
         )
         for key in candidate:
@@ -200,10 +234,15 @@ class DefaultReflectionTemplateRegistry:
                 "Your response must have exactly two sections, in this order. Do not start with a fenced code block.\n\n"
                 "Proposal rationale:\n"
                 "- Failure pattern:\n"
+                "- Evidence across examples:\n"
                 "- Selected component:\n"
                 "- Why this component:\n"
                 "- Why not other components:\n"
+                "- Applicability scope and exclusions:\n"
+                "- Cross-case regression risk:\n"
+                "- Operational rule shape:\n"
                 "- Boundary checks:\n"
+                "- Hidden-data boundary check:\n"
                 "- Intended behavior change:\n\n"
                 "Final replacement:\n"
                 "Use exactly one fenced code block after `Final replacement:`. Do not use triple backticks anywhere "
@@ -225,9 +264,17 @@ class DefaultReflectionTemplateRegistry:
                 "instead. Avoid large growth unless the feedback explicitly requires it."
             )
         if key.endswith(":SKILL.md"):
-            return "Return a complete SKILL.md file. Preserve valid YAML frontmatter with name and description."
+            return (
+                "Return a complete SKILL.md file. Preserve valid YAML frontmatter with name and description. Keep the "
+                "skill focused on invariant workflow, resource routing, failure modes, and guardrails. Put scoped "
+                "industry or business-model knowledge in the most specific reference/*.md component instead."
+            )
         if ":reference/" in key:
-            return "Return a complete Markdown reference file containing reusable rules, facts, examples, or lookup tables."
+            return (
+                "Return a complete Markdown reference file containing reusable scoped rules, facts, examples, or lookup "
+                "tables. Each learned rule should state applicability signals, evidence, analysis method, risk "
+                "transmission, decision use, and exclusions."
+            )
         if ":tool:" in key and key.endswith(":description"):
             return "Return only a concise tool description. Explain when to call it, parameters, and boundaries."
         if key.startswith("subagent:") and key.endswith(":description"):
@@ -257,13 +304,20 @@ class DefaultReflectionTemplateRegistry:
                 "- Scope: reusable skill definition, workflow, failure modes, and guardrails.\n"
                 "- Preserve YAML frontmatter with name and description.\n"
                 "- You may reference local reference/*.md and scripts/*.py paths that actually belong to this skill.\n"
+                "- Keep domain catalogs and industry-specific risk patterns in reference/*.md; route to them from the "
+                "workflow instead of accumulating them in SKILL.md.\n"
+                "- Add a domain rule here only when it is invariant across the skill's intended use cases.\n"
                 "- Do not paste AGENTS.md, system prompts, tool descriptions, or unrelated subagent skills."
             )
         if ":reference/" in key:
             return (
                 "- Scope: reusable domain facts, rules, rubrics, examples, and lookup material.\n"
                 "- Do not write agent persona, delegation instructions, tool descriptions, or workflow prose here.\n"
-                "- Keep references structured for lookup and reuse by a skill."
+                "- Keep references structured for lookup and reuse by a skill.\n"
+                "- Scope each learned pattern by observable signals or business model. Include non-applicability "
+                "conditions so an improvement for one sector does not become a global rule.\n"
+                "- Make each rule concrete enough to execute: evidence source, comparison or calculation, risk "
+                "transmission, and resulting verification or approval action."
             )
         if ":tool:" in key and key.endswith(":description"):
             return (

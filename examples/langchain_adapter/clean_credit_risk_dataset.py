@@ -1,10 +1,9 @@
-"""Clean credit approval opinions into GEPA JSONL examples.
+"""将信贷审批意见清洗为 GEPA JSONL 数据.
 
-The cleaner focuses on the approval-officer "project risk points" section. It
-keeps the agent input minimal, usually just the borrower name, and stores the
-expert section in ``data`` for evaluator/reflection use only.
+清洗器只提取审批官意见中的“项目风险点”章节. 智能体输入保持最小化, 通常
+只有企业名称; 专家章节存入 ``data``, 仅供评估器和反思步骤使用.
 
-Example:
+示例:
     uv run --no-sync python examples/langchain_adapter/clean_credit_risk_dataset.py \
       --input-dir /path/to/opinions \
       --output examples/langchain_adapter/deepagents_gepa_credit_approval_project/evals/project_risk_sections.jsonl
@@ -22,11 +21,11 @@ from typing import Any
 from xml.etree import ElementTree
 
 DEFAULT_RUBRIC = (
-    "把 data 视为审批官风险评价意见中的项目风险点章节。评价 agent 针对 input 企业名自主检索和"
-    "分析后的轨迹与最终输出: 1) 是否调用或尝试调用足够的工具获取行业、财务、债务结构、集团"
-    "穿透、环保安监、司法工商等相关信息; 2) 是否覆盖 data 中的核心风险点; 3) 是否说明风险"
-    "事实依据和风险传导逻辑; 4) 是否识别缺失信息并提出补充核验; 5) 不奖励只套模板、未查证、"
-    "未结合企业特征的泛泛表述。"
+    "将评估材料视为审批官风险评价意见中的“项目风险点”章节. 评价智能体仅根据企业名称自主检索"
+    "和分析后形成的轨迹与最终输出: 1. 是否通过成功的工具调用取得与企业特征相关的行业、财务、"
+    "债务结构、集团穿透、环保安监、司法工商等证据; 2. 是否覆盖评估材料中的核心风险点; 3. 是否"
+    "说明事实依据、比较方法和风险传导; 4. 是否识别缺失信息、工具能力缺口并提出补充核验; 5. 不"
+    "奖励只套模板、未查证或针对单一样本硬编码的表述."
 )
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".docx", ".pdf"}
@@ -62,13 +61,13 @@ class CleanedRiskSection:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input-dir", help="Directory containing approval-opinion files.")
-    source.add_argument("--input-file", action="append", help="One approval-opinion file. Can be repeated.")
-    parser.add_argument("--output", required=True, help="Output JSONL file.")
+    source.add_argument("--input-dir", help="包含审批意见文件的目录.")
+    source.add_argument("--input-file", action="append", help="单个审批意见文件, 可重复传入.")
+    parser.add_argument("--output", required=True, help="输出 JSONL 文件.")
     parser.add_argument("--rubric", default=DEFAULT_RUBRIC)
     parser.add_argument("--id-prefix", default="credit_case")
-    parser.add_argument("--no-metadata", action="store_true", help="Do not emit heuristic metadata.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite output if it already exists.")
+    parser.add_argument("--no-metadata", action="store_true", help="不生成启发式元数据.")
+    parser.add_argument("--overwrite", action="store_true", help="输出文件已存在时覆盖.")
     return parser.parse_args()
 
 
@@ -76,7 +75,7 @@ def main() -> None:
     args = parse_args()
     output = Path(args.output).expanduser().resolve()
     if output.exists() and not args.overwrite:
-        raise FileExistsError(f"{output} already exists. Pass --overwrite to replace it.")
+        raise FileExistsError(f"{output} 已存在, 请传入 --overwrite 后再覆盖.")
     source_files = collect_source_files(args)
     records = []
     for index, source_file in enumerate(source_files, start=1):
@@ -97,7 +96,7 @@ def main() -> None:
         "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + ("\n" if records else ""),
         encoding="utf-8",
     )
-    print(f"Wrote {len(records)} records to {output}")
+    print(f"已将 {len(records)} 条数据写入 {output}")
 
 
 def collect_source_files(args: argparse.Namespace) -> list[Path]:
@@ -143,7 +142,7 @@ def read_source_text(path: Path) -> str:
         return read_docx_text(path)
     if suffix == ".pdf":
         return read_pdf_text(path)
-    raise ValueError(f"Unsupported file type: {path}")
+    raise ValueError(f"不支持的文件类型: {path}")
 
 
 def read_docx_text(path: Path) -> str:
@@ -164,7 +163,7 @@ def read_pdf_text(path: Path) -> str:
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover - optional dependency.
-        raise ImportError("PDF input requires pypdf. Convert the file to .txt or install pypdf.") from exc
+        raise ImportError("读取 PDF 需要 pypdf; 请安装 pypdf, 或先将文件转换为 .txt.") from exc
     reader = PdfReader(str(path))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 

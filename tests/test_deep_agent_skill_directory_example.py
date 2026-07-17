@@ -327,6 +327,44 @@ def test_darwin_feedback_component_selector_cools_down_repeated_failed_component
     assert third != ["memory:AGENTS.md"]
 
 
+def test_component_selector_skips_text_mutation_for_tool_capability_only_batch(tmp_path):
+    example = _load_example_module()
+    seed_spec = example.create_seed_workspace(tmp_path)
+    candidate, _surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
+    selector = example.DarwinFeedbackComponentSelector()
+
+    selected = selector(
+        None,
+        [
+            {
+                "score": 0.1,
+                "feedback": "Scores:\n"
+                "- failure_classification: TOOL_CAPABILITY_GAP\n"
+                "- suggested_component: none",
+            }
+        ],
+        [0.1],
+        0,
+        candidate,
+    )
+
+    assert selected == []
+
+
+def test_default_evaluator_writes_fitness_back_to_original_state():
+    example = _load_example_module()
+    state = {"messages": []}
+
+    def evaluate(_example, mutable_state):
+        mutable_state["fitness"] = {"composite": 0.75}
+        return 0.75, "ok"
+
+    score, _feedback = example.DefaultEvaluator(evaluate).evaluate({"input": "x"}, state)
+
+    assert score == 0.75
+    assert state["fitness"] == {"composite": 0.75}
+
+
 def test_eval_caps_score_when_expected_route_is_missing(tmp_path):
     example = _load_example_module()
     seed_spec = example.create_seed_workspace(tmp_path)
@@ -453,6 +491,9 @@ def test_judge_prompt_includes_expert_data_and_trace_expectations(tmp_path):
     assert "七、项目风险点" in prompt
     assert "Trace expectations:" in prompt
     assert "行业周期信息获取" in prompt
+    assert "Do not grow SKILL.md into an industry catalog" in prompt
+    assert "cross_case_regression_risk" in prompt
+    assert "those fields are hidden during rollout" in prompt
 
 
 def test_adaptive_trace_summary_uses_llm_only_after_budget(monkeypatch):
@@ -572,13 +613,35 @@ def test_prepared_trace_summary_is_cached_for_reflection_record():
     assert len(calls) == 1
 
 
-def test_trace_expectation_matching_uses_full_trace_not_tail_only():
+def test_trace_expectation_matching_uses_successful_tool_evidence_from_full_trace():
     example = _load_example_module()
     state = {
         "messages": [
-            example.AIMessage(content="早期工具结果: 已查询钢铁行业周期和库存减值压力。"),
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_industry_cycle",
+                        "args": {"query": "钢铁行业周期和库存减值"},
+                        "id": "industry-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="钢铁行业处于下行周期, 存货存在减值压力。",
+                tool_call_id="industry-1",
+                name="lookup_industry_cycle",
+            ),
             *[example.AIMessage(content=f"后续普通消息 {index}") for index in range(40)],
-        ]
+        ],
+        "capability_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_industry_cycle",
+                "description": "查询钢铁行业周期、价格和库存减值信息。",
+            }
+        ],
     }
     row = {
         "metadata": {
@@ -593,6 +656,55 @@ def test_trace_expectation_matching_uses_full_trace_not_tail_only():
     assert matched == ["行业周期信息获取"]
     assert missing == []
     assert coverage == 1.0
+
+
+def test_trace_expectation_rejects_ai_prose_and_failed_tool_results():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "trace_expectations": [
+                {"label": "司法工商信息获取", "tool_intent_keywords": ["司法", "被执行"]}
+            ]
+        }
+    }
+    state = {
+        "messages": [
+            example.AIMessage(content="已查询司法和被执行信息。"),
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_judicial",
+                        "args": {"query": "司法 被执行"},
+                        "id": "judicial-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="ERROR: upstream service unavailable",
+                tool_call_id="judicial-1",
+                name="lookup_judicial",
+                status="error",
+            ),
+        ],
+        "capability_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_judicial",
+                "description": "查询企业司法、被执行和诉讼信息。",
+            }
+        ],
+    }
+
+    diagnostics = example.data_acquisition_diagnostics(row, state)
+
+    assert diagnostics["matched_trace_expectations"] == []
+    assert diagnostics["missing_trace_expectations"] == ["司法工商信息获取"]
+    assert diagnostics["tool_supported_missing_expectations"] == ["司法工商信息获取"]
+    assert diagnostics["tool_capability_gaps"] == []
+    assert diagnostics["successful_tool_evidence"] == []
+    assert diagnostics["failed_tool_evidence"][0]["name"] == "lookup_judicial"
 
 
 def test_data_acquisition_diagnostics_distinguishes_missing_tool_from_skipped_tool():
@@ -620,6 +732,35 @@ def test_data_acquisition_diagnostics_distinguishes_missing_tool_from_skipped_to
 
     assert diagnostics["tool_supported_missing_expectations"] == ["债务结构信息获取"]
     assert diagnostics["tool_capability_gaps"] == ["环保安监信息获取"]
+
+
+def test_missing_data_tool_is_classified_as_tool_capability_gap():
+    example = _load_example_module()
+    row = {
+        "input": "华东钢铁集团有限公司",
+        "rubric": "核验环保处罚信息。",
+        "metadata": {
+            "trace_expectations": [
+                {"label": "环保安监信息获取", "tool_intent_keywords": ["环保", "安全生产"]}
+            ]
+        },
+    }
+    state = {
+        "messages": [example.AIMessage(content="目前缺少环保处罚数据。")],
+        "baseline_response": "",
+        "candidate_excerpt": {"skill:credit-risk-review:SKILL.md": "Review available evidence."},
+        "candidate_constraints": [],
+        "available_tools": [
+            {"owner": "main", "name": "lookup_policy", "description": "查询内部授信政策。"}
+        ],
+    }
+
+    _score, feedback = example.evaluate_response(row, state)
+
+    assert state["fitness"]["failure_classification"] == "TOOL_CAPABILITY_GAP"
+    assert state["fitness"]["tool_capability_gaps"] == ["环保安监信息获取"]
+    assert "- failure_classification: TOOL_CAPABILITY_GAP" in feedback
+    assert "- suggested_component: none" in feedback
 
 
 def test_reflection_judge_score_is_capped_when_expected_route_is_missing(tmp_path):
@@ -760,6 +901,41 @@ def test_memory_reflection_template_discourages_copying_skill_content(tmp_path):
     assert "Selected component" in template
     assert "missing_rationale" in template
     assert "Do not start with a fenced code block" in template
+    assert "Expert data, rubrics, checkpoints" in template
+    assert "under <side_info> is optimizer-only evidence" in template
+    assert "A TOOL_CAPABILITY_GAP means no current text component" in template
+    assert "Hidden-data boundary check" in template
+    assert "Applicability scope and exclusions" in template
+    assert "Cross-case regression risk" in template
+    assert "trigger, evidence to obtain, analysis or comparison" in template
+    assert "not one universal checklist" in template
+    assert "Preserve the natural language used by the current component" in template
+
+
+def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
+    example = _load_example_module()
+    config_path = (
+        Path(__file__).parents[1]
+        / "examples"
+        / "langchain_adapter"
+        / "deepagents_gepa_configs"
+        / "credit_approval.toml"
+    )
+    project = example.build_candidate_from_deep_agent_project(example.load_deepagents_gepa_config(config_path))
+    learned_key = "skill:credit-risk-review:reference/learned_expert_patterns.md"
+    state = {
+        "candidate_excerpt": project.candidate,
+        "candidate_constraints": [],
+    }
+
+    suggested = example.suggest_component_to_update(state, "effect")
+    template = example.reflection_prompt_templates(project.candidate)[learned_key]
+
+    assert suggested == learned_key
+    assert "observable signals or business model" in template
+    assert "non-applicability" in template
+    assert "risk transmission" in template
+    assert "borrower-specific acquisition plan" in template
 
 
 def test_artifact_callback_writes_agent_logs_and_rejected_proposals(tmp_path):
@@ -957,6 +1133,63 @@ def test_run_analyzer_handles_windows_style_proposal_dirs(tmp_path):
     assert summary["proposal_diff_files"] == 1
 
 
+def test_run_analyzer_deduplicates_proposal_lifecycle_events(tmp_path):
+    analyzer = _load_analyzer_module()
+    run_dir = tmp_path / "run"
+    (run_dir / "agent_logs").mkdir(parents=True)
+    (run_dir / "proposals" / "0001").mkdir(parents=True)
+    (run_dir / "rejected_proposals" / "0001").mkdir(parents=True)
+    (run_dir / "result_summary.json").write_text(
+        json.dumps({"best_val_score": 0.5, "val_aggregate_scores": [0.5]}),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_logs" / "rollouts.jsonl").write_text("", encoding="utf-8")
+    events = [
+        {
+            "iteration": 1,
+            "status": "started",
+            "components": ["main:system_prompt"],
+            "proposal_dir": "proposals/0001",
+        },
+        {
+            "iteration": 1,
+            "status": "proposed",
+            "components": ["main:system_prompt"],
+            "proposal_dir": "proposals/0001",
+        },
+        {
+            "iteration": 1,
+            "status": "proposed",
+            "components": ["main:system_prompt"],
+            "proposal_dir": "proposals/0001",
+        },
+        {
+            "iteration": 1,
+            "status": "accepted",
+            "components": ["main:system_prompt"],
+            "proposal_dir": "proposals/0001",
+        },
+    ]
+    (run_dir / "proposals" / "index.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (run_dir / "rejected_proposals" / "index.jsonl").write_text(
+        json.dumps({"iteration": 1, "proposal_dir": "rejected_proposals/0001"}) + "\n",
+        encoding="utf-8",
+    )
+    for directory in [run_dir / "proposals" / "0001", run_dir / "rejected_proposals" / "0001"]:
+        (directory / "proposal_rationale.json").write_text("{}", encoding="utf-8")
+
+    summary = analyzer.summarize_run(run_dir)
+
+    assert summary["proposal_event_count"] == 4
+    assert summary["proposal_count"] == 1
+    assert summary["proposal_statuses"] == {"accepted": 1}
+    assert summary["proposed_components"] == {"main:system_prompt": 1}
+    assert summary["proposal_rationale_files"] == 1
+
+
 def test_local_runner_forces_no_proxy_for_localhost(monkeypatch):
     runner = _load_runner_module()
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
@@ -1140,14 +1373,23 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert "skill:credit-risk-review:reference/cashflow_and_repayment.md" in project.candidate
     assert "skill:credit-risk-review:reference/collateral_and_guarantee.md" in project.candidate
     assert "skill:credit-risk-review:reference/industry_management_and_warnings.md" in project.candidate
+    assert "skill:credit-risk-review:reference/learned_expert_patterns.md" in project.candidate
     assert all("rubric" in row for row in rows)
     assert all("data" in row for row in rows)
     assert all("answer" not in row and "expected" not in row for row in rows)
     assert all("项目风险点" in row["data"] for row in rows)
-    assert all("自主检索" in row["rubric"] for row in rows)
+    assert all("智能体仅根据企业名称自主检索" in row["rubric"] for row in rows)
     assert len(rows) >= 8
     assert all(row["metadata"].get("checkpoints") for row in rows)
     assert all(row["metadata"].get("trace_expectations") for row in rows)
+    assert "取证计划" in project.candidate["skill:credit-risk-review:reference/learned_expert_patterns.md"]
+    assert "同一触发条件" in project.candidate["skill:credit-risk-review:reference/learned_expert_patterns.md"]
+
+    skill_constraints = example.skill_structure_constraints(
+        "skill:credit-risk-review:SKILL.md",
+        project.candidate["skill:credit-risk-review:SKILL.md"],
+    )
+    assert all(constraint.passed for constraint in skill_constraints)
     assert any(row["metadata"].get("scenario") == "钢铁集团授信_项目风险点对齐" for row in rows)
     assert any(row["input"] == "华东钢铁集团有限公司" for row in rows)
 
@@ -1209,7 +1451,7 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
     result = example.run_configured_skill_optimization(
         config_path,
         ToolFriendlyFakeChatModel(responses=["Credit risk review draft."] * 100),
-        lambda _prompt: "```\n# Credit Risk Review\n\nUse verified cash-flow evidence before approval.\n```",
+        lambda _prompt: "```\n# 信贷审批风险审查\n\n审批前使用经过验证的现金流证据。\n```",
         dataset_provider=DatasetProvider(),
         evaluator=Evaluator(),
         template_registry=TemplateRegistry(),
@@ -1258,6 +1500,55 @@ def test_golden_dataset_supports_rubric_without_expected(tmp_path):
     assert "answer" not in rows[0]
     assert rows[1]["answer"] == "account"
     assert rows[1]["metadata"]["topic"] == "auth"
+
+
+def test_dataset_split_is_stratified_deterministic_and_disjoint():
+    example = _load_example_module()
+    rows = [
+        {
+            "input": f"企业-{index}",
+            "metadata": {
+                "difficulty": "hard" if index % 2 else "medium",
+                "industry": "制造业" if index < 5 else "服务业",
+            },
+        }
+        for index in range(10)
+    ]
+
+    first = example.split_examples(
+        rows,
+        stratify_by=("metadata.difficulty", "metadata.industry"),
+        seed=17,
+    )
+    second = example.split_examples(
+        list(reversed(rows)),
+        stratify_by=("metadata.difficulty", "metadata.industry"),
+        seed=17,
+    )
+
+    assert [len(split) for split in first] == [6, 2, 2]
+    assert [{row["input"] for row in split} for split in first] == [
+        {row["input"] for row in split} for split in second
+    ]
+    assert not ({row["input"] for row in first[0]} & {row["input"] for row in first[1]})
+    assert not ({row["input"] for row in first[0]} & {row["input"] for row in first[2]})
+    assert all(row["metadata"]["dataset_split"] == "train" for row in first[0])
+    assert all(row["metadata"]["dataset_stratum"] for split in first for row in split)
+
+
+def test_dataset_split_honors_explicit_assignments():
+    example = _load_example_module()
+    rows = [
+        {"input": "训练企业", "metadata": {"split": "train"}},
+        {"input": "验证企业", "metadata": {"split": "val"}},
+        {"input": "测试企业", "metadata": {"split": "test"}},
+    ]
+
+    train, val, test = example.split_examples(rows, split_strategy="explicit")
+
+    assert [row["input"] for row in train] == ["训练企业"]
+    assert [row["input"] for row in val] == ["验证企业"]
+    assert [row["input"] for row in test] == ["测试企业"]
 
 
 def test_golden_dataset_supports_evaluator_only_data_path(tmp_path):
@@ -1407,7 +1698,14 @@ def test_run_configured_optimization_writes_artifacts(tmp_path):
     example.create_seed_workspace(project_root)
     dataset_path = project_root / "golden.jsonl"
     dataset_path.write_text(
-        json.dumps({"input": "I was charged twice for my invoice.", "expected": "billing"}) + "\n",
+        "\n".join(
+            [
+                json.dumps({"input": "I was charged twice for my invoice.", "expected": "billing"}),
+                json.dumps({"input": "The invoice total is wrong.", "expected": "billing"}),
+                json.dumps({"input": "Where can I download my receipt?", "expected": "billing"}),
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     config_path = tmp_path / "deepagents_gepa.toml"
@@ -1434,3 +1732,13 @@ def test_run_configured_optimization_writes_artifacts(tmp_path):
     assert (run_dir / "candidates" / "0000" / "candidate.json").exists()
     assert (run_dir / "best_candidate" / "candidate.json").exists()
     assert (run_dir / "materialized_best_candidate" / "AGENTS.md").exists()
+    rollout_rows = [
+        json.loads(line)
+        for line in (run_dir / "agent_logs" / "rollouts.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(row["fitness"] for row in rollout_rows)
+    final_test = json.loads((run_dir / "final_test" / "summary.json").read_text(encoding="utf-8"))
+    result_summary = json.loads((run_dir / "result_summary.json").read_text(encoding="utf-8"))
+    assert final_test["count"] == 1
+    assert result_summary["final_test"] == final_test

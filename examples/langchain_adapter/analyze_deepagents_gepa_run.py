@@ -47,12 +47,17 @@ def resolve_run_dir(path: str | Path | None) -> Path:
 def summarize_run(run_dir: Path) -> dict[str, Any]:
     summary = read_json(run_dir / "result_summary.json", {})
     rollouts = read_jsonl(run_dir / "agent_logs" / "rollouts.jsonl")
-    proposals = read_jsonl(run_dir / "proposals" / "index.jsonl")
-    rejected_proposals = read_jsonl(run_dir / "rejected_proposals" / "index.jsonl")
-    rollout_details = read_rollout_details(run_dir, rollouts)
+    proposal_events = read_jsonl(run_dir / "proposals" / "index.jsonl")
+    rejected_proposal_events = read_jsonl(run_dir / "rejected_proposals" / "index.jsonl")
+    proposals = latest_proposal_events(proposal_events)
+    rejected_proposals = latest_proposal_events(rejected_proposal_events)
+    optimization_rollouts = [
+        row for row in rollouts if not str(row.get("evaluation_phase", "optimization")).startswith("final_test")
+    ]
+    rollout_details = read_rollout_details(run_dir, optimization_rollouts)
 
-    scores = [float(row.get("score", 0.0)) for row in rollouts]
-    errors = Counter(error for row in rollouts if (error := rollout_error(row)))
+    scores = [float(row.get("score", 0.0)) for row in optimization_rollouts]
+    errors = Counter(error for row in optimization_rollouts if (error := rollout_error(row)))
     boundary_failures = Counter(
         constraint.get("name")
         for detail in rollout_details
@@ -92,7 +97,13 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         for row in rejected_proposals
         for failure_class in row.get("failure_classifications", [])
     )
+    rollout_failure_classes = Counter(
+        str(row.get("failure_classification"))
+        for row in optimization_rollouts
+        if row.get("failure_classification")
+    )
     proposal_artifacts = proposal_artifact_counts(run_dir, proposals, rejected_proposals)
+    final_test = summary.get("final_test") or read_json(run_dir / "final_test" / "summary.json")
 
     val_scores = summary.get("val_aggregate_scores") or []
     best_val_score = summary.get("best_val_score")
@@ -101,7 +112,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     if baseline_score is not None and best_val_score is not None:
         improvement = float(best_val_score) - float(baseline_score)
 
-    runtime_blocked = bool(rollouts) and sum(errors.values()) == len(rollouts)
+    runtime_blocked = bool(optimization_rollouts) and sum(errors.values()) == len(optimization_rollouts)
     connection_blocked = runtime_blocked and all("APIConnectionError" in key or "ConnectError" in key for key in errors)
 
     return {
@@ -112,7 +123,8 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "num_candidates": summary.get("num_candidates"),
         "total_metric_calls": summary.get("total_metric_calls"),
         "num_full_val_evals": summary.get("num_full_val_evals"),
-        "rollout_count": len(rollouts),
+        "rollout_count": len(optimization_rollouts),
+        "final_test_rollout_count": len(rollouts) - len(optimization_rollouts),
         "rollout_score_mean": sum(scores) / len(scores) if scores else None,
         "rollout_score_min": min(scores) if scores else None,
         "rollout_score_max": max(scores) if scores else None,
@@ -122,10 +134,15 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "missed_supported_expectations": dict(missed_supported_expectations.most_common()),
         "missing_trace_expectations": dict(missing_trace_expectations.most_common()),
         "proposal_statuses": dict(proposal_statuses),
+        "proposal_count": len(proposals),
+        "proposal_event_count": len(proposal_events),
         "proposed_components": dict(proposed_components.most_common()),
         "rejected_components": dict(rejected_components.most_common()),
         "rejected_failure_classes": dict(failure_classes.most_common()),
+        "rollout_failure_classes": dict(rollout_failure_classes.most_common()),
         "rejected_proposal_count": len(rejected_proposals),
+        "rejected_proposal_event_count": len(rejected_proposal_events),
+        "final_test": final_test,
         **proposal_artifacts,
         "experiment_valid_for_effectiveness": not connection_blocked,
         "diagnosis": diagnose(
@@ -140,6 +157,18 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             proposal_artifacts=proposal_artifacts,
         ),
     }
+
+
+def latest_proposal_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse the proposal event stream to one terminal/latest row per iteration."""
+    latest: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for index, row in enumerate(rows):
+        identity = str(row.get("iteration") if row.get("iteration") is not None else row.get("proposal_dir") or index)
+        if identity not in latest:
+            order.append(identity)
+        latest[identity] = row
+    return [latest[identity] for identity in order]
 
 
 def diagnose(
@@ -223,13 +252,17 @@ def proposal_artifact_counts(
     proposals: list[dict[str, Any]],
     rejected_proposals: list[dict[str, Any]],
 ) -> dict[str, int]:
-    proposal_dirs = {run_dir / artifact_relative_path(row.get("proposal_dir", "")) for row in proposals if row.get("proposal_dir")}
-    rejected_dirs = {
-        run_dir / artifact_relative_path(row.get("proposal_dir", ""))
-        for row in rejected_proposals
-        if row.get("proposal_dir")
-    }
-    all_dirs = proposal_dirs | rejected_dirs
+    dirs_by_iteration: dict[str, Path] = {}
+    for index, row in enumerate([*proposals, *rejected_proposals]):
+        proposal_dir = row.get("proposal_dir")
+        if not proposal_dir:
+            continue
+        identity = str(row.get("iteration") if row.get("iteration") is not None else index)
+        candidate_dir = run_dir / artifact_relative_path(proposal_dir)
+        current = dirs_by_iteration.get(identity)
+        if current is None or str(candidate_dir).replace("\\", "/").find("/proposals/") >= 0:
+            dirs_by_iteration[identity] = candidate_dir
+    all_dirs = set(dirs_by_iteration.values())
     return {
         "proposal_rationale_files": sum(1 for path in all_dirs if (path / "proposal_rationale.json").exists()),
         "proposal_missing_rationale_files": sum(
@@ -265,16 +298,25 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Metric calls: {summary['total_metric_calls']}")
     print(f"Candidates: {summary['num_candidates']}")
     print(f"Rollouts: {summary['rollout_count']}")
+    print(f"Final test rollouts: {summary['final_test_rollout_count']}")
     print(f"Runtime errors: {summary['runtime_errors']}")
     print(f"Boundary failures: {summary['boundary_failures']}")
     print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
     print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
     print(f"Missing trace expectations: {summary['missing_trace_expectations']}")
     print(f"Proposal statuses: {summary['proposal_statuses']}")
+    print(f"Proposals: {summary['proposal_count']} ({summary['proposal_event_count']} lifecycle events)")
     print(f"Rejected proposals: {summary['rejected_proposal_count']}")
     print(f"Proposal rationale files: {summary['proposal_rationale_files']}")
     print(f"Proposal missing rationale files: {summary['proposal_missing_rationale_files']}")
     print(f"Proposal diff files: {summary['proposal_diff_files']}")
+    if summary.get("final_test"):
+        final_test = summary["final_test"]
+        print(
+            "Final test: "
+            f"seed={final_test.get('seed_mean')} best={final_test.get('best_mean')} "
+            f"improvement={final_test.get('improvement')}"
+        )
     print("Diagnosis:")
     for note in summary["diagnosis"]:
         print(f"- {note}")

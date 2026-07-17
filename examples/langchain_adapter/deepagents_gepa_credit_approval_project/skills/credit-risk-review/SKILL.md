@@ -1,33 +1,26 @@
 ---
 name: credit-risk-review
-description: Review credit applications using approval-officer risk methodology.
+description: 运用审批官风险审查方法分析企业授信申请。
 ---
 
-# Credit Risk Review
+# 信贷审批风险审查
 
-Use this skill when drafting, checking, or improving a credit approval opinion.
+用于起草、检查或改进企业信贷审批意见。
 
-## Workflow
+## 工作流程
 
-1. Identify the borrower, facility purpose, tenor, amount, source of repayment,
-   collateral, guarantees, and requested approval conditions.
-2. If the user provides only a borrower name, use available tools to gather or
-   request borrower-specific evidence before judging risk.
-3. Read the relevant reference files before making the risk judgment.
-4. Separate primary repayment capacity from secondary risk mitigants.
-5. Name the strongest approval risks, the evidence that supports them, and the
-   transmission path from fact to repayment or enforceability pressure.
-6. Convert unresolved risk into explicit pre-disbursement conditions, covenants,
-   monitoring triggers, or decline rationale.
+1. 识别借款人、授信用途、期限、金额、第一还款来源、抵质押、保证及拟设置的审批条件。
+2. 用户只提供企业名称时，先调用现有工具获取企业专属证据；工具不能覆盖的信息应列为待补充资料，不得据此编造结论。
+3. 根据已观察到的行业、商业模式、交易、资产和融资特征形成待验证风险假设，再读取与该假设相关的 reference 文件。仅在适用信号吻合时使用 `reference/learned_expert_patterns.md`；其中的行业仅是机制示例，不是封闭名单。
+4. 将第一还款来源与第二还款来源分开评价，不能用抵质押或保证替代经营偿债能力分析。
+5. 对每项重点风险写清“已知事实或信号→待取得证据→比较或验证方法→风险传导→审批措施”。企业差异较大时允许使用条件分支，不要求套用固定指标或统一阈值。
+6. 将未解决风险转化为明确的放款前提、授信条件、承诺条款、监控触发项、额度调整或否决理由。
 
-## Failure Modes And Guardrails
+## 失败模式与约束
 
-- Do not treat collateral value as proof of repayment capacity.
-- Do not rely on revenue growth without checking cash conversion and debt
-  service pressure.
-- Do not accept related-party receivables, circular transactions, or one-off
-  government subsidies as stable cash flow without verification.
-- Do not ignore negative expert comments simply because the borrower has a long
-  relationship with the bank.
-- If evidence is missing, state the missing evidence and the approval condition
-  needed to resolve it.
+- 不得将抵质押估值直接视为第一还款来源充足。
+- 不得只看营业收入或利润增长而忽略现金转化、债务期限和偿债压力。
+- 未核实交易实质、定价、账龄和回款记录前，不得把关联方应收、循环交易或一次性补贴视为稳定现金流。
+- 不得因企业与银行合作时间长而忽略审批官、外部数据或工具结果中的负面信号。
+- 行业经验只能形成待验证假设；没有企业专属证据时，应写明缺口和补充核验条件。
+- 不得把某一家企业的名称、金额、年份或结论沉淀为通用规则。

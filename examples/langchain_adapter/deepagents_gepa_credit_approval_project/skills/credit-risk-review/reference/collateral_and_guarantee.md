@@ -1,21 +1,24 @@
-# Collateral And Guarantee
+# 抵质押与保证
 
-Collateral and guarantees reduce loss severity; they do not replace borrower
-repayment capacity.
+抵质押和保证用于降低违约损失，不能替代对第一还款来源的评价。核验范围应随资产类型、权利状态和交易结构变化。
 
-Collateral checks:
+## 抵质押物
 
-- Verify ownership, valuation basis, liquidity, senior liens, pledge
-  registration, and disposal restrictions.
-- Discount collateral if the asset is specialized, illiquid, legally disputed,
-  or dependent on the borrower's own operation.
-- Real-estate collateral needs location, occupancy, marketability, and policy
-  restriction checks.
+- 触发信号：授信依赖房产、土地、设备、存货、应收账款、仓单、股权或其他权利缓释风险。
+- 取得证据：权属、登记、估值依据、在先权利、保险、占用状态、处置限制和历史交易资料；具体资料随资产类型调整。
+- 分析方法：核验权属和登记有效性，比较估值假设与可观察市场或回收记录，并测试处置时间、费用、折价和优先受偿顺序。
+- 审批使用：专业性强、流动性差、存在争议或依赖借款人持续经营的资产应审慎折价，并设置登记、监管、保险和定期重估条件。
 
-Guarantee checks:
+## 应收账款和存货质押
 
-- Verify guarantor financial capacity and independence from the borrower.
-- Group guarantees may be circular if all entities depend on the same cash
-  source.
-- Personal guarantees have limited comfort without asset verification and
-  enforceability.
+- 触发信号：缓释价值取决于持续变化的应收、存货、仓单或订单池。
+- 取得证据：底层交易、确权和验收、账龄、回款、出入库、盘点、第三方监管和重复质押查询。
+- 分析方法：按付款方、账龄、质量、流动性和权利瑕疵分层，动态测试有效质押池和覆盖水平。
+- 审批使用：设置准入、折扣、补仓、替换、回款归集和异常触发规则，不能只采用静态账面金额。
+
+## 保证人
+
+- 触发信号：审批结论依赖集团企业、自然人或外部机构保证。
+- 取得证据：保证人财务和现金流、负债与对外担保、关联关系、授权程序、资产可执行性及代偿记录。
+- 分析方法：评价保证人的独立偿付能力和法律可执行性，识别与借款人共享同一现金来源的循环担保。
+- 审批使用：缺乏独立偿付来源或资产核验的保证只能提供有限缓释，不得重复计算集团内部信用支持。

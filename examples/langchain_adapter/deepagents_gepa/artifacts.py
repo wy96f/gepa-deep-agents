@@ -60,6 +60,8 @@ def _message_to_dict(message: Any) -> dict[str, Any]:
     return {
         "type": type(message).__name__,
         "name": getattr(message, "name", None),
+        "tool_call_id": getattr(message, "tool_call_id", None),
+        "status": getattr(message, "status", None),
         "content": content,
         "tool_calls": getattr(message, "tool_calls", None) or [],
         "additional_kwargs": getattr(message, "additional_kwargs", {}) or {},
@@ -76,9 +78,11 @@ def _state_summary(state: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_metrics": state.get("candidate_metrics", {}),
         "fitness": state.get("fitness", {}),
         "available_tools": state.get("available_tools", []),
+        "capability_tools": state.get("capability_tools", []),
         "trace_context_window_tokens": state.get("trace_context_window_tokens"),
         "trace_context_ratio": state.get("trace_context_ratio"),
         "evaluation_trace_mode": state.get("evaluation_trace_mode"),
+        "evaluation_phase": state.get("evaluation_phase", "optimization"),
     }
 
 
@@ -237,6 +241,29 @@ def _failure_classes_from_trajectories(trajectories: Sequence[Any] | None) -> li
     return classes
 
 
+def _evaluation_payload(examples: Sequence[Mapping[str, Any]], evaluation: Any) -> dict[str, Any]:
+    scores = [float(score) for score in list(getattr(evaluation, "scores", []) or [])]
+    outputs = list(getattr(evaluation, "outputs", []) or [])
+    rows = []
+    for index, example in enumerate(examples):
+        output = outputs[index] if index < len(outputs) else None
+        state = output.get("state", {}) if isinstance(output, Mapping) else {}
+        rows.append(
+            {
+                "input": example.get("input"),
+                "score": scores[index] if index < len(scores) else None,
+                "response": output.get("response") if isinstance(output, Mapping) else None,
+                "fitness": state.get("fitness", {}) if isinstance(state, Mapping) else {},
+                "candidate_hash": state.get("candidate_hash") if isinstance(state, Mapping) else None,
+            }
+        )
+    return {"scores": scores, "mean": _score_mean(scores), "rows": rows}
+
+
+def _score_mean(scores: Sequence[float]) -> float:
+    return sum(scores) / len(scores) if scores else 0.0
+
+
 class RunArtifactStore:
     """Persist run inputs, candidates, and final materialized artifacts."""
 
@@ -329,6 +356,7 @@ class RunArtifactStore:
             "expected": example.get("expected") or example.get("answer"),
             "rubric": example.get("rubric"),
             "metadata": example.get("metadata", {}),
+            "evaluation_phase": state.get("evaluation_phase", "optimization"),
             "score": score,
             "response": _last_message_text(state),
             "baseline_response": state.get("baseline_response", ""),
@@ -348,8 +376,10 @@ class RunArtifactStore:
             "baseline_preview": str(record["baseline_response"])[:500],
             "feedback_preview": feedback[:500],
             "fitness": record["fitness"],
+            "failure_classification": record["fitness"].get("failure_classification"),
             "tool_capability_gaps": record["fitness"].get("tool_capability_gaps", []),
             "tool_supported_missing_expectations": record["fitness"].get("tool_supported_missing_expectations", []),
+            "evaluation_phase": record["evaluation_phase"],
             "error": record["state"]["error"],
             "detail_file": f"rollouts/{index:06d}.json",
         }
@@ -475,7 +505,38 @@ class RunArtifactStore:
             },
         )
 
-    def write_result_summary(self, result: Any) -> dict[str, Any]:
+    def write_final_test(
+        self,
+        *,
+        examples: Sequence[Mapping[str, Any]],
+        seed_evaluation: Any,
+        best_evaluation: Any,
+    ) -> dict[str, Any]:
+        seed_payload = _evaluation_payload(examples, seed_evaluation)
+        best_payload = _evaluation_payload(examples, best_evaluation)
+        _write_json(self.run_dir / "final_test" / "seed.json", seed_payload)
+        _write_json(self.run_dir / "final_test" / "best.json", best_payload)
+        seed_mean = _score_mean(seed_payload["scores"])
+        best_mean = _score_mean(best_payload["scores"])
+        comparison = {
+            "count": len(examples),
+            "seed_mean": seed_mean,
+            "best_mean": best_mean,
+            "improvement": best_mean - seed_mean,
+            "per_example": [
+                {
+                    "input": example.get("input"),
+                    "seed_score": seed_payload["scores"][index],
+                    "best_score": best_payload["scores"][index],
+                    "delta": best_payload["scores"][index] - seed_payload["scores"][index],
+                }
+                for index, example in enumerate(examples)
+            ],
+        }
+        _write_json(self.run_dir / "final_test" / "summary.json", comparison)
+        return comparison
+
+    def write_result_summary(self, result: Any, final_test: Mapping[str, Any] | None = None) -> dict[str, Any]:
         best_candidate = getattr(result, "best_candidate", {})
         summary = {
             "result_type": type(result).__name__,
@@ -495,6 +556,7 @@ class RunArtifactStore:
             "component_lengths": (
                 {name: len(text) for name, text in best_candidate.items()} if isinstance(best_candidate, dict) else None
             ),
+            "final_test": dict(final_test) if final_test is not None else None,
         }
         _write_json(self.run_dir / "result_summary.json", summary)
         return summary
@@ -560,10 +622,11 @@ class RunArtifactStore:
         result: Any,
         project: Any,
         apply_candidate: Callable[[Any, Mapping[str, str], Path], Any],
+        final_test: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.write_result_candidates(result)
         self.materialize_best_candidate(result=result, project=project, apply_candidate=apply_candidate)
-        return self.write_result_summary(result)
+        return self.write_result_summary(result, final_test=final_test)
 
 
 class RunArtifactCallback:

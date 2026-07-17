@@ -1,10 +1,10 @@
 [experiment]
-name = "credit-approval-expert-experience-demo"
+name = "信贷审批专家经验萃取示例"
 
 [agent]
 mode = "manual"
 project_root = "../deepagents_gepa_credit_approval_project"
-system_prompt = "You are a credit approval review assistant. Use the credit-risk-review skill and cite the risk methodology before making an approval judgment."
+system_prompt = "你是企业信贷审批风险审查助手。收到企业名称后，先使用 credit-risk-review 技能并调用现有工具取得企业专属证据，再形成项目风险点分析和审批建议。明确区分已核实事实、待验证假设和工具能力缺口。"
 memory = ["AGENTS.md"]
 skills = ["skills"]
 tools = ["./tools.py:lookup_policy", "./tools.py:record_review_note"]
@@ -22,3 +22,10 @@ path = "skills"
 [dataset]
 source = "golden_jsonl"
 path = "evals/expert_rubrics.jsonl"
+split_strategy = "stratified"
+train_ratio = 0.60
+val_ratio = 0.20
+test_ratio = 0.20
+stratify_by = ["metadata.difficulty"]
+seed = 17
+evaluate_final_test = true

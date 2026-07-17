@@ -68,7 +68,7 @@ Its golden dataset intentionally includes multiple examples for each support
 route (`billing`, `account`, `engineering`, `product`) so small train/validation
 splits do not leave an entire class represented by only one held-out example.
 
-There is also a credit approval expert-risk-section demo:
+另有一个信贷审批专家风险意见萃取示例：
 
 ```text
 examples/langchain_adapter/deepagents_gepa_credit_approval_project/
@@ -92,16 +92,13 @@ examples/langchain_adapter/deepagents_gepa_example.toml
 It is not the primary demo config used by tests. Use `manual.toml` or
 `langgraph_cli.toml` when you want to run the repository demo.
 
-## Credit Approval Demo
+## 信贷审批示例
 
-The credit approval demo is designed for expert-experience distillation rather
-than exact-answer routing. Each row gives the agent only a borrower name as
-`input`. The approval officer's "project risk points" section is stored in
-`data`, which is evaluator-only material: it is visible to the judge and
-reflection step, but it is not passed to the agent during rollout. The judge
-compares the agent trace/output with the expert risk section and asks whether
-the agent gathered the right data, covered the risk points, and explained the
-risk logic. Its skill directory contains reusable methodology:
+信贷审批示例用于萃取专家经验，不要求匹配唯一标准答案。每条数据只把企业名称作为
+`input` 交给智能体。审批官风险评价意见中的“项目风险点”章节保存在 `data`，仅供
+评估器和反思步骤使用，不会在智能体运行时泄露。评审模型比较智能体轨迹、输出与
+专家风险意见，判断是否取得了正确的企业证据、覆盖核心风险点并讲清风险逻辑。
+技能目录包含以下可复用方法论：
 
 ```text
 skills/credit-risk-review/SKILL.md
@@ -109,48 +106,65 @@ skills/credit-risk-review/reference/financial_statement_analysis.md
 skills/credit-risk-review/reference/cashflow_and_repayment.md
 skills/credit-risk-review/reference/collateral_and_guarantee.md
 skills/credit-risk-review/reference/industry_management_and_warnings.md
+skills/credit-risk-review/reference/learned_expert_patterns.md
 ```
 
-The dataset shape is:
+`SKILL.md` 负责稳定的审查流程：形成假设、取得证据、判定状态、分析风险传导并形成
+审批措施。有行业、商业模式或交易结构适用范围的经验应进入最具体的
+`reference/*.md`。`learned_expert_patterns.md` 是预先声明的专家经验沉淀面，用于
+容纳无法归入现有分类的可复用模式。一次 GEPA 优化中的 component key 集合固定，
+不能在中途凭空新增文件；领域需要独立知识分类时，应在运行前预建相应 reference。
+
+评审与反思模板要求经验模式写清机制假设、适用信号、排除条件、动态取证计划、分析
+方法、状态判定、风险传导和审批应用。这些不是所有企业共用的一张固定清单：智能体应
+根据当前企业的商业模式、交易、资产和融资特征选择证据及比较基准。行业案例只用于
+解释经济机制，不是封闭名单。这样可以避免某条规则改善一个样本后被无条件应用到无关
+企业。
+
+数据格式如下：
 
 ```json
 {
   "input": "华东钢铁集团有限公司",
   "data": "七、项目风险点\n1、钢铁行业周期性风险...",
-  "rubric": "评价 agent 是否自主获取相关信息, 覆盖专家风险点, 并讲清风险逻辑。",
+  "rubric": "评价智能体是否自主取得相关证据、覆盖专家风险点并讲清风险逻辑。",
   "metadata": {
     "checkpoints": [
       {"label": "钢铁行业周期性风险", "keywords": ["钢铁行业", "周期", "库存减值"]},
       {"label": "高负债规模与债务结构压力风险", "keywords": ["资产负债率", "短贷长投"]}
     ],
     "trace_expectations": [
-      {"label": "行业周期信息获取", "tool_intent_keywords": ["行业", "钢铁", "周期"]},
+      {
+        "label": "行业周期信息获取",
+        "tool_names": ["lookup_industry_cycle"],
+        "tool_intent_keywords": ["行业", "钢铁", "周期"]
+      },
       {"label": "债务结构信息获取", "tool_intent_keywords": ["负债", "借款", "融资"]}
     ]
   }
 }
 ```
 
-There is no `expected` answer. The reflection judge evaluates whether the agent
-trace shows relevant data acquisition, whether the final output covers the
-expert risk points, and whether the output explains the risk transmission logic.
-`metadata` is optional, but useful. `metadata.checkpoints` acts as a stricter
-coverage checklist for the final answer. `metadata.trace_expectations` is a
-soft diagnostic shown to the judge and feedback; it is not a deterministic hard
-gate because real tool traces vary by project.
+数据没有 `expected` 标准答案。评审模型评价轨迹是否显示相关信息获取、最终输出是否
+覆盖专家风险点，以及是否说明风险传导。`metadata` 可选但很有用：
+`metadata.checkpoints` 是最终答案的严格覆盖清单；trace expectation 只有在轨迹中
+出现成对的成功工具调用与结果，且种子工具能力与该期望匹配时才算完成。提示词、
+SKILL.md、智能体文字和最终答案中的关键词都不能作为已取得证据。已知目标工具时可
+设置 `tool_names`；否则框架使用种子工具名称、描述和 `tool_intent_keywords` 进行
+保守匹配。
 
-To clean many approval opinions into this format:
+批量清洗审批意见：
 
 ```bash
-python examples/langchain_adapter/clean_credit_risk_dataset.py \
+uv run --no-sync python examples/langchain_adapter/clean_credit_risk_dataset.py \
   --input-dir /path/to/risk-opinions \
   --output examples/langchain_adapter/deepagents_gepa_credit_approval_project/evals/project_risk_sections.jsonl
 ```
 
-Run it with:
+运行优化：
 
 ```bash
-python examples/langchain_adapter/run_deepagents_gepa_local.py \
+uv run --no-sync python examples/langchain_adapter/run_deepagents_gepa_local.py \
   --config examples/langchain_adapter/deepagents_gepa_configs/credit_approval.toml \
   --base-url http://127.0.0.1:8080/v1 \
   --model local-chat-model \
@@ -162,10 +176,10 @@ python examples/langchain_adapter/run_deepagents_gepa_local.py \
   --artifact-run-name credit_approval_10
 ```
 
-Analyze it with:
+分析运行产物：
 
 ```bash
-python examples/langchain_adapter/analyze_deepagents_gepa_run.py \
+uv run --no-sync python examples/langchain_adapter/analyze_deepagents_gepa_run.py \
   --run-dir examples/langchain_adapter/runs/credit_approval_10
 ```
 
@@ -346,15 +360,23 @@ the final fenced replacement:
 
 ```text
 Failure pattern
+Evidence across examples
 Selected component
 Why this component
 Why not other components
+Applicability scope and exclusions
+Cross-case regression risk
+Operational rule shape
 Boundary checks
+Hidden-data boundary check
 Intended behavior change
 ```
 
 This is a review artifact, not hidden chain-of-thought. GEPA still extracts only
-the final fenced block as the new component text.
+the final fenced block as the new component text. `<side_info>`, expert data,
+rubrics, checkpoints, and evaluator feedback are optimizer-only evidence; they
+were never runtime input. The reflection model is explicitly forbidden from
+claiming the agent saw or failed to read them.
 
 ## Skill Scripts
 
@@ -434,6 +456,10 @@ Fields mean:
 - `expected`: optional known answer, route, label, or structured result.
 - `rubric`: optional evaluation guidance for open-ended tasks.
 - `metadata`: optional grouping, topic, difficulty, source, or trace metadata.
+- top-level `split` or `metadata.split`: optional explicit `train`, `val`, or
+  `test` assignment.
+- top-level `stratum` or `metadata.stratum`: optional grouping used by
+  stratified splitting.
 
 For deterministic tasks, `expected` is useful. For open-ended work such as due
 diligence report generation, `rubric` is usually more valuable than exact-match
@@ -464,9 +490,28 @@ score saturation:
 Each checkpoint is a reusable expert judgment point. The evaluator reports
 matched and missing checkpoints, caps open-ended scores when checkpoints are
 missing, and pushes feedback toward the most specific skill/reference component
-that should preserve the lesson. Trace expectations are softer: they are shown
-to the judge and feedback as data-acquisition diagnostics, but they are not a
-hard deterministic gate because tool traces vary by project.
+that should preserve the lesson. Trace expectations remain diagnostics rather
+than a hard score gate, but their matched/missing state is deterministic and
+uses only successful tool evidence. Failed tool results are retained separately.
+
+Dataset splitting is deterministic and stratified by default:
+
+```toml
+[dataset]
+split_strategy = "stratified"
+train_ratio = 0.60
+val_ratio = 0.20
+test_ratio = 0.20
+stratify_by = ["metadata.difficulty", "metadata.industry"]
+seed = 17
+evaluate_final_test = true
+```
+
+Explicit split labels take precedence. Unlabeled rows are distributed by the
+configured strata using a stable hash, so JSONL ordering does not place whole
+industries only in train or test. After GEPA finishes, the harness evaluates
+seed and best on the held-out test split. This final test does not influence
+optimization, acceptance, or Pareto selection.
 
 Langfuse import supports two dataset styles:
 
@@ -570,7 +615,9 @@ that does not return the expected route/label cannot be accepted as a high-score
 improvement. For expert-data rows with `metadata.checkpoints`, the judge
 is also capped by checkpoint coverage; missing expert points are classified as
 `SKILL_DEFECT` so the next proposal is encouraged to update `SKILL.md` or a
-focused `reference/*.md` file. If a hard deterministic gate fails, the final
+focused `reference/*.md` file. If the missing point requires evidence that no
+declared seed tool can obtain, it is classified as `TOOL_CAPABILITY_GAP`
+instead. If a hard deterministic gate fails, the final
 judge score is capped to zero. Advisory notes do not cap the score by
 themselves; they are fed to the judge so it can decide whether the issue
 actually matters.
@@ -600,12 +647,16 @@ Feedback includes:
 - failure classification
 - recommended component key
 - short reason for the recommendation
+- knowledge scope and applicability conditions
+- cross-case regression risk
+- an operational rule shape: trigger -> evidence -> analysis -> transmission -> action
 
 Failures are classified as:
 
 ```text
 SKILL_DEFECT
 EXECUTION_LAPSE
+TOOL_CAPABILITY_GAP
 NO_FAILURE
 ```
 
@@ -629,12 +680,24 @@ subagent:<name>:system_prompt
 subagent:<name>:description
 ```
 
+`TOOL_CAPABILITY_GAP` means the required external evidence has no matching
+current tool capability. It recommends no text component. Capability-gap-only
+minibatches return an empty component selection, so the unchanged proposal is
+rejected rather than teaching prompts to invent unavailable data. The gap is
+still saved for the tool/MCP backlog.
+
 The component selector aggregates recommendations across feedback records. It
 prefers component keys that appear most often in low-scoring trajectories. If
 the same component is repeatedly selected for the same candidate without
 producing an accepted improvement, it cools that component down and tries
 another surface. If no valid key is found, it falls back to round-robin
-selection.
+selection. `TOOL_CAPABILITY_GAP` trajectories are excluded from this vote.
+
+The default reflection minibatch size is `3`, so a proposal normally sees more
+than one trajectory and must explain evidence across examples. For small,
+heterogeneous datasets, keep validation coverage across multiple industries;
+scope a rule by observable borrower signals when it helps one segment but could
+reduce quality in another.
 
 GEPA's own acceptance and Pareto frontier act as the in-memory ratchet. This
 example does not implement SkillOpt's patch schema, hierarchical merge,
@@ -819,6 +882,10 @@ rejected_proposals/
     proposal_rationale_missing.json
     diff_against_seed.patch
     diff_against_parent.patch
+final_test/
+  seed.json
+  best.json
+  summary.json
 materialized_best_candidate/
   AGENTS.md
   skills/
@@ -832,8 +899,10 @@ best candidate back into the source project automatically.
 
 `agent_logs/` records each rollout: input, expected answer or rubric, final
 agent response, baseline response, score, fitness dimensions, constraints, and a
-serializable raw message trace. It also records the available tool inventory,
-matched/missing trace expectations, and likely tool capability gaps. The
+serializable raw message trace. Evaluator mutations such as `fitness` are
+written back to the original rollout state before artifact export. The log also
+records the available and seed-capability tool inventories, successful/failed
+tool evidence, matched/missing trace expectations, and tool capability gaps. The
 feedback prompt uses the filtered, adaptive evaluation trace, while the raw
 trace remains in the detailed rollout artifact for audit. Saving that raw file
 is not part of runtime summarization and is not required by the reflection
@@ -875,11 +944,19 @@ valid for algorithm-effectiveness analysis. If every rollout failed with a
 local-model connection error, it says so explicitly instead of treating the
 scores as useful.
 
+`proposals/index.jsonl` is intentionally a lifecycle event stream and may hold
+started, proposed, evaluated, and terminal rows for one iteration. The analyzer
+reports both raw event count and deduplicated proposal count, using only the
+latest row per iteration for status/component statistics. Final-test scores are
+reported separately from optimization rollouts.
+
 Tool capability gaps mean the evaluator expected a data-acquisition direction
-but the current available tool names/descriptions did not appear to cover it.
-Those gaps are outside GEPA's text-only optimization surface: use them as a
-backlog for new tools or MCP integrations. "Missed supported expectations" are
-different: the tool seems available, but the agent did not call it reliably, so
+but the original tool names/descriptions did not cover it. Capability checks
+use seed descriptions, not optimized descriptions, because rewriting text
+cannot add a data source to unchanged tool code. Those gaps are outside GEPA's
+text-only optimization surface: use them as a backlog for new tools or MCP
+integrations. "Missed supported expectations" are different: the tool seems
+available, but no matching successful result appeared in the trace, so
 skill/prompt/tool-description optimization can plausibly help.
 
 The base artifact directory also gets:
@@ -981,7 +1058,13 @@ It covers:
 - candidate materialization into a temp Deep Agents workspace
 - preservation of subagent-specific skill sources
 - copying scripts as runtime files rather than candidate text
-- failure classification into `SKILL_DEFECT` and `EXECUTION_LAPSE`
+- failure classification into `SKILL_DEFECT`, `EXECUTION_LAPSE`, and
+  `TOOL_CAPABILITY_GAP`
+- successful-tool-only trace acquisition matching
+- evaluator fitness write-back to rollout artifacts
+- lifecycle-event deduplication in the run analyzer
+- deterministic stratified train/validation/test splitting
+- automatic held-out seed/best final-test evaluation
 - suggested component aggregation
 - repeated-component cooldown
 - correctness score caps
@@ -999,14 +1082,13 @@ It covers:
 Run:
 
 ```bash
-source .venv/bin/activate
-python -m pytest tests/test_deep_agent_skill_directory_example.py -q
+uv run --frozen pytest tests/test_deep_agent_skill_directory_example.py -q
 ```
 
 Expected result:
 
 ```text
-44 passed
+52 passed
 ```
 
 ## Production Notes

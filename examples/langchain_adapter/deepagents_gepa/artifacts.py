@@ -272,6 +272,7 @@ class RunArtifactStore:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._rollout_counter = 0
+        self._reflection_error_counter = 0
         self._seed_candidate: dict[str, str] = {}
 
     @classmethod
@@ -389,6 +390,32 @@ class RunArtifactStore:
 
     def create_callback(self) -> RunArtifactCallback:
         return RunArtifactCallback(self)
+
+    def write_reflection_error(self, *, prompt: Any, error: Exception) -> None:
+        prompt_text = str(prompt)
+        component_match = re.search(r"Component boundary rules for `([^`]+)`", prompt_text)
+        record = {
+            "component": component_match.group(1) if component_match else None,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "error_repr": repr(error),
+            "prompt_chars": len(prompt_text),
+        }
+        with self._lock:
+            index = self._reflection_error_counter
+            self._reflection_error_counter += 1
+            error_dir = self.run_dir / "reflection_errors"
+            _write_json(error_dir / f"{index:06d}.json", record)
+            (error_dir / f"{index:06d}.prompt.txt").write_text(prompt_text, encoding="utf-8")
+            _append_jsonl(
+                error_dir / "index.jsonl",
+                {
+                    "index": index,
+                    **record,
+                    "detail_file": f"{index:06d}.json",
+                    "prompt_file": f"{index:06d}.prompt.txt",
+                },
+            )
 
     def write_proposal_snapshot(self, iteration: int, pending: Mapping[str, Any], status: str) -> None:
         proposal_dir = self.run_dir / "proposals" / f"{iteration:04d}"

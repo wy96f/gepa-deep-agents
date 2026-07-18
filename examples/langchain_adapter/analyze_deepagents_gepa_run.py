@@ -49,6 +49,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     rollouts = read_jsonl(run_dir / "agent_logs" / "rollouts.jsonl")
     proposal_events = read_jsonl(run_dir / "proposals" / "index.jsonl")
     rejected_proposal_events = read_jsonl(run_dir / "rejected_proposals" / "index.jsonl")
+    reflection_errors = read_jsonl(run_dir / "reflection_errors" / "index.jsonl")
     proposals = latest_proposal_events(proposal_events)
     rejected_proposals = latest_proposal_events(rejected_proposal_events)
     optimization_rollouts = [
@@ -96,6 +97,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         failure_class
         for row in rejected_proposals
         for failure_class in row.get("failure_classifications", [])
+        if failure_class != "NO_FAILURE"
     )
     rollout_failure_classes = Counter(
         str(row.get("failure_classification"))
@@ -146,6 +148,8 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "rollout_failure_classes": dict(rollout_failure_classes.most_common()),
         "rejected_proposal_count": len(rejected_proposals),
         "rejected_proposal_event_count": len(rejected_proposal_events),
+        "reflection_error_count": len(reflection_errors),
+        "reflection_errors": reflection_errors,
         "final_test": final_test,
         **proposal_artifacts,
         "experiment_valid_for_effectiveness": not connection_blocked,
@@ -153,6 +157,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             improvement=improvement,
             connection_blocked=connection_blocked,
             rejected_proposals=rejected_proposals,
+            reflection_errors=reflection_errors,
             proposal_statuses=proposal_statuses,
             proposed_components=proposed_components,
             failure_classes=failure_classes,
@@ -181,6 +186,7 @@ def diagnose(
     improvement: float | None,
     connection_blocked: bool,
     rejected_proposals: list[dict[str, Any]],
+    reflection_errors: list[dict[str, Any]],
     proposal_statuses: Counter[str],
     proposed_components: Counter[str],
     failure_classes: Counter[str],
@@ -207,6 +213,20 @@ def diagnose(
 
     if rejected_proposals:
         notes.append(f"{len(rejected_proposals)} proposals were rejected at subsample acceptance.")
+    if reflection_errors:
+        dominant_error, count = Counter(str(item.get("error_type", "unknown")) for item in reflection_errors).most_common(
+            1
+        )[0]
+        notes.append(
+            f"{len(reflection_errors)} reflection calls failed before proposal generation; "
+            f"dominant error: {dominant_error} ({count}). Inspect reflection_errors/index.jsonl."
+        )
+    elif proposal_statuses.get("started", 0):
+        notes.append(
+            f"{proposal_statuses['started']} proposals stopped after reflection started without producing candidate "
+            "text. This artifact predates reflection error capture; inspect the external debug log for the provider "
+            "exception."
+        )
     if failure_classes:
         dominant_class, count = failure_classes.most_common(1)[0]
         notes.append(f"Dominant rejected failure class: {dominant_class} ({count}).")
@@ -323,6 +343,7 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Proposal statuses: {summary['proposal_statuses']}")
     print(f"Proposals: {summary['proposal_count']} ({summary['proposal_event_count']} lifecycle events)")
     print(f"Rejected proposals: {summary['rejected_proposal_count']}")
+    print(f"Reflection errors: {summary['reflection_error_count']}")
     print(f"Proposal rationale files: {summary['proposal_rationale_files']}")
     print(f"Proposal missing rationale files: {summary['proposal_missing_rationale_files']}")
     print(f"Proposal diff files: {summary['proposal_diff_files']}")

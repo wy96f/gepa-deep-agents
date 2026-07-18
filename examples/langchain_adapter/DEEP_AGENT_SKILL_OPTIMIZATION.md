@@ -896,6 +896,10 @@ rejected_proposals/
     proposal_rationale_missing.json
     diff_against_seed.patch
     diff_against_parent.patch
+reflection_errors/
+  index.jsonl
+  <call-index>.json
+  <call-index>.prompt.txt
 final_test/
   seed.json
   best.json
@@ -929,6 +933,15 @@ trace remains in the detailed rollout artifact for audit. Saving that raw file
 is not part of runtime summarization and is not required by the reflection
 model; it exists only when artifacts are enabled and is intended for human or
 offline analysis.
+
+The proposer receives a compact reflective record: agent output, baseline,
+adaptive trace, and structured feedback are each included once. Duplicate
+copies embedded inside evaluator feedback and large tool-evidence objects are
+removed only from the proposer input; the complete rollout artifact is
+unchanged. Provider failures during reflection are written to
+`reflection_errors/` with the component, exception, prompt size, and full
+prompt, so a proposal that stops at `started` can be diagnosed without the
+external process log.
 
 `proposals/` records every reflective proposal, including the rendered
 reflection prompt, raw LLM output, explicit proposal rationale, and diffs

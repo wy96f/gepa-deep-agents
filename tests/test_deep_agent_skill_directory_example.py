@@ -704,6 +704,38 @@ def test_prepared_trace_summary_is_cached_for_reflection_record():
     assert len(calls) == 1
 
 
+def test_reflective_record_removes_duplicate_large_sections():
+    example = _load_example_module()
+    response = "最终审批分析。"
+    state = {
+        "messages": [example.AIMessage(content=response)],
+        "baseline_response": response,
+        "fitness": {
+            "composite": 0.5,
+            "successful_tool_evidence": [{"name": "lookup", "result": "large result"}],
+            "failed_tool_evidence": [],
+            "trace_expectation_evidence": {"risk": ["large evidence"]},
+        },
+        "evaluation_trace_summary": "完整 AI 轨迹摘要。",
+        "evaluation_trace_summary_budget": example.trace_prompt_char_budget(),
+    }
+    feedback = (
+        "Scores:\n- final_score: 0.50\n\n"
+        "Judge feedback:\nImprove the scoped rule.\n\n"
+        "With candidate output:\n重复的最终审批分析。\n\n"
+        "Baseline output:\n重复的 baseline。\n\n"
+        "Adaptive trace summary:\n重复的完整轨迹。"
+    )
+
+    record = example.reflective_record({"input": "测试企业"}, state, 0.5, feedback)
+
+    assert record["Feedback"].endswith("Improve the scoped rule.")
+    assert "重复的最终审批分析" not in record["Feedback"]
+    assert record["Baseline response"] == "[same as Agent response]"
+    assert record["Recent trace"] == "完整 AI 轨迹摘要。"
+    assert record["Fitness"] == {"composite": 0.5}
+
+
 def test_trace_expectation_matching_uses_successful_tool_evidence_from_full_trace():
     example = _load_example_module()
     state = {
@@ -1305,6 +1337,29 @@ def test_artifact_callback_marks_missing_proposal_rationale(tmp_path):
     assert not (tmp_path / "run" / "proposals" / "0002" / "proposal_rationale.json").exists()
 
 
+def test_reflection_provider_errors_are_written_to_artifacts(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+
+    def failing_reflection(_prompt):
+        raise TimeoutError("provider timed out")
+
+    reflection = example.with_reflection_error_artifacts(failing_reflection, store)
+    prompt = "Component boundary rules for `skill:test:SKILL.md`:\nReturn a replacement."
+
+    with pytest.raises(TimeoutError, match="provider timed out"):
+        reflection(prompt)
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "reflection_errors" / "index.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[0]["component"] == "skill:test:SKILL.md"
+    assert rows[0]["error_type"] == "TimeoutError"
+    assert rows[0]["prompt_chars"] == len(prompt)
+    assert (tmp_path / "run" / "reflection_errors" / "000000.prompt.txt").read_text(encoding="utf-8") == prompt
+
+
 def test_artifacts_materialize_selected_candidate_on_validation_tie(tmp_path):
     example = _load_example_module()
     run_dir = tmp_path / "run"
@@ -1413,6 +1468,29 @@ def test_run_analyzer_counts_missing_proposal_rationale(tmp_path):
     assert any("missing rationale" in note for note in summary["diagnosis"])
 
 
+def test_run_analyzer_reports_unfinished_reflection_proposal(tmp_path):
+    analyzer = _load_analyzer_module()
+    run_dir = tmp_path / "run"
+    (run_dir / "agent_logs").mkdir(parents=True)
+    (run_dir / "proposals").mkdir(parents=True)
+    (run_dir / "rejected_proposals").mkdir(parents=True)
+    (run_dir / "result_summary.json").write_text(
+        json.dumps({"best_val_score": 0.5, "val_aggregate_scores": [0.5]}),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_logs" / "rollouts.jsonl").write_text("", encoding="utf-8")
+    (run_dir / "proposals" / "index.jsonl").write_text(
+        json.dumps({"iteration": 1, "status": "started", "components": ["main:system_prompt"]}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = analyzer.summarize_run(run_dir)
+
+    assert summary["proposal_statuses"] == {"started": 1}
+    assert summary["reflection_error_count"] == 0
+    assert any("stopped after reflection started" in note for note in summary["diagnosis"])
+
+
 def test_run_analyzer_handles_windows_style_proposal_dirs(tmp_path):
     analyzer = _load_analyzer_module()
     run_dir = tmp_path / "run"
@@ -1496,6 +1574,35 @@ def test_run_analyzer_deduplicates_proposal_lifecycle_events(tmp_path):
     assert summary["proposed_components"] == {"main:system_prompt": 1}
     assert summary["proposal_rationale_files"] == 1
     assert any("accepted candidate tied" in note for note in summary["diagnosis"])
+
+
+def test_run_analyzer_excludes_no_failure_from_rejected_failure_class(tmp_path):
+    analyzer = _load_analyzer_module()
+    run_dir = tmp_path / "run"
+    (run_dir / "agent_logs").mkdir(parents=True)
+    (run_dir / "proposals").mkdir(parents=True)
+    (run_dir / "rejected_proposals").mkdir(parents=True)
+    (run_dir / "result_summary.json").write_text(
+        json.dumps({"best_val_score": 0.5, "val_aggregate_scores": [0.5]}),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_logs" / "rollouts.jsonl").write_text("", encoding="utf-8")
+    (run_dir / "proposals" / "index.jsonl").write_text("", encoding="utf-8")
+    (run_dir / "rejected_proposals" / "index.jsonl").write_text(
+        json.dumps(
+            {
+                "iteration": 1,
+                "failure_classifications": ["NO_FAILURE", "NO_FAILURE", "EXECUTION_LAPSE"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = analyzer.summarize_run(run_dir)
+
+    assert summary["rejected_failure_classes"] == {"EXECUTION_LAPSE": 1}
+    assert any("EXECUTION_LAPSE (1)" in note for note in summary["diagnosis"])
 
 
 def test_local_runner_forces_no_proxy_for_localhost(monkeypatch):

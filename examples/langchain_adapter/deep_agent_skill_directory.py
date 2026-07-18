@@ -3020,21 +3020,41 @@ def suggested_component_reason(
 
 
 def reflective_record(example: dict[str, Any], state: dict, score: float, feedback: str) -> dict[str, Any]:
+    response = last_message_text(state)
+    baseline_response = state.get("baseline_response", "")
+    fitness = {
+        key: value
+        for key, value in dict(state.get("fitness", {})).items()
+        if key not in {"successful_tool_evidence", "failed_tool_evidence", "trace_expectation_evidence"}
+    }
     return {
         "Runtime input": example["input"],
         "Expected": example.get("answer") or example.get("expected"),
         "Rubric": example.get("rubric"),
         "Evaluator-only expert evidence (never shown to runtime agent)": example.get("data"),
-        "Agent response": last_message_text(state),
-        "Baseline response": state.get("baseline_response", ""),
+        "Agent response": response,
+        "Baseline response": "[same as Agent response]" if baseline_response == response else baseline_response,
         "Score": score,
-        "Fitness": state.get("fitness", {}),
-        "Feedback": feedback,
+        "Fitness": fitness,
+        "Feedback": compact_feedback_for_reflection(feedback),
         "Constraints": state.get("candidate_constraints", []),
         "Candidate metrics": state.get("candidate_metrics", {}),
         "Recent trace": summarize_messages(state),
         "Candidate excerpt": state.get("candidate_excerpt", {}),
     }
+
+
+def compact_feedback_for_reflection(feedback: str) -> str:
+    """Drop sections already represented as structured reflection-record fields."""
+    duplicate_section_markers = (
+        "\nWith candidate output:\n",
+        "\nBaseline output:\n",
+        "\nAdaptive trace summary:\n",
+        "\nDeterministic fallback feedback:\n",
+        "\nRaw judge output:\n",
+    )
+    cutoffs = [feedback.find(marker) for marker in duplicate_section_markers if marker in feedback]
+    return feedback[: min(cutoffs)].rstrip() if cutoffs else feedback
 
 
 def log_agent_evaluation(
@@ -3071,6 +3091,20 @@ def with_rejected_history(
         if block:
             prompt = f"{prompt}\n\n{block}\n"
         return reflection_callable(prompt)
+
+    return reflection_lm
+
+
+def with_reflection_error_artifacts(
+    reflection_callable: Callable[[str], str],
+    artifact_store: RunArtifactStore,
+) -> Callable[[str], str]:
+    def reflection_lm(prompt: str) -> str:
+        try:
+            return reflection_callable(prompt)
+        except Exception as exc:
+            artifact_store.write_reflection_error(prompt=prompt, error=exc)
+            raise
 
     return reflection_lm
 
@@ -3482,6 +3516,8 @@ def run_configured_skill_optimization(
     reflection_callable = base_reflection_callable
     if artifact_callback is not None:
         reflection_callable = with_rejected_history(reflection_callable, artifact_callback.rejected_history_prompt_block)
+    if artifact_store is not None:
+        reflection_callable = with_reflection_error_artifacts(reflection_callable, artifact_store)
     adapter = LangChainAdapter(
         rollout_fn=lambda candidate, example: configured_rollout(
             candidate,

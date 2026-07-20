@@ -458,6 +458,7 @@ class RunArtifactStore:
         raw_review: str,
         reviewed_response: str | None,
         error: str | None = None,
+        review_pass: int = 1,
     ) -> None:
         component_match = re.search(r"Component boundary rules for `([^`]+)`", prompt)
         with self._lock:
@@ -469,6 +470,7 @@ class RunArtifactStore:
             "index": index,
             "component": component_match.group(1) if component_match else None,
             "decision": decision,
+            "review_pass": review_pass,
             "issues": list(issues),
             "error": error,
             "prompt_chars": len(prompt),

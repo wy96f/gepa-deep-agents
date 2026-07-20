@@ -2272,25 +2272,7 @@ def tool_attempt_matches_expectation(
         return any(tool_name_matches(tool_name, expected_name) for expected_name in explicit_names)
 
     matching_inventory = inventory_for_tool(tool_name, inventory)
-    if expectation_supported_by_tools(expectation, matching_inventory):
-        return True
-
-    attempt_text = normalize_for_keyword_match(
-        " ".join(
-            [
-                tool_name,
-                json.dumps(evidence.get("args"), ensure_ascii=False, default=str),
-            ]
-        )
-    )
-    normalized_keywords = {
-        normalized_keyword
-        for keyword in trace_expectation_keywords(expectation)
-        if (normalized_keyword := normalize_for_keyword_match(keyword))
-    }
-    required_matches = min(2, len(normalized_keywords))
-    matched_keywords = {keyword for keyword in normalized_keywords if keyword in attempt_text}
-    return bool(required_matches) and len(matched_keywords) >= required_matches
+    return expectation_supported_by_tools(expectation, matching_inventory)
 
 
 def tool_failure_is_invocation_error(evidence: Mapping[str, Any]) -> bool:
@@ -3880,54 +3862,74 @@ def with_proposal_quality_review(
     review_callable: Callable[[str], str],
     reviewer: ProposalReviewer,
     artifact_store: RunArtifactStore | None = None,
+    max_review_passes: int = 2,
 ) -> Callable[[str], str]:
     """Review and optionally revise each reflected proposal before candidate rollout."""
 
     def reflection_lm(prompt: str) -> str:
         original_response = proposal_callable(prompt)
-        try:
-            review = reviewer.review(
-                reflection_prompt=prompt,
-                proposal_response=original_response,
-                review_lm=review_callable,
-            )
-        except Exception as exc:  # pragma: no cover - provider-specific defensive fallback.
+        current_response = original_response
+        review_passes = max(1, max_review_passes)
+        for review_pass in range(1, review_passes + 1):
+            try:
+                review = reviewer.review(
+                    reflection_prompt=prompt,
+                    proposal_response=current_response,
+                    review_lm=review_callable,
+                )
+            except Exception as exc:  # pragma: no cover - provider-specific defensive fallback.
+                if artifact_store is not None:
+                    artifact_store.write_proposal_review(
+                        prompt=prompt,
+                        original_response=current_response,
+                        decision="REVIEW_ERROR",
+                        issues=(),
+                        raw_review="",
+                        reviewed_response=None,
+                        error=f"{type(exc).__name__}: {exc}",
+                        review_pass=review_pass,
+                    )
+                LOGGER.warning(
+                    "proposal review pass=%d failed; retaining current proposal: %s: %s",
+                    review_pass,
+                    type(exc).__name__,
+                    exc,
+                )
+                return current_response
+
+            reviewed_response = current_response
+            artifact_decision = review.decision
+            if review.decision == "REVISE" and review.reviewed_response is not None:
+                if review_pass >= review_passes:
+                    reviewed_response = no_change_proposal_response(prompt, review.issues) or current_response
+                    artifact_decision = "REVISE_EXHAUSTED"
+                else:
+                    reviewed_response = review.reviewed_response
+            elif review.decision == "REJECT":
+                reviewed_response = no_change_proposal_response(prompt, review.issues) or current_response
+
             if artifact_store is not None:
                 artifact_store.write_proposal_review(
                     prompt=prompt,
-                    original_response=original_response,
-                    decision="REVIEW_ERROR",
-                    issues=(),
-                    raw_review="",
-                    reviewed_response=None,
-                    error=f"{type(exc).__name__}: {exc}",
+                    original_response=current_response,
+                    decision=artifact_decision,
+                    issues=review.issues,
+                    raw_review=review.raw_output,
+                    reviewed_response=reviewed_response if reviewed_response != current_response else None,
+                    review_pass=review_pass,
                 )
-            LOGGER.warning("proposal review failed; retaining original proposal: %s: %s", type(exc).__name__, exc)
-            return original_response
-
-        reviewed_response = original_response
-        if review.decision == "REVISE" and review.reviewed_response is not None:
-            reviewed_response = review.reviewed_response
-        elif review.decision == "REJECT":
-            reviewed_response = no_change_proposal_response(prompt, review.issues) or original_response
-
-        if artifact_store is not None:
-            artifact_store.write_proposal_review(
-                prompt=prompt,
-                original_response=original_response,
-                decision=review.decision,
-                issues=review.issues,
-                raw_review=review.raw_output,
-                reviewed_response=reviewed_response if reviewed_response != original_response else None,
+            LOGGER.info(
+                "proposal_review pass=%d decision=%s issues=%d original_chars=%d reviewed_chars=%d",
+                review_pass,
+                artifact_decision,
+                len(review.issues),
+                len(current_response),
+                len(reviewed_response),
             )
-        LOGGER.info(
-            "proposal_review decision=%s issues=%d original_chars=%d reviewed_chars=%d",
-            review.decision,
-            len(review.issues),
-            len(original_response),
-            len(reviewed_response),
-        )
-        return reviewed_response
+            current_response = reviewed_response
+            if artifact_decision != "REVISE" or review.reviewed_response is None:
+                break
+        return current_response
 
     return reflection_lm
 

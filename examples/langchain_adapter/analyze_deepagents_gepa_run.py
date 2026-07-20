@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -87,10 +88,18 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     tool_capability_gaps = Counter(
         gap for detail in rollout_details for gap in detail.get("fitness", {}).get("tool_capability_gaps", [])
     )
+    tool_capability_gap_unique_inputs = unique_input_counts(
+        rollout_details,
+        lambda detail: detail.get("fitness", {}).get("tool_capability_gaps", []),
+    )
     missed_supported_expectations = Counter(
         gap
         for detail in rollout_details
         for gap in detail.get("fitness", {}).get("tool_supported_missing_expectations", [])
+    )
+    missed_supported_expectation_unique_inputs = unique_input_counts(
+        rollout_details,
+        lambda detail: detail.get("fitness", {}).get("tool_supported_missing_expectations", []),
     )
     missing_trace_expectations = Counter(
         gap for detail in rollout_details for gap in detail.get("fitness", {}).get("missing_trace_expectations", [])
@@ -176,7 +185,11 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "unloadable_skill_failures": dict(unloadable_skill_failures.most_common()),
         "candidate_runtime_skipped_count": runtime_skipped_count,
         "tool_capability_gaps": dict(tool_capability_gaps.most_common()),
+        "tool_capability_gap_unique_inputs": dict(tool_capability_gap_unique_inputs.most_common()),
         "missed_supported_expectations": dict(missed_supported_expectations.most_common()),
+        "missed_supported_expectation_unique_inputs": dict(
+            missed_supported_expectation_unique_inputs.most_common()
+        ),
         "missing_trace_expectations": dict(missing_trace_expectations.most_common()),
         "failed_tool_expectations": dict(failed_tool_expectations.most_common()),
         "incomplete_tool_result_expectations": dict(incomplete_tool_result_expectations.most_common()),
@@ -217,7 +230,9 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             deterministic_judge_disagreement_count=deterministic_judge_disagreement_count,
             no_actionable_proposal_count=no_actionable_proposal_count,
             tool_capability_gaps=tool_capability_gaps,
+            tool_capability_gap_unique_inputs=tool_capability_gap_unique_inputs,
             missed_supported_expectations=missed_supported_expectations,
+            missed_supported_expectation_unique_inputs=missed_supported_expectation_unique_inputs,
             failed_tool_expectations=failed_tool_expectations,
             incomplete_tool_result_expectations=incomplete_tool_result_expectations,
             remediation_types=remediation_types,
@@ -242,6 +257,18 @@ def latest_proposal_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [latest[identity] for identity in order]
 
 
+def unique_input_counts(
+    details: list[dict[str, Any]],
+    values: Callable[[dict[str, Any]], Any],
+) -> Counter[str]:
+    inputs_by_value: dict[str, set[str]] = {}
+    for index, detail in enumerate(details):
+        input_id = str(detail.get("input") or f"<rollout:{index}>")
+        for value in values(detail) or []:
+            inputs_by_value.setdefault(str(value), set()).add(input_id)
+    return Counter({value: len(inputs) for value, inputs in inputs_by_value.items()})
+
+
 def diagnose(
     *,
     improvement: float | None,
@@ -259,7 +286,9 @@ def diagnose(
     deterministic_judge_disagreement_count: int,
     no_actionable_proposal_count: int,
     tool_capability_gaps: Counter[str],
+    tool_capability_gap_unique_inputs: Counter[str],
     missed_supported_expectations: Counter[str],
+    missed_supported_expectation_unique_inputs: Counter[str],
     failed_tool_expectations: Counter[str],
     incomplete_tool_result_expectations: Counter[str],
     remediation_types: Counter[str],
@@ -340,15 +369,19 @@ def diagnose(
             "diagnostic evidence for a tool/data backlog, not a text mutation."
         )
     if tool_capability_gaps:
-        dominant_gap, count = tool_capability_gaps.most_common(1)[0]
+        dominant_gap, rollout_count = tool_capability_gaps.most_common(1)[0]
+        unique_count = tool_capability_gap_unique_inputs.get(dominant_gap, 0)
         notes.append(
-            f"External tool capability gap likely blocks improvement: {dominant_gap} ({count}). "
+            f"External tool capability gap likely blocks improvement: {dominant_gap} "
+            f"({unique_count} unique inputs, {rollout_count} rollout occurrences). "
             "Implement or connect a tool for this data source before expecting GEPA text edits to fix it."
         )
     if missed_supported_expectations:
-        dominant_miss, count = missed_supported_expectations.most_common(1)[0]
+        dominant_miss, rollout_count = missed_supported_expectations.most_common(1)[0]
+        unique_count = missed_supported_expectation_unique_inputs.get(dominant_miss, 0)
         notes.append(
-            f"Agent skipped an apparently available data-acquisition path: {dominant_miss} ({count}); "
+            f"Agent skipped an apparently available data-acquisition path: {dominant_miss} "
+            f"({unique_count} unique inputs, {rollout_count} rollout occurrences); "
             "optimize skill/prompt/tool descriptions to call the existing tool more reliably."
         )
     if failed_tool_expectations:
@@ -383,6 +416,19 @@ def diagnose(
             "The test set is diagnostic only and must not select a candidate, but this is strong evidence against "
             "deploying a validation-tied proposal."
         )
+    if final_test is not None:
+        positive_diagnostics = [
+            item
+            for item in final_test.get("diagnostic_candidates", [])
+            if float(item.get("delta_vs_seed", 0.0)) > 0.0
+        ]
+        if positive_diagnostics:
+            strongest = max(positive_diagnostics, key=lambda item: float(item.get("delta_vs_seed", 0.0)))
+            notes.append(
+                f"Validation-tied candidate {strongest.get('candidate_idx')} improved held-out diagnostic mean by "
+                f"{float(strongest.get('delta_vs_seed', 0.0)):.3f}. Do not select it using test data; broaden or "
+                "stratify validation so the repaired behavior is represented before deployment."
+            )
     if proposal_statuses.get("accepted", 0) and improvement == 0:
         if len(tied_best_indices) > 1 and selection_policy == "latest_accepted_on_validation_tie":
             notes.append(
@@ -482,7 +528,12 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Unloadable skill failures: {summary['unloadable_skill_failures']}")
     print(f"Runtime-skipped candidates: {summary['candidate_runtime_skipped_count']}")
     print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
+    print(f"Tool capability gaps by unique input: {summary['tool_capability_gap_unique_inputs']}")
     print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
+    print(
+        "Missed supported expectations by unique input: "
+        f"{summary['missed_supported_expectation_unique_inputs']}"
+    )
     print(f"Missing trace expectations: {summary['missing_trace_expectations']}")
     print(f"Failed tool expectations: {summary['failed_tool_expectations']}")
     print(f"Incomplete tool results: {summary['incomplete_tool_result_expectations']}")
@@ -506,6 +557,8 @@ def print_report(summary: dict[str, Any]) -> None:
             f"seed={final_test.get('seed_mean')} best={final_test.get('best_mean')} "
             f"improvement={final_test.get('improvement')}"
         )
+        if final_test.get("diagnostic_candidates"):
+            print(f"Final test diagnostic candidates: {final_test['diagnostic_candidates']}")
     print("Diagnosis:")
     for note in summary["diagnosis"]:
         print(f"- {note}")

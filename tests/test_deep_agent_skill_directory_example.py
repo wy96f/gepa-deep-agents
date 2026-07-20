@@ -1020,6 +1020,53 @@ def test_policy_topic_overlap_does_not_claim_borrower_data_capability():
     assert diagnostics["tool_capability_gaps"] == ["财务现金流信息获取"]
 
 
+def test_undeclared_task_delegation_does_not_claim_data_capability():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "trace_expectations": [
+                {
+                    "label": "集团穿透信息获取",
+                    "tool_intent_keywords": ["集团", "子公司", "担保"],
+                }
+            ]
+        }
+    }
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {"description": "查询集团子公司和担保信息"},
+                        "id": "task-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="当前没有企业数据查询工具, 无法取得集团穿透信息。",
+                tool_call_id="task-1",
+                name="task",
+            ),
+        ],
+        "capability_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_policy",
+                "description": "仅按主题返回内部通用审查政策, 不查询具体企业事实。",
+            }
+        ],
+    }
+
+    diagnostics = example.data_acquisition_diagnostics(row, state)
+
+    assert diagnostics["tool_supported_missing_expectations"] == []
+    assert diagnostics["incomplete_tool_result_expectations"] == []
+    assert diagnostics["tool_capability_gaps"] == ["集团穿透信息获取"]
+
+
 def test_missing_data_tool_is_classified_as_tool_capability_gap():
     example = _load_example_module()
     row = {
@@ -1609,9 +1656,15 @@ def test_proposal_reviewer_revises_and_persists_original_and_review(tmp_path):
         "Final replacement:\n```markdown\n# Existing\n\nOne compact signal -> concern -> consequence reminder.\n```"
     )
     review_output = f"Decision: REVISE\nIssues:\n- proposal repeats generic analysis\nReviewed response:\n{revised}"
+    review_outputs = iter(
+        [
+            review_output,
+            "Decision: ACCEPT\nIssues:\n- none\nReviewed response:\nsame",
+        ]
+    )
     reflection = example.with_proposal_quality_review(
         lambda _prompt: original,
-        lambda _prompt: review_output,
+        lambda _prompt: next(review_outputs),
         example.DefaultProposalReviewer(),
         store,
     )
@@ -1623,11 +1676,15 @@ def test_proposal_reviewer_revises_and_persists_original_and_review(tmp_path):
         json.loads(line)
         for line in (tmp_path / "run" / "proposal_reviews" / "index.jsonl").read_text(encoding="utf-8").splitlines()
     ]
+    assert [row["review_pass"] for row in review_index] == [1, 2]
     assert review_index[0]["decision"] == "REVISE"
+    assert review_index[1]["decision"] == "ACCEPT"
     assert review_index[0]["component"] == "skill:risk:reference/learned.md"
     detail_dir = tmp_path / "run" / review_index[0]["detail_dir"]
     assert (detail_dir / "original_proposal.txt").read_text(encoding="utf-8") == original
     assert (detail_dir / "reviewed_proposal.txt").read_text(encoding="utf-8") == revised
+    second_detail_dir = tmp_path / "run" / review_index[1]["detail_dir"]
+    assert (second_detail_dir / "original_proposal.txt").read_text(encoding="utf-8") == revised
 
 
 def test_proposal_reviewer_rejects_to_exact_no_change():
@@ -1648,6 +1705,41 @@ def test_proposal_reviewer_rejects_to_exact_no_change():
 
     assert "# Existing memory\n\nKeep this exact text." in result
     assert "Memorize hidden facts." not in result
+
+
+def test_proposal_reviewer_exhausted_revision_returns_no_change(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+    prompt = (
+        "Component boundary rules for `memory:AGENTS.md`:\n"
+        "Current target component (this is the only text you may replace):\n"
+        "```\n# Existing memory\n\nKeep this exact text.\n```\n\n"
+        "Before answering, verify the replacement."
+    )
+    bloated = (
+        "Proposal rationale:\n- add a universal workflow\n\n"
+        "Final replacement:\n```markdown\n# Existing memory\n\nRepeat every skill and reference path here.\n```"
+    )
+    review_output = (
+        "Decision: REVISE\nIssues:\n- still duplicates skill-owned workflow\n"
+        f"Reviewed response:\n{bloated}"
+    )
+    reflection = example.with_proposal_quality_review(
+        lambda _prompt: bloated,
+        lambda _prompt: review_output,
+        example.DefaultProposalReviewer(),
+        store,
+    )
+
+    result = reflection(prompt)
+
+    assert "# Existing memory\n\nKeep this exact text." in result
+    assert "Repeat every skill and reference path here." not in result
+    review_index = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "proposal_reviews" / "index.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["decision"] for row in review_index] == ["REVISE", "REVISE_EXHAUSTED"]
 
 
 def test_final_test_artifact_records_tied_candidate_as_diagnostic_only(tmp_path):
@@ -1946,15 +2038,36 @@ def test_run_analyzer_reports_judge_disagreement_and_no_actionable_proposal(tmp_
     (run_dir / "proposals").mkdir(parents=True)
     (run_dir / "rejected_proposals").mkdir(parents=True)
     (run_dir / "result_summary.json").write_text(
-        json.dumps({"best_val_score": 1.0, "val_aggregate_scores": [1.0]}),
+        json.dumps(
+            {
+                "best_val_score": 1.0,
+                "val_aggregate_scores": [1.0, 1.0],
+                "tied_best_indices": [0, 1],
+                "final_test": {
+                    "seed_mean": 0.0,
+                    "best_mean": 0.0,
+                    "improvement": 0.0,
+                    "diagnostic_candidates": [
+                        {
+                            "candidate_idx": 1,
+                            "validation_score": 1.0,
+                            "test_mean": 1.0,
+                            "delta_vs_seed": 1.0,
+                        }
+                    ],
+                },
+            }
+        ),
         encoding="utf-8",
     )
     detail = {
+        "input": "示例企业",
         "expected": "engineering",
         "fitness": {
             "hard": 1.0,
             "judge_score": 0.0,
             "mutation_eligible": False,
+            "tool_capability_gaps": ["客户交易信息获取"],
             "remediation_actions": [
                 {
                     "type": "ADD_TOOL_OR_MCP",
@@ -1985,9 +2098,11 @@ def test_run_analyzer_reports_judge_disagreement_and_no_actionable_proposal(tmp_
     assert summary["no_actionable_proposal_count"] == 1
     assert summary["remediation_types"] == {"ADD_TOOL_OR_MCP": 1}
     assert summary["remediation_owners"] == {"tool_or_mcp": 1}
+    assert summary["tool_capability_gap_unique_inputs"] == {"客户交易信息获取": 1}
     assert any("exact authoritative target match" in note for note in summary["diagnosis"])
     assert any("no actionable text component" in note for note in summary["diagnosis"])
     assert any("ADD_TOOL_OR_MCP" in note for note in summary["diagnosis"])
+    assert any("held-out diagnostic mean by 1.000" in note for note in summary["diagnosis"])
 
 
 def test_run_analyzer_reports_unfinished_reflection_proposal(tmp_path):
@@ -2295,17 +2410,22 @@ def test_repository_toml_examples_load_and_run(config_name, tmp_path):
     if config.agent_mode in {"manual", "langgraph_cli"}:
         pytest.importorskip("deepagents", reason="DeepAgents modes require deepagents")
     project = example.build_candidate_from_deep_agent_project(config)
-    train, _val, _test = example.load_dataset_from_config(config)
+    train, val, test = example.load_dataset_from_config(config)
+    billing_example = next(row for row in train if row.get("expected") == "billing")
 
     state = example.configured_rollout(
         project.candidate,
-        train[0],
+        billing_example,
         ToolFriendlyFakeChatModel(responses=["<route>billing</route>"] * 30),
         project,
         project.candidate,
     )
 
     assert state.get("error") is None
+    expected_routes = {"billing", "account", "engineering", "product"}
+    assert {row["expected"] for row in train} == expected_routes
+    assert {row["expected"] for row in val} == expected_routes
+    assert {row["expected"] for row in test} == expected_routes
     output_text = example.last_message_text(state)
     assert example.extract_route(output_text) == "billing"
     assert "memory:AGENTS.md" in project.candidate
@@ -2391,6 +2511,11 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
 
     assert project.config.agent_mode == "manual"
     assert "skill:credit-risk-review:SKILL.md" in project.candidate
+    assert "main:tool:lookup_financial_snapshot:description" in project.candidate
+    assert "不查询具体企业事实" in project.candidate["main:tool:lookup_policy:description"]
+    assert "利润、现金流、负债借款、票据和用信" in project.candidate[
+        "main:tool:lookup_financial_snapshot:description"
+    ]
     assert "skill:credit-risk-review:reference/financial_statement_analysis.md" in project.candidate
     assert "skill:credit-risk-review:reference/cashflow_and_repayment.md" in project.candidate
     assert "skill:credit-risk-review:reference/collateral_and_guarantee.md" in project.candidate
@@ -2406,6 +2531,14 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert len(rows) >= 8
     assert all(row["metadata"].get("checkpoints") for row in rows)
     assert all(row["metadata"].get("trace_expectations") for row in rows)
+    financial_expectations = [
+        expectation
+        for row in rows
+        for expectation in row["metadata"]["trace_expectations"]
+        if expectation["label"] in {"财务盈利质量信息获取", "债务结构信息获取", "财务现金流信息获取"}
+    ]
+    assert financial_expectations
+    assert all(expectation["tool_names"] == ["lookup_financial_snapshot"] for expectation in financial_expectations)
     assert all(
         checkpoint["label"] != "授信压降和回款监管必要性"
         for row in rows
@@ -2420,6 +2553,11 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert "只输出当前信息能够支持的风险点" in credit_skill
     assert "缺少事实依据的维度直接不展开" in credit_skill
     assert "不输出审批意见" in credit_skill
+
+    financial_tool = next(tool for tool in project.spec.tools if tool.name == "lookup_financial_snapshot")
+    financial_snapshot = json.loads(financial_tool.invoke({"company_name": "华东钢铁集团有限公司"}))
+    assert financial_snapshot["净利润"]["2024年"] == "17.84亿元"
+    assert "子公司单体财务" in financial_snapshot["数据限制"]
 
     skill_constraints = example.skill_structure_constraints(
         "skill:credit-risk-review:SKILL.md",

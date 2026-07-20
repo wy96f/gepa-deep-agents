@@ -20,3 +20,9 @@ description = "Search routing risk notes for missing evidence and likely misrout
 [dataset]
 source = "golden_jsonl"
 path = "evals/golden.jsonl"
+split_strategy = "stratified"
+train_ratio = 0.34
+val_ratio = 0.33
+test_ratio = 0.33
+stratify_by = ["expected"]
+seed = 0

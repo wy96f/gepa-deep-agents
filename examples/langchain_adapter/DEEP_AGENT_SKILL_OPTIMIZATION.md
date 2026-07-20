@@ -153,7 +153,10 @@ skills/credit-risk-review/reference/learned_expert_patterns.md
 SKILL.md、智能体文字和最终答案中的关键词都不能作为已取得证据。已知目标工具时可
 设置 `tool_names`；否则框架使用种子工具名称、描述和 `tool_intent_keywords` 进行
 保守匹配。模糊匹配至少需要两个独立能力关键词，避免把内部政策查询误判为企业数据
-查询。
+查询。对 `@tool` 函数，`tools.py` 中的 docstring 就是这里使用的工具 description，
+因此应明确写出“查询什么事实、不查询什么、参数语义和返回边界”。工具调用参数、
+`task` 委派文字或智能体声称“准备查询某数据”都不用于推断工具能力；它们只能证明
+调用意图，不能证明系统确实具备该数据源。
 
 checkpoint 缺失始终会降低分数；不会因为当前缺工具或信息有限就放宽覆盖 cap。低分
 和“改什么”是两个问题，框架会结合轨迹生成 `remediation_actions`：
@@ -592,6 +595,10 @@ vary by domain:
 - `ProposalReviewer`: how a generated proposal is checked before candidate
   rollout. The default reviewer can accept, compact/revise, or reject a
   proposal while preserving both the original and reviewed text as artifacts.
+  A revised proposal is reviewed once more by default, so a response that only
+  promises to remove duplication but does not actually do so is not silently
+  treated as approved. If the second review still requests revision, the
+  wrapper records `REVISE_EXHAUSTED` and emits an exact no-change proposal.
 - `Constraint`: generic hard/advisory checks for candidate validity. Keep hard
   checks high-confidence and domain-neutral when possible; put softer judgment
   into the evaluator.

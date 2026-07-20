@@ -339,9 +339,32 @@ def test_component_selector_skips_text_mutation_for_tool_capability_only_batch(t
         [
             {
                 "score": 0.1,
+                "feedback": "Scores:\n- failure_classification: TOOL_CAPABILITY_GAP\n- suggested_component: none",
+            }
+        ],
+        [0.1],
+        0,
+        candidate,
+    )
+
+    assert selected == []
+
+
+def test_component_selector_skips_insufficient_runtime_evidence_votes(tmp_path):
+    example = _load_example_module()
+    seed_spec = example.create_seed_workspace(tmp_path)
+    candidate, _surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
+    selector = example.DarwinFeedbackComponentSelector()
+
+    selected = selector(
+        None,
+        [
+            {
+                "score": 0.1,
                 "feedback": "Scores:\n"
-                "- failure_classification: TOOL_CAPABILITY_GAP\n"
-                "- suggested_component: none",
+                "- failure_classification: INSUFFICIENT_RUNTIME_EVIDENCE\n"
+                "- mutation_eligible: false\n"
+                "- suggested_component: skill:support-router:reference/routing.md",
             }
         ],
         [0.1],
@@ -362,11 +385,7 @@ def test_component_selector_ignores_no_failure_votes(tmp_path):
         "- failure_classification: NO_FAILURE\n"
         "- suggested_component: skill:support-router:reference/routing.md"
     )
-    execution_feedback = (
-        "Scores:\n"
-        "- failure_classification: EXECUTION_LAPSE\n"
-        "- suggested_component: memory:AGENTS.md"
-    )
+    execution_feedback = "Scores:\n- failure_classification: EXECUTION_LAPSE\n- suggested_component: memory:AGENTS.md"
 
     selected = selector(
         None,
@@ -824,9 +843,7 @@ def test_trace_expectation_matching_uses_successful_tool_evidence_from_full_trac
     }
     row = {
         "metadata": {
-            "trace_expectations": [
-                {"label": "行业周期信息获取", "tool_intent_keywords": ["钢铁行业周期", "库存减值"]}
-            ]
+            "trace_expectations": [{"label": "行业周期信息获取", "tool_intent_keywords": ["钢铁行业周期", "库存减值"]}]
         }
     }
 
@@ -840,11 +857,7 @@ def test_trace_expectation_matching_uses_successful_tool_evidence_from_full_trac
 def test_trace_expectation_rejects_ai_prose_and_failed_tool_results():
     example = _load_example_module()
     row = {
-        "metadata": {
-            "trace_expectations": [
-                {"label": "司法工商信息获取", "tool_intent_keywords": ["司法", "被执行"]}
-            ]
-        }
+        "metadata": {"trace_expectations": [{"label": "司法工商信息获取", "tool_intent_keywords": ["司法", "被执行"]}]}
     }
     state = {
         "messages": [
@@ -913,6 +926,34 @@ def test_data_acquisition_diagnostics_distinguishes_missing_tool_from_skipped_to
     assert diagnostics["tool_capability_gaps"] == ["环保安监信息获取"]
 
 
+def test_skipped_supported_tool_is_mutation_eligible_execution_lapse():
+    example = _load_example_module()
+    row = {
+        "input": "示例企业",
+        "rubric": "调用现有工具取得债务结构信息。",
+        "metadata": {"trace_expectations": [{"label": "债务结构信息获取", "tool_intent_keywords": ["负债", "借款"]}]},
+    }
+    state = {
+        "messages": [example.AIMessage(content="当前无法判断债务结构。")],
+        "baseline_response": "",
+        "candidate_excerpt": {"memory:AGENTS.md": "Use available tools before answering."},
+        "candidate_constraints": [],
+        "available_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_debt",
+                "description": "查询企业负债、借款、票据和融资结构。",
+            }
+        ],
+    }
+
+    _score, feedback = example.evaluate_response(row, state)
+
+    assert state["fitness"]["mutation_eligible"] is True
+    assert state["fitness"]["failure_classification"] == "EXECUTION_LAPSE"
+    assert "- suggested_component: memory:AGENTS.md" in feedback
+
+
 def test_policy_topic_overlap_does_not_claim_borrower_data_capability():
     example = _load_example_module()
     row = {
@@ -948,9 +989,7 @@ def test_missing_data_tool_is_classified_as_tool_capability_gap():
         "input": "华东钢铁集团有限公司",
         "rubric": "核验环保处罚信息。",
         "metadata": {
-            "trace_expectations": [
-                {"label": "环保安监信息获取", "tool_intent_keywords": ["环保", "安全生产"]}
-            ]
+            "trace_expectations": [{"label": "环保安监信息获取", "tool_intent_keywords": ["环保", "安全生产"]}]
         },
     }
     state = {
@@ -958,9 +997,7 @@ def test_missing_data_tool_is_classified_as_tool_capability_gap():
         "baseline_response": "",
         "candidate_excerpt": {"skill:credit-risk-review:SKILL.md": "Review available evidence."},
         "candidate_constraints": [],
-        "available_tools": [
-            {"owner": "main", "name": "lookup_policy", "description": "查询内部授信政策。"}
-        ],
+        "available_tools": [{"owner": "main", "name": "lookup_policy", "description": "查询内部授信政策。"}],
     }
 
     _score, feedback = example.evaluate_response(row, state)
@@ -971,7 +1008,7 @@ def test_missing_data_tool_is_classified_as_tool_capability_gap():
     assert "- suggested_component: none" in feedback
 
 
-def test_mixed_checkpoint_and_tool_gap_still_selects_learned_reference():
+def test_checkpoint_with_unavailable_tool_does_not_select_learned_reference():
     example = _load_example_module()
     config_path = (
         Path(__file__).parents[1]
@@ -1010,13 +1047,14 @@ def test_mixed_checkpoint_and_tool_gap_still_selects_learned_reference():
 
     _score, feedback = example.evaluate_response(row, state)
 
-    assert state["fitness"]["failure_classification"] == "SKILL_DEFECT"
+    assert state["fitness"]["failure_classification"] == "TOOL_CAPABILITY_GAP"
+    assert state["fitness"]["mutation_eligible"] is False
     assert state["fitness"]["tool_capability_gaps"] == ["客户交易信息获取"]
-    assert "- suggested_component: skill:credit-risk-review:reference/learned_expert_patterns.md" in feedback
-    assert "separate tool capability gaps" in feedback
+    assert "- suggested_component: none" in feedback
+    assert "- mutation_eligible: false" in feedback
 
 
-def test_reflection_judge_keeps_mixed_gap_text_actionable():
+def test_reflection_judge_cannot_override_unavailable_tool_gap_into_text_mutation():
     example = _load_example_module()
     config_path = (
         Path(__file__).parents[1]
@@ -1069,9 +1107,73 @@ def test_reflection_judge_keeps_mixed_gap_text_actionable():
         ),
     )
 
+    assert state["fitness"]["failure_classification"] == "TOOL_CAPABILITY_GAP"
+    assert state["fitness"]["mutation_eligible"] is False
+    assert "- suggested_component: none" in feedback
+    assert "- mutation_eligible: false" in feedback
+
+
+def test_runtime_tool_evidence_can_make_missing_expert_logic_text_actionable():
+    example = _load_example_module()
+    config_path = (
+        Path(__file__).parents[1]
+        / "examples"
+        / "langchain_adapter"
+        / "deepagents_gepa_configs"
+        / "credit_approval.toml"
+    )
+    project = example.build_candidate_from_deep_agent_project(example.load_deepagents_gepa_config(config_path))
+    row = {
+        "input": "示例制造企业",
+        "rubric": "识别客户集中导致的回款和流动性风险。",
+        "metadata": {
+            "checkpoints": [{"label": "客户集中风险", "keywords": ["客户集中", "流动性风险"]}],
+            "trace_expectations": [
+                {
+                    "label": "客户交易信息获取",
+                    "tool_names": ["lookup_customers"],
+                    "tool_intent_keywords": ["客户", "回款"],
+                }
+            ],
+        },
+    }
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_customers",
+                        "args": {"company": "示例制造企业"},
+                        "id": "customers-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="前五大客户占比较高, 近期回款周期延长。",
+                tool_call_id="customers-1",
+                name="lookup_customers",
+            ),
+            example.AIMessage(content="当前资料需要进一步核验。"),
+        ],
+        "baseline_response": "",
+        "candidate_excerpt": project.candidate,
+        "candidate_constraints": [],
+        "available_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_customers",
+                "description": "查询客户集中度和回款情况。",
+            }
+        ],
+    }
+
+    _score, feedback = example.evaluate_response(row, state)
+
+    assert state["fitness"]["mutation_eligible"] is True
     assert state["fitness"]["failure_classification"] == "SKILL_DEFECT"
     assert "- suggested_component: skill:credit-risk-review:reference/learned_expert_patterns.md" in feedback
-    assert "separate tool capability gaps" in feedback
 
 
 def test_reflection_judge_score_is_capped_when_expected_route_is_missing(tmp_path):
@@ -1147,11 +1249,7 @@ def test_reflection_judge_score_is_capped_by_missing_rubric_checkpoints(tmp_path
     candidate, surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
     constraints = example.validate_candidate_constraints(candidate, candidate, surfaces)
     state = {
-        "messages": [
-            example.AIMessage(
-                content="该企业现金回款弱化, 放款前需要核验应收账款账龄。"
-            )
-        ],
+        "messages": [example.AIMessage(content="该企业现金回款弱化, 放款前需要核验应收账款账龄。")],
         "baseline_response": "Generic approval review.",
         "candidate_excerpt": candidate,
         "candidate_constraints": [constraint.__dict__ for constraint in constraints],
@@ -1187,7 +1285,9 @@ def test_reflection_judge_score_is_capped_by_missing_rubric_checkpoints(tmp_path
     assert score == 0.45
     assert "- rubric_cap: 0.45" in feedback
     assert "- rubric_coverage: 0.33" in feedback
-    assert "- failure_classification: SKILL_DEFECT" in feedback
+    assert "- failure_classification: INSUFFICIENT_RUNTIME_EVIDENCE" in feedback
+    assert "- mutation_eligible: false" in feedback
+    assert "- suggested_component: none" in feedback
     assert "关联方应收可回收性" in feedback
     assert "抵押物独立评估" in feedback
 
@@ -1251,7 +1351,8 @@ def test_memory_reflection_template_discourages_copying_skill_content(tmp_path):
     assert "Hidden-data boundary check" in template
     assert "Applicability scope and exclusions" in template
     assert "Cross-case regression risk" in template
-    assert "trigger, evidence to obtain, analysis or comparison" in template
+    assert "short signal -> concern -> consequence reminder" in template
+    assert "do not expand every reminder into a fixed multi-section template" in template
     assert "not one universal checklist" in template
     assert "Preserve the natural language used by the current component" in template
     assert template.rfind("Authoritative target component: `memory:AGENTS.md`") > template.index("<side_info>")
@@ -1280,12 +1381,100 @@ def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
     assert suggested == learned_key
     assert "observable signals or business model" in template
     assert "non-applicability" in template
-    assert "risk transmission" in template
+    assert "signal -> concern -> consequence" in template
     assert "borrower-specific acquisition plan" in template
     assert "shared economic mechanism" in template
     assert "do not append one section per evaluation example" in template
+    assert "Do not repeat generic finance" in template
     assert "company name or keyword is only a weak discovery clue" in template
     assert "Do not invent fixed cutoffs" in template
+
+
+def test_proposal_reviewer_revises_and_persists_original_and_review(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+    prompt = (
+        "Component boundary rules for `skill:risk:reference/learned.md`:\n"
+        "Current target component (this is the only text you may replace):\n"
+        "```\n# Existing\n\nKeep this.\n```\n\n"
+        "Before answering, verify the replacement."
+    )
+    original = (
+        "Proposal rationale:\n- Failure pattern: too broad\n\n"
+        "Final replacement:\n```markdown\n# Existing\n\nA very long template.\n```"
+    )
+    revised = (
+        "Proposal rationale:\n- Failure pattern: retain one compact cue\n\n"
+        "Final replacement:\n```markdown\n# Existing\n\nOne compact signal -> concern -> consequence reminder.\n```"
+    )
+    review_output = f"Decision: REVISE\nIssues:\n- proposal repeats generic analysis\nReviewed response:\n{revised}"
+    reflection = example.with_proposal_quality_review(
+        lambda _prompt: original,
+        lambda _prompt: review_output,
+        example.DefaultProposalReviewer(),
+        store,
+    )
+
+    result = reflection(prompt)
+
+    assert result == revised
+    review_index = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "proposal_reviews" / "index.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert review_index[0]["decision"] == "REVISE"
+    assert review_index[0]["component"] == "skill:risk:reference/learned.md"
+    detail_dir = tmp_path / "run" / review_index[0]["detail_dir"]
+    assert (detail_dir / "original_proposal.txt").read_text(encoding="utf-8") == original
+    assert (detail_dir / "reviewed_proposal.txt").read_text(encoding="utf-8") == revised
+
+
+def test_proposal_reviewer_rejects_to_exact_no_change():
+    example = _load_example_module()
+    prompt = (
+        "Component boundary rules for `memory:AGENTS.md`:\n"
+        "Current target component (this is the only text you may replace):\n"
+        "```\n# Existing memory\n\nKeep this exact text.\n```\n\n"
+        "Before answering, verify the replacement."
+    )
+    reflection = example.with_proposal_quality_review(
+        lambda _prompt: "Proposal rationale:\n- bad\n\nFinal replacement:\n```\nMemorize hidden facts.\n```",
+        lambda _prompt: ("Decision: REJECT\nIssues:\n- no runtime-observable evidence\nReviewed response:\nsame"),
+        example.DefaultProposalReviewer(),
+    )
+
+    result = reflection(prompt)
+
+    assert "# Existing memory\n\nKeep this exact text." in result
+    assert "Memorize hidden facts." not in result
+
+
+def test_final_test_artifact_records_tied_candidate_as_diagnostic_only(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+    seed = SimpleNamespace(scores=[0.5], outputs=[])
+    best = SimpleNamespace(scores=[0.5], outputs=[])
+    tied_candidate = SimpleNamespace(scores=[1.0], outputs=[])
+
+    summary = store.write_final_test(
+        examples=[{"input": "held-out"}],
+        seed_evaluation=seed,
+        best_evaluation=best,
+        diagnostic_evaluations={1: tied_candidate},
+        diagnostic_val_scores={1: 1.0},
+    )
+
+    assert summary["improvement"] == 0.0
+    assert summary["diagnostic_candidates"] == [
+        {
+            "candidate_idx": 1,
+            "validation_score": 1.0,
+            "test_mean": 1.0,
+            "delta_vs_seed": 0.5,
+            "selection_effect": "diagnostic_only",
+        }
+    ]
+    assert (tmp_path / "run" / "final_test" / "candidate_0001.json").exists()
 
 
 def test_artifact_callback_writes_agent_logs_and_rejected_proposals(tmp_path):
@@ -1828,11 +2017,7 @@ def test_config_driven_candidate_includes_project_and_mcp_surfaces(tmp_path):
 def test_repository_toml_examples_load_and_run(config_name, tmp_path):
     example = _load_example_module()
     config_path = (
-        Path(__file__).parents[1]
-        / "examples"
-        / "langchain_adapter"
-        / "deepagents_gepa_configs"
-        / f"{config_name}.toml"
+        Path(__file__).parents[1] / "examples" / "langchain_adapter" / "deepagents_gepa_configs" / f"{config_name}.toml"
     )
     config = example.load_deepagents_gepa_config(config_path)
     if config.agent_mode in {"manual", "langgraph_cli"}:
@@ -1947,8 +2132,11 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert len(rows) >= 8
     assert all(row["metadata"].get("checkpoints") for row in rows)
     assert all(row["metadata"].get("trace_expectations") for row in rows)
-    assert "取证计划" in project.candidate["skill:credit-risk-review:reference/learned_expert_patterns.md"]
-    assert "同一触发条件" in project.candidate["skill:credit-risk-review:reference/learned_expert_patterns.md"]
+    assert (
+        "适用条件或信号 -> 重点关注 -> 可能后果"
+        in project.candidate["skill:credit-risk-review:reference/learned_expert_patterns.md"]
+    )
+    assert "不重复常规财务分析" in project.candidate["skill:credit-risk-review:reference/learned_expert_patterns.md"]
 
     skill_constraints = example.skill_structure_constraints(
         "skill:credit-risk-review:SKILL.md",
@@ -1995,9 +2183,7 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
         def templates_for(self, candidate):
             calls["templates"] += 1
             return {
-                key: "Return only the selected component.\n<curr_param>\n<side_info>\n```"
-                + value
-                + "\n```"
+                key: "Return only the selected component.\n<curr_param>\n<side_info>\n```" + value + "\n```"
                 for key, value in candidate.items()
             }
 
@@ -2092,9 +2278,7 @@ def test_dataset_split_is_stratified_deterministic_and_disjoint():
     )
 
     assert [len(split) for split in first] == [6, 2, 2]
-    assert [{row["input"] for row in split} for split in first] == [
-        {row["input"] for row in split} for split in second
-    ]
+    assert [{row["input"] for row in split} for split in first] == [{row["input"] for row in split} for split in second]
     assert not ({row["input"] for row in first[0]} & {row["input"] for row in first[1]})
     assert not ({row["input"] for row in first[0]} & {row["input"] for row in first[2]})
     assert all(row["metadata"]["dataset_split"] == "train" for row in first[0])
@@ -2131,9 +2315,7 @@ def test_golden_dataset_supports_evaluator_only_data_path(tmp_path):
                 "data_path": "risk_section.md",
                 "rubric": "评价风险点覆盖。",
                 "metadata": {
-                    "trace_expectations": [
-                        {"label": "行业周期信息获取", "tool_intent_keywords": ["行业", "库存"]}
-                    ]
+                    "trace_expectations": [{"label": "行业周期信息获取", "tool_intent_keywords": ["行业", "库存"]}]
                 },
             },
             ensure_ascii=False,

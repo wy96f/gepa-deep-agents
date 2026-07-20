@@ -275,6 +275,7 @@ class RunArtifactStore:
         self._lock = threading.Lock()
         self._rollout_counter = 0
         self._reflection_error_counter = 0
+        self._proposal_review_counter = 0
         self._seed_candidate: dict[str, str] = {}
 
     @classmethod
@@ -422,6 +423,48 @@ class RunArtifactStore:
                 },
             )
 
+    def write_proposal_review(
+        self,
+        *,
+        prompt: str,
+        original_response: str,
+        decision: str,
+        issues: Sequence[str],
+        raw_review: str,
+        reviewed_response: str | None,
+        error: str | None = None,
+    ) -> None:
+        component_match = re.search(r"Component boundary rules for `([^`]+)`", prompt)
+        with self._lock:
+            index = self._proposal_review_counter
+            self._proposal_review_counter += 1
+        review_dir = self.run_dir / "proposal_reviews" / f"{index:06d}"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "index": index,
+            "component": component_match.group(1) if component_match else None,
+            "decision": decision,
+            "issues": list(issues),
+            "error": error,
+            "prompt_chars": len(prompt),
+            "original_response_chars": len(original_response),
+            "reviewed_response_chars": len(reviewed_response or original_response),
+        }
+        _write_json(review_dir / "metadata.json", record)
+        (review_dir / "reflection_prompt.txt").write_text(prompt, encoding="utf-8")
+        (review_dir / "original_proposal.txt").write_text(original_response, encoding="utf-8")
+        (review_dir / "raw_review.txt").write_text(raw_review, encoding="utf-8")
+        if reviewed_response is not None:
+            (review_dir / "reviewed_proposal.txt").write_text(reviewed_response, encoding="utf-8")
+        with self._lock:
+            _append_jsonl(
+                self.run_dir / "proposal_reviews" / "index.jsonl",
+                {
+                    **record,
+                    "detail_dir": str(review_dir.relative_to(self.run_dir)),
+                },
+            )
+
     def write_proposal_snapshot(self, iteration: int, pending: Mapping[str, Any], status: str) -> None:
         proposal_dir = self.run_dir / "proposals" / f"{iteration:04d}"
         proposal_dir.mkdir(parents=True, exist_ok=True)
@@ -467,6 +510,7 @@ class RunArtifactStore:
             }
         }
         metadata["status"] = status
+        metadata["acceptance_scope"] = "candidate_pool_not_deployment" if status == "accepted" else None
         metadata["candidate_components"] = list(candidate)
         metadata["changed_components"] = sorted(dict(pending.get("new_instructions") or {}))
         metadata["proposal_rationale"] = rationales
@@ -480,6 +524,7 @@ class RunArtifactStore:
             {
                 "iteration": iteration,
                 "status": status,
+                "acceptance_scope": "candidate_pool_not_deployment" if status == "accepted" else None,
                 "components": pending.get("components", []),
                 "changed_components": sorted(dict(pending.get("new_instructions") or {})),
                 "parent_scores": pending.get("parent_scores", []),
@@ -543,6 +588,8 @@ class RunArtifactStore:
         examples: Sequence[Mapping[str, Any]],
         seed_evaluation: Any,
         best_evaluation: Any,
+        diagnostic_evaluations: Mapping[int, Any] | None = None,
+        diagnostic_val_scores: Mapping[int, float] | None = None,
     ) -> dict[str, Any]:
         seed_payload = _evaluation_payload(examples, seed_evaluation)
         best_payload = _evaluation_payload(examples, best_evaluation)
@@ -565,6 +612,22 @@ class RunArtifactStore:
                 for index, example in enumerate(examples)
             ],
         }
+        diagnostic_rows: list[dict[str, Any]] = []
+        for candidate_idx, evaluation in sorted((diagnostic_evaluations or {}).items()):
+            payload = _evaluation_payload(examples, evaluation)
+            _write_json(self.run_dir / "final_test" / f"candidate_{candidate_idx:04d}.json", payload)
+            mean = _score_mean(payload["scores"])
+            diagnostic_rows.append(
+                {
+                    "candidate_idx": candidate_idx,
+                    "validation_score": (diagnostic_val_scores or {}).get(candidate_idx),
+                    "test_mean": mean,
+                    "delta_vs_seed": mean - seed_mean,
+                    "selection_effect": "diagnostic_only",
+                }
+            )
+        if diagnostic_rows:
+            comparison["diagnostic_candidates"] = diagnostic_rows
         _write_json(self.run_dir / "final_test" / "summary.json", comparison)
         return comparison
 
@@ -623,7 +686,9 @@ class RunArtifactStore:
         selected_best_idx = getattr(result, "best_idx", None) if best_idx is None else best_idx
         for index, candidate in enumerate(candidates):
             label = "best_candidate" if index == selected_best_idx else None
-            parent_candidate = self._parent_candidate_for_result(index, candidates, getattr(result, "parents", []) or [])
+            parent_candidate = self._parent_candidate_for_result(
+                index, candidates, getattr(result, "parents", []) or []
+            )
             self.write_candidate(index, candidate, label=label, parent_candidate=parent_candidate)
             metadata = {
                 "index": index,

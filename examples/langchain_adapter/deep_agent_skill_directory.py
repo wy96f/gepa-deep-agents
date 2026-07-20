@@ -53,8 +53,10 @@ try:
         DefaultDatasetProvider,
         DefaultEvaluator,
         DefaultFeedbackComponentSelector,
+        DefaultProposalReviewer,
         DefaultReflectionTemplateRegistry,
         Evaluator,
+        ProposalReviewer,
         ReflectionTemplateRegistry,
         select_deployment_candidate_index,
     )
@@ -70,8 +72,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution.
         DefaultDatasetProvider,
         DefaultEvaluator,
         DefaultFeedbackComponentSelector,
+        DefaultProposalReviewer,
         DefaultReflectionTemplateRegistry,
         Evaluator,
+        ProposalReviewer,
         ReflectionTemplateRegistry,
         select_deployment_candidate_index,
     )
@@ -125,6 +129,7 @@ YAML_FRONTMATTER_RE = re.compile(r"(?s)^\s*---\s*\n.*?\bname\s*:.*?\bdescription
 SKILL_DEFECT = "SKILL_DEFECT"
 EXECUTION_LAPSE = "EXECUTION_LAPSE"
 TOOL_CAPABILITY_GAP = "TOOL_CAPABILITY_GAP"
+INSUFFICIENT_RUNTIME_EVIDENCE = "INSUFFICIENT_RUNTIME_EVIDENCE"
 NO_FAILURE = "NO_FAILURE"
 TOOL_FAILURE_PATTERN = re.compile(
     r"(?is)^\s*(?:error|exception|failed|failure|tool error|执行失败|调用失败|工具失败)\b|"
@@ -1862,14 +1867,15 @@ def skill_structure_constraints(key: str, text: str) -> list[ConstraintResult]:
         )
     )
     lowered = text.lower()
-    has_ordered_workflow = "workflow" in lowered or "工作流程" in text or re.search(r"^\s*1[.、]", text, re.M) is not None
-    has_failure_modes = (
-        any(marker in lowered for marker in ["failure", "fallback", "if "])
-        or any(marker in text for marker in ["失败模式", "异常处理", "如果", "若", "当"])
+    has_ordered_workflow = (
+        "workflow" in lowered or "工作流程" in text or re.search(r"^\s*1[.、]", text, re.M) is not None
     )
-    has_guardrails = any(
-        marker in lowered for marker in ["do not", "never", "avoid", "guardrail", "blacklist"]
-    ) or any(marker in text for marker in ["不得", "禁止", "避免", "约束", "护栏", "不应"])
+    has_failure_modes = any(marker in lowered for marker in ["failure", "fallback", "if "]) or any(
+        marker in text for marker in ["失败模式", "异常处理", "如果", "若", "当"]
+    )
+    has_guardrails = any(marker in lowered for marker in ["do not", "never", "avoid", "guardrail", "blacklist"]) or any(
+        marker in text for marker in ["不得", "禁止", "避免", "约束", "护栏", "不应"]
+    )
     return [
         ConstraintResult(
             frontmatter_match is not None,
@@ -2050,7 +2056,9 @@ def trace_expectation_label(expectation: Any) -> str:
 
 def trace_expectation_keywords(expectation: Any) -> list[str]:
     if isinstance(expectation, Mapping):
-        keywords = expectation.get("tool_intent_keywords") or expectation.get("keywords") or expectation.get("aliases") or []
+        keywords = (
+            expectation.get("tool_intent_keywords") or expectation.get("keywords") or expectation.get("aliases") or []
+        )
         if isinstance(keywords, str):
             keywords = [keywords]
         values = [str(item) for item in keywords if str(item).strip()]
@@ -2284,8 +2292,7 @@ def tool_evidence_text(evidence: Sequence[Mapping[str, Any]], limit: int = 12) -
         args = json.dumps(item.get("args"), ensure_ascii=False, default=str)
         result = str(item.get("result") or "").replace("\n", " ")[:300]
         lines.append(
-            f"- {item.get('name', 'unknown_tool')} status={item.get('status', 'unknown')} "
-            f"args={args} result={result}"
+            f"- {item.get('name', 'unknown_tool')} status={item.get('status', 'unknown')} args={args} result={result}"
         )
     return "\n".join(lines) or "- none"
 
@@ -2417,6 +2424,7 @@ def evaluate_response(example: dict[str, Any], state: dict) -> tuple[float, str]
         "eval_mode": eval_mode,
         "composite": composite,
     }
+    fitness.update(mutation_eligibility_diagnostics(example, state, failures, fitness))
     failure_classification, classification_reason = classify_failure(example, state, response, failures, fitness)
     fitness["failure_classification"] = failure_classification
     fitness["classification_reason"] = classification_reason
@@ -2447,18 +2455,27 @@ def evaluate_response_with_judge(
     try:
         raw_judge = judge_lm(prompt)
     except Exception as exc:  # pragma: no cover - defensive fallback for flaky judge providers.
-        return deterministic_score, f"{deterministic_feedback}\n\nReflection judge unavailable: {type(exc).__name__}: {exc}"
+        return (
+            deterministic_score,
+            f"{deterministic_feedback}\n\nReflection judge unavailable: {type(exc).__name__}: {exc}",
+        )
 
     payload = parse_judge_json(raw_judge)
     if payload is None:
-        return deterministic_score, f"{deterministic_feedback}\n\nReflection judge returned non-JSON output:\n{raw_judge[:1200]}"
+        return (
+            deterministic_score,
+            f"{deterministic_feedback}\n\nReflection judge returned non-JSON output:\n{raw_judge[:1200]}",
+        )
 
     candidate = state.get("candidate_excerpt", {})
     response = last_message_text(state)
     expected = example.get("answer") or example.get("expected") or ""
-    failure_classification, default_reason = classify_failure(example, state, response, failures, state.get("fitness", {}))
+    failure_classification, default_reason = classify_failure(
+        example, state, response, failures, state.get("fitness", {})
+    )
     suggested = str(payload.get("suggested_component") or "").strip()
-    if failure_classification == TOOL_CAPABILITY_GAP:
+    mutation_eligible = bool(state.get("fitness", {}).get("mutation_eligible", True))
+    if not mutation_eligible:
         suggested = ""
     elif suggested not in candidate:
         suggested = suggest_component_to_update(
@@ -2489,7 +2506,13 @@ def evaluate_response_with_judge(
     state["fitness"] = fitness
 
     judged_classification = str(payload.get("failure_classification") or failure_classification).strip()
-    if judged_classification not in {SKILL_DEFECT, EXECUTION_LAPSE, TOOL_CAPABILITY_GAP, NO_FAILURE}:
+    if judged_classification not in {
+        SKILL_DEFECT,
+        EXECUTION_LAPSE,
+        TOOL_CAPABILITY_GAP,
+        INSUFFICIENT_RUNTIME_EVIDENCE,
+        NO_FAILURE,
+    }:
         judged_classification = failure_classification
     classification_reason = str(payload.get("classification_reason") or default_reason)
     tool_gaps = [str(item) for item in fitness.get("tool_capability_gaps") or []]
@@ -2498,10 +2521,27 @@ def evaluate_response_with_judge(
     if failures:
         judged_classification = SKILL_DEFECT
     elif missing_checkpoints and not expected:
-        judged_classification = SKILL_DEFECT
-        classification_reason = "rubric-only output missed expert checkpoints: " + ", ".join(missing_checkpoints[:3])
-        if tool_gaps:
-            classification_reason += "; separate tool capability gaps: " + ", ".join(tool_gaps[:3])
+        if supported_missing:
+            judged_classification = EXECUTION_LAPSE
+            classification_reason = "agent skipped available data-acquisition paths for: " + ", ".join(
+                supported_missing[:3]
+            )
+        elif not mutation_eligible:
+            judged_classification = str(fitness.get("mutation_block_classification") or INSUFFICIENT_RUNTIME_EVIDENCE)
+            classification_reason = str(
+                fitness.get("mutation_eligibility_reason")
+                or "missing expert checkpoints are not supported by runtime-observable evidence"
+            )
+            suggested = ""
+        elif judged_classification in {
+            TOOL_CAPABILITY_GAP,
+            INSUFFICIENT_RUNTIME_EVIDENCE,
+            NO_FAILURE,
+        }:
+            judged_classification = SKILL_DEFECT
+            classification_reason = "runtime evidence exists, but reusable analysis missed: " + ", ".join(
+                missing_checkpoints[:3]
+            )
     elif supported_missing and not expected:
         judged_classification = EXECUTION_LAPSE
         classification_reason = "agent skipped available data-acquisition paths for: " + ", ".join(
@@ -2513,13 +2553,19 @@ def evaluate_response_with_judge(
         classification_reason = "required evidence is unavailable from current tools: " + ", ".join(tool_gaps[:3])
     elif judged_classification == NO_FAILURE:
         suggested = ""
-    if judged_classification != TOOL_CAPABILITY_GAP and suggested not in candidate:
+    if (
+        mutation_eligible
+        and judged_classification not in {TOOL_CAPABILITY_GAP, INSUFFICIENT_RUNTIME_EVIDENCE, NO_FAILURE}
+        and suggested not in candidate
+    ):
         suggested = suggest_component_to_update(
             state,
             weakest_dimension(fitness, failures),
             judged_classification,
             expected,
         )
+    if not mutation_eligible:
+        suggested = ""
     fitness["failure_classification"] = judged_classification
     fitness["classification_reason"] = classification_reason
     state["fitness"] = fitness
@@ -2569,20 +2615,23 @@ def build_judge_prompt(
     matched_trace_expectations = acquisition_diagnostics["matched_trace_expectations"]
     missing_trace_expectations = acquisition_diagnostics["missing_trace_expectations"]
     trace_coverage = acquisition_diagnostics["trace_expectation_coverage"]
-    trace_expectation_lines = "\n".join(
-        f"- {trace_expectation_label(item)}" for item in trace_expectations(example)
-    ) or "- none"
+    trace_expectation_lines = (
+        "\n".join(f"- {trace_expectation_label(item)}" for item in trace_expectations(example)) or "- none"
+    )
     missing_trace_expectation_lines = "\n".join(f"- {item}" for item in missing_trace_expectations) or "- none"
     matched_trace_expectation_lines = "\n".join(f"- {item}" for item in matched_trace_expectations) or "- none"
-    tool_supported_missing_lines = "\n".join(
-        f"- {item}" for item in acquisition_diagnostics["tool_supported_missing_expectations"]
-    ) or "- none"
-    tool_capability_gap_lines = "\n".join(
-        f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]
-    ) or "- none"
+    tool_supported_missing_lines = (
+        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_supported_missing_expectations"]) or "- none"
+    )
+    tool_capability_gap_lines = (
+        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]) or "- none"
+    )
     successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
     failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
     available_tools = tool_inventory_text(state.get("available_tools") or []) or "- none"
+    fitness = state.get("fitness", {})
+    mutation_eligible = bool(fitness.get("mutation_eligible", True))
+    mutation_eligibility_reason = str(fitness.get("mutation_eligibility_reason") or "not evaluated")
     return (
         "You are the evaluator for a Deep Agents GEPA text-surface optimization run.\n"
         "Use hard constraints as non-negotiable validity rules. Treat advisory notes as hints, not automatic failures.\n"
@@ -2601,11 +2650,11 @@ def build_judge_prompt(
         "model. Keep unsupported or uncollected evidence as a hypothesis. Reject vague advice that lacks these elements.\n"
         "Data-acquisition expectations are satisfied only by paired, successful tool-call results whose declared seed "
         "capability matches the expectation. Keywords in prompts, skills, AI prose, or final answers are not acquisition "
-        "evidence. If missing tool capability is the only actionable failure, classify TOOL_CAPABILITY_GAP, leave "
-        "suggested_component empty, and recommend a concrete new tool capability instead of a text mutation. If the "
-        "same example also misses reusable expert checkpoints or skips a supported tool, keep the text-actionable "
-        "classification and suggest the owning text component; report the tool gap separately and never claim that "
-        "the text edit supplies the missing data.\n"
+        "evidence. A hidden expert checkpoint is allowed to lower the task score, but it may drive a text mutation only "
+        "when the trace contains relevant successful evidence or the agent skipped an available matching tool. If "
+        "current tools cannot obtain the evidence, classify TOOL_CAPABILITY_GAP. If the evaluator cannot establish "
+        "whether the lesson is observable at runtime, classify INSUFFICIENT_RUNTIME_EVIDENCE. In both cases leave "
+        "suggested_component empty. Never convert unavailable company facts into memorized skill/reference content.\n"
         "For NO_FAILURE, leave suggested_component empty. Successful examples are regression constraints and positive "
         "evidence; they must not vote to mutate a component.\n"
         "If Expected is not `rubric-only`, treat it as the authoritative target label, route, answer, or structured "
@@ -2613,20 +2662,24 @@ def build_judge_prompt(
         "explicitly asks for that. For routing or classification tasks, score the final response by whether it returns "
         "the expected label/route and recommend text-surface changes that improve that classification behavior. "
         "Operational troubleshooting advice instead of the expected label is a failure.\n"
-        "For rubric-only expert-experience examples, use the rubric checkpoints as a strict coverage checklist. Full "
-        "credit requires covering all required expert judgment points in the response, and useful optimization should "
-        "move missing reusable expertise into the most specific skill or reference component. If Expert evaluation data "
-        "is present, treat it as evaluator-only material: the agent should not see or quote it, but its output and trace "
-        "should align with the risk points, data-acquisition needs, and risk logic expressed there. Never recommend that "
-        "the runtime agent read Expert data, rubrics, checkpoints, or evaluator feedback; those fields are hidden during "
+        "For rubric-only expert-experience examples, use rubric checkpoints as a strict behavior-scoring checklist: "
+        "missing checkpoints still cap the score. Keep scoring separate from mutation eligibility. Expert evaluation "
+        "data is evaluator-only material; do not copy its case facts, exact conclusions, thresholds, or complete "
+        "analysis into a runtime component. When runtime evidence supports a reusable lesson, recommend only the "
+        "smallest non-obvious cue. For learned references, prefer a compact condition -> concern -> consequence reminder "
+        "and rely on the runtime model's general knowledge for standard investigation and analysis. Never tell the "
+        "runtime agent to read Expert data, rubrics, checkpoints, or evaluator feedback; those fields are hidden during "
         "rollout.\n\n"
         "Return JSON only, with this schema:\n"
         "{\n"
         '  "score": 0.0,\n'
-        f'  "failure_classification": "{SKILL_DEFECT}|{EXECUTION_LAPSE}|{TOOL_CAPABILITY_GAP}|{NO_FAILURE}",\n'
+        f'  "failure_classification": "{SKILL_DEFECT}|{EXECUTION_LAPSE}|{TOOL_CAPABILITY_GAP}|'
+        f'{INSUFFICIENT_RUNTIME_EVIDENCE}|{NO_FAILURE}",\n'
         '  "classification_reason": "short reason",\n'
-        '  "suggested_component": "one key from allowed_components, or empty for TOOL_CAPABILITY_GAP/NO_FAILURE",\n'
+        '  "mutation_eligible": false,\n'
+        '  "suggested_component": "one key from allowed_components, or empty when mutation_eligible is false",\n'
         '  "suggested_component_reason": "short reason",\n'
+        '  "reusable_lesson": "smallest non-obvious reusable lesson, or empty",\n'
         '  "knowledge_scope": "global_policy|invariant_workflow|scoped_domain_rule|tool_semantics",\n'
         '  "applicability_scope": "observable triggers, relevant scopes, and exclusions",\n'
         '  "cross_case_regression_risk": "how the change could hurt other examples and how to contain it",\n'
@@ -2648,6 +2701,8 @@ def build_judge_prompt(
         f"Missing trace expectations:\n{missing_trace_expectation_lines}\n"
         f"Missing expectations with apparent tool support:\n{tool_supported_missing_lines}\n"
         f"Tool capability gaps:\n{tool_capability_gap_lines}\n"
+        f"Deterministic mutation eligibility: {str(mutation_eligible).lower()}\n"
+        f"Mutation eligibility reason: {mutation_eligibility_reason}\n"
         f"Successful tool evidence:\n{successful_tool_evidence_lines}\n"
         f"Failed tool evidence:\n{failed_tool_evidence_lines}\n"
         f"Available tools:\n{available_tools[:2500]}\n\n"
@@ -2723,8 +2778,14 @@ def build_judge_feedback(
     applicability_scope = str(payload.get("applicability_scope") or "not provided").strip()
     regression_risk = str(payload.get("cross_case_regression_risk") or "not provided").strip()
     operational_rule = str(payload.get("operational_rule") or "not provided").strip()
+    reusable_lesson = str(payload.get("reusable_lesson") or "").strip()
     feedback_text = str(payload.get("feedback") or "").strip()
     boundary_assessment = str(payload.get("boundary_assessment") or "").strip()
+    fitness = state.get("fitness", {})
+    mutation_eligible = bool(fitness.get("mutation_eligible", True))
+    mutation_eligibility_reason = str(fitness.get("mutation_eligibility_reason") or "not provided")
+    if not mutation_eligible:
+        suggested_reason = mutation_eligibility_reason
     matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(example, response)
     matched_checkpoint_lines = "\n".join(f"- {item}" for item in matched_checkpoints) or "- none"
     missing_checkpoint_lines = "\n".join(f"- {item}" for item in missing_checkpoints) or "- none"
@@ -2734,12 +2795,12 @@ def build_judge_feedback(
     trace_coverage = acquisition_diagnostics["trace_expectation_coverage"]
     matched_trace_expectation_lines = "\n".join(f"- {item}" for item in matched_trace_expectations) or "- none"
     missing_trace_expectation_lines = "\n".join(f"- {item}" for item in missing_trace_expectations) or "- none"
-    tool_supported_missing_lines = "\n".join(
-        f"- {item}" for item in acquisition_diagnostics["tool_supported_missing_expectations"]
-    ) or "- none"
-    tool_capability_gap_lines = "\n".join(
-        f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]
-    ) or "- none"
+    tool_supported_missing_lines = (
+        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_supported_missing_expectations"]) or "- none"
+    )
+    tool_capability_gap_lines = (
+        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]) or "- none"
+    )
     successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
     failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
     return (
@@ -2760,8 +2821,11 @@ def build_judge_feedback(
         f"- eval_mode: llm_judge\n"
         f"- failure_classification: {failure_classification}\n"
         f"- classification_reason: {classification_reason}\n"
+        f"- mutation_eligible: {str(mutation_eligible).lower()}\n"
+        f"- mutation_eligibility_reason: {mutation_eligibility_reason}\n"
         f"- suggested_component: {suggested or 'none'}\n"
         f"- suggested_component_reason: {suggested_reason}\n"
+        f"- reusable_lesson: {reusable_lesson or 'none'}\n"
         f"- knowledge_scope: {knowledge_scope}\n"
         f"- applicability_scope: {applicability_scope}\n"
         f"- cross_case_regression_risk: {regression_risk}\n"
@@ -2801,6 +2865,77 @@ def build_judge_feedback(
     )
 
 
+def mutation_eligibility_diagnostics(
+    example: dict[str, Any],
+    state: Mapping[str, Any],
+    failures: Sequence[Mapping[str, Any]],
+    fitness: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Separate behavior scoring from whether hidden evidence may drive a text mutation."""
+    if failures:
+        return {
+            "mutation_eligible": True,
+            "mutation_eligibility_reason": "candidate text itself violates a deterministic validity constraint",
+            "mutation_block_classification": None,
+        }
+
+    expected = example.get("answer") or example.get("expected") or ""
+    if expected:
+        return {
+            "mutation_eligible": True,
+            "mutation_eligibility_reason": "the runtime output can be compared directly with an authoritative target",
+            "mutation_block_classification": None,
+        }
+
+    supported_missing = list(fitness.get("tool_supported_missing_expectations") or [])
+    if supported_missing:
+        return {
+            "mutation_eligible": True,
+            "mutation_eligibility_reason": "the agent skipped available evidence-acquisition paths: "
+            + ", ".join(str(item) for item in supported_missing[:3]),
+            "mutation_block_classification": None,
+        }
+
+    missing_checkpoints = list(fitness.get("missing_rubric_checkpoints") or [])
+    matched_expectations = list(fitness.get("matched_trace_expectations") or [])
+    if missing_checkpoints and matched_expectations:
+        return {
+            "mutation_eligible": True,
+            "mutation_eligibility_reason": "runtime evidence matched required acquisition paths: "
+            + ", ".join(str(item) for item in matched_expectations[:3]),
+            "mutation_block_classification": None,
+        }
+
+    tool_gaps = list(fitness.get("tool_capability_gaps") or [])
+    if tool_gaps:
+        return {
+            "mutation_eligible": False,
+            "mutation_eligibility_reason": "missing expert checkpoints depend on evidence unavailable from current tools: "
+            + ", ".join(str(item) for item in tool_gaps[:3]),
+            "mutation_block_classification": TOOL_CAPABILITY_GAP,
+        }
+
+    if not missing_checkpoints:
+        return {
+            "mutation_eligible": False,
+            "mutation_eligibility_reason": "no missing expert checkpoint requires a text change",
+            "mutation_block_classification": NO_FAILURE,
+        }
+
+    if trace_expectations(example):
+        reason = "required runtime evidence was not established by a successful or supported tool path"
+    else:
+        reason = (
+            "the evaluator-only opinion is not linked to runtime-observable evidence, so a reusable text lesson "
+            "cannot be established safely"
+        )
+    return {
+        "mutation_eligible": False,
+        "mutation_eligibility_reason": reason,
+        "mutation_block_classification": INSUFFICIENT_RUNTIME_EVIDENCE,
+    }
+
+
 def classify_failure(
     example: dict[str, Any],
     state: dict,
@@ -2818,6 +2953,20 @@ def classify_failure(
     if not expected:
         _matched, missing, _coverage = rubric_checkpoint_results(example, response)
         if missing:
+            if supported_missing:
+                return (
+                    EXECUTION_LAPSE,
+                    "agent skipped available data-acquisition paths for: "
+                    + ", ".join(str(item) for item in supported_missing[:3]),
+                )
+            if not bool(fitness.get("mutation_eligible", True)):
+                blocked_classification = str(
+                    fitness.get("mutation_block_classification") or INSUFFICIENT_RUNTIME_EVIDENCE
+                )
+                return blocked_classification, str(
+                    fitness.get("mutation_eligibility_reason")
+                    or "missing expert checkpoints are not supported by runtime-observable evidence"
+                )
             reason = f"rubric-only output missed expert checkpoints: {', '.join(missing[:3])}"
             if tool_gaps:
                 reason += "; separate tool capability gaps: " + ", ".join(str(item) for item in tool_gaps[:3])
@@ -2831,8 +2980,7 @@ def classify_failure(
         if tool_gaps:
             return (
                 TOOL_CAPABILITY_GAP,
-                "current tools cannot obtain required evidence for: "
-                + ", ".join(str(item) for item in tool_gaps[:3]),
+                "current tools cannot obtain required evidence for: " + ", ".join(str(item) for item in tool_gaps[:3]),
             )
         if response.strip():
             return NO_FAILURE, "rubric-only output covered the expert checkpoints"
@@ -2894,9 +3042,9 @@ def build_feedback(
     missing_trace_expectations = fitness.get("missing_trace_expectations", [])
     matched_trace_expectation_lines = "\n".join(f"- {item}" for item in matched_trace_expectations) or "- none"
     missing_trace_expectation_lines = "\n".join(f"- {item}" for item in missing_trace_expectations) or "- none"
-    tool_supported_missing_lines = "\n".join(
-        f"- {item}" for item in fitness.get("tool_supported_missing_expectations", [])
-    ) or "- none"
+    tool_supported_missing_lines = (
+        "\n".join(f"- {item}" for item in fitness.get("tool_supported_missing_expectations", [])) or "- none"
+    )
     tool_capability_gap_lines = "\n".join(f"- {item}" for item in fitness.get("tool_capability_gaps", [])) or "- none"
     successful_tool_evidence_lines = tool_evidence_text(fitness.get("successful_tool_evidence", []))
     failed_tool_evidence_lines = tool_evidence_text(fitness.get("failed_tool_evidence", []))
@@ -2927,6 +3075,8 @@ def build_feedback(
         f"- weakest_dimension: {weakest}\n"
         f"- failure_classification: {failure_classification}\n"
         f"- classification_reason: {classification_reason}\n"
+        f"- mutation_eligible: {str(bool(fitness.get('mutation_eligible', True))).lower()}\n"
+        f"- mutation_eligibility_reason: {fitness.get('mutation_eligibility_reason', 'not provided')}\n"
         f"- suggested_component: {suggested or 'none'}\n"
         f"- suggested_component_reason: {suggested_reason}\n\n"
         "Gate failures:\n"
@@ -2985,7 +3135,15 @@ def optimization_guidance(
             "- do_not: do not duplicate task knowledge that already lives in SKILL.md or reference/*.md.\n"
             "- expected_change: make the agent call or consult existing resources more reliably."
         )
-    if failure_classification == TOOL_CAPABILITY_GAP:
+    if failure_classification in {TOOL_CAPABILITY_GAP, INSUFFICIENT_RUNTIME_EVIDENCE}:
+        if failure_classification == INSUFFICIENT_RUNTIME_EVIDENCE:
+            return (
+                "- primary_action: do not mutate a text component from evaluator-only facts that are not connected to "
+                "runtime-observable evidence.\n"
+                "- framework_action: retain the sample for diagnosis and obtain a trace/tool-evidence mapping before "
+                "promoting any lesson into a skill or reference.\n"
+                "- do_not: do not memorize the expert answer, company facts, or exact checkpoint wording."
+            )
         return (
             "- primary_action: do not mutate a text component to simulate unavailable data access.\n"
             "- framework_action: preserve the missing expectation as a TOOL_CAPABILITY_GAP artifact for tool backlog "
@@ -3018,7 +3176,7 @@ def suggest_component_to_update(
     expected_route: str = "",
 ) -> str:
     candidate = state.get("candidate_excerpt", {})
-    if failure_classification in {TOOL_CAPABILITY_GAP, NO_FAILURE}:
+    if failure_classification in {TOOL_CAPABILITY_GAP, INSUFFICIENT_RUNTIME_EVIDENCE, NO_FAILURE}:
         return ""
     if failure_classification == EXECUTION_LAPSE:
         return prompt_or_memory_component(candidate)
@@ -3097,6 +3255,8 @@ def suggested_component_reason(
 ) -> str:
     if failure_classification == TOOL_CAPABILITY_GAP:
         return "no current text component can add the missing external data capability"
+    if failure_classification == INSUFFICIENT_RUNTIME_EVIDENCE:
+        return "evaluator-only facts are not connected to evidence observable by the runtime agent"
     if failure_classification == EXECUTION_LAPSE:
         return f"{suggested} can remind the agent to use already-available skills, references, and tools"
     if failures:
@@ -3222,6 +3382,99 @@ def with_rejected_history(
     return reflection_lm
 
 
+def current_component_from_reflection_prompt(prompt: str) -> str | None:
+    match = re.search(
+        r"(?s)Current target component \(this is the only text you may replace\):\n```\n(.*?)\n```\n\n"
+        r"Before answering,",
+        prompt,
+    )
+    return match.group(1) if match else None
+
+
+def no_change_proposal_response(prompt: str, issues: Sequence[str]) -> str | None:
+    current_component = current_component_from_reflection_prompt(prompt)
+    if current_component is None:
+        return None
+    issue_text = "; ".join(str(issue) for issue in issues if str(issue).strip()) or (
+        "available optimizer evidence does not justify a runtime text mutation"
+    )
+    return (
+        "Proposal rationale:\n"
+        f"- Failure pattern: {issue_text}\n"
+        "- Evidence across examples: no runtime-observable evidence supports promoting hidden case facts.\n"
+        "- Selected component: no change.\n"
+        "- Why this component: the selected component is preserved exactly.\n"
+        "- Why not other components: the gap belongs to evidence/tooling, not another text surface.\n"
+        "- Applicability scope and exclusions: n/a.\n"
+        "- Cross-case regression risk: avoided by retaining the incumbent text.\n"
+        "- Operational rule shape: no new rule.\n"
+        "- Boundary checks: unchanged component remains within its boundary.\n"
+        "- Hidden-data boundary check: evaluator-only facts were not persisted.\n"
+        "- Intended behavior change: none until runtime evidence or tooling makes the lesson learnable.\n\n"
+        "Final replacement:\n"
+        "```markdown\n"
+        f"{current_component}\n"
+        "```"
+    )
+
+
+def with_proposal_quality_review(
+    proposal_callable: Callable[[str], str],
+    review_callable: Callable[[str], str],
+    reviewer: ProposalReviewer,
+    artifact_store: RunArtifactStore | None = None,
+) -> Callable[[str], str]:
+    """Review and optionally revise each reflected proposal before candidate rollout."""
+
+    def reflection_lm(prompt: str) -> str:
+        original_response = proposal_callable(prompt)
+        try:
+            review = reviewer.review(
+                reflection_prompt=prompt,
+                proposal_response=original_response,
+                review_lm=review_callable,
+            )
+        except Exception as exc:  # pragma: no cover - provider-specific defensive fallback.
+            if artifact_store is not None:
+                artifact_store.write_proposal_review(
+                    prompt=prompt,
+                    original_response=original_response,
+                    decision="REVIEW_ERROR",
+                    issues=(),
+                    raw_review="",
+                    reviewed_response=None,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            LOGGER.warning("proposal review failed; retaining original proposal: %s: %s", type(exc).__name__, exc)
+            return original_response
+
+        reviewed_response = original_response
+        if review.decision == "REVISE" and review.reviewed_response is not None:
+            reviewed_response = review.reviewed_response
+        elif review.decision == "REJECT":
+            reviewed_response = no_change_proposal_response(prompt, review.issues) or original_response
+
+        if artifact_store is not None:
+            artifact_store.write_proposal_review(
+                prompt=prompt,
+                original_response=original_response,
+                decision=review.decision,
+                issues=review.issues,
+                raw_review=review.raw_output,
+                reviewed_response=reviewed_response if reviewed_response != original_response else None,
+            )
+        LOGGER.info(
+            "proposal_review decision=%s issues=%d original_chars=%d reviewed_chars=%d",
+            review.decision,
+            len(review.issues),
+            len(original_response),
+            len(reviewed_response),
+        )
+        return reviewed_response
+
+    return reflection_lm
+
+
 def with_reflection_error_artifacts(
     reflection_callable: Callable[[str], str],
     artifact_store: RunArtifactStore,
@@ -3305,7 +3558,9 @@ def normalize_eval_record(
         merged_metadata["stratum"] = str(payload["stratum"])
     messages = tuple(_normalize_message(message) for message in payload.get("messages", []))
     data = payload.get("data") or payload.get("expert_risk_section") or payload.get("expert_opinion")
-    data_path = payload.get("data_path") or payload.get("expert_risk_section_path") or payload.get("expert_opinion_path")
+    data_path = (
+        payload.get("data_path") or payload.get("expert_risk_section_path") or payload.get("expert_opinion_path")
+    )
     if data is None and data_path is not None:
         resolved_data_path = Path(_expand_value(str(data_path)))
         if not resolved_data_path.is_absolute():
@@ -3592,6 +3847,7 @@ def run_configured_skill_optimization(
     evaluator: Evaluator | Callable[[Mapping[str, Any], Mapping[str, Any]], tuple[float, str]] | None = None,
     template_registry: ReflectionTemplateRegistry | None = None,
     component_selector: ComponentSelector | None = None,
+    proposal_reviewer: ProposalReviewer | None = None,
     constraint_policy: Constraint | None = None,
     mcp_loader: Callable[[Sequence[MCPServerConfig], dict[str, str]], Sequence[BaseTool | Callable | dict[str, Any]]]
     | None = None,
@@ -3602,12 +3858,16 @@ def run_configured_skill_optimization(
     artifact_dir: str | Path | None = None,
     artifact_run_name: str | None = None,
     use_reflection_judge: bool = True,
+    review_proposals: bool = True,
     evaluate_final_test: bool | None = None,
+    evaluate_tied_candidates: bool = True,
 ) -> Any:
     """End-to-end config-driven optimization entry point."""
     config = load_deepagents_gepa_config(config_path)
     project = build_candidate_from_deep_agent_project(config, tool_registry=tool_registry)
-    provider = dataset_provider or DefaultDatasetProvider(config, load_dataset_from_config, langfuse_client=langfuse_client)
+    provider = dataset_provider or DefaultDatasetProvider(
+        config, load_dataset_from_config, langfuse_client=langfuse_client
+    )
     train_set, val_set, test_set = provider.load()
     if not train_set:
         raise ValueError("Configured dataset produced no training examples")
@@ -3641,8 +3901,17 @@ def run_configured_skill_optimization(
         return score, feedback
 
     reflection_callable = base_reflection_callable
+    if review_proposals:
+        reflection_callable = with_proposal_quality_review(
+            reflection_callable,
+            base_reflection_callable,
+            proposal_reviewer or DefaultProposalReviewer(),
+            artifact_store,
+        )
     if artifact_callback is not None:
-        reflection_callable = with_rejected_history(reflection_callable, artifact_callback.rejected_history_prompt_block)
+        reflection_callable = with_rejected_history(
+            reflection_callable, artifact_callback.rejected_history_prompt_block
+        )
     if artifact_store is not None:
         reflection_callable = with_reflection_error_artifacts(reflection_callable, artifact_store)
     adapter = LangChainAdapter(
@@ -3702,12 +3971,49 @@ def run_configured_skill_optimization(
                 deployment_candidate,
                 capture_traces=False,
             )
+        diagnostic_evaluations: dict[int, Any] = {}
+        diagnostic_val_scores: dict[int, float] = {}
+        if evaluate_tied_candidates and deployment_best_idx is not None:
+            val_scores = [float(score) for score in list(getattr(result, "val_aggregate_scores", []) or [])]
+            if val_scores:
+                top_score = max(val_scores)
+                for candidate_idx, candidate in enumerate(result.candidates):
+                    if candidate_idx == deployment_best_idx or abs(val_scores[candidate_idx] - top_score) > 1e-12:
+                        continue
+                    diagnostic_evaluations[candidate_idx] = adapter.evaluate(
+                        examples_for_evaluation_phase(test_set, f"final_test_tied_candidate_{candidate_idx}"),
+                        candidate,
+                        capture_traces=False,
+                    )
+                    diagnostic_val_scores[candidate_idx] = val_scores[candidate_idx]
         final_test_result = final_test_summary(seed_test, best_test)
+        if diagnostic_evaluations:
+            seed_mean = final_test_result["seed_mean"]
+            final_test_result["diagnostic_candidates"] = [
+                {
+                    "candidate_idx": candidate_idx,
+                    "validation_score": diagnostic_val_scores[candidate_idx],
+                    "test_mean": (
+                        sum(float(score) for score in evaluation.scores) / len(evaluation.scores)
+                        if evaluation.scores
+                        else 0.0
+                    ),
+                    "delta_vs_seed": (
+                        sum(float(score) for score in evaluation.scores) / len(evaluation.scores) - seed_mean
+                        if evaluation.scores
+                        else -seed_mean
+                    ),
+                    "selection_effect": "diagnostic_only",
+                }
+                for candidate_idx, evaluation in sorted(diagnostic_evaluations.items())
+            ]
         if artifact_store is not None:
             final_test_result = artifact_store.write_final_test(
                 examples=test_set,
                 seed_evaluation=seed_test,
                 best_evaluation=best_test,
+                diagnostic_evaluations=diagnostic_evaluations,
+                diagnostic_val_scores=diagnostic_val_scores,
             )
         LOGGER.info(
             "final_test count=%d seed_mean=%.3f best_mean=%.3f improvement=%.3f",
@@ -3742,8 +4048,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--artifact-dir", help="Optional base directory for run artifacts.")
     parser.add_argument("--artifact-run-name", help="Optional run directory name under --artifact-dir.")
-    parser.add_argument("--no-reflection-judge", action="store_true", help="Use deterministic eval instead of LLM judge.")
-    parser.add_argument("--skip-final-test", action="store_true", help="Do not evaluate seed and best on held-out test.")
+    parser.add_argument(
+        "--no-reflection-judge", action="store_true", help="Use deterministic eval instead of LLM judge."
+    )
+    parser.add_argument("--skip-proposal-review", action="store_true", help="Skip the pre-runtime LLM proposal review.")
+    parser.add_argument(
+        "--skip-final-test", action="store_true", help="Do not evaluate seed and best on held-out test."
+    )
+    parser.add_argument(
+        "--skip-tied-candidate-test",
+        action="store_true",
+        help="Do not evaluate non-deployed validation-tied candidates on held-out data for diagnostics.",
+    )
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--skip-optimize", action="store_true")
     return parser.parse_args()
@@ -3766,7 +4082,9 @@ def main():
             artifact_dir=args.artifact_dir,
             artifact_run_name=args.artifact_run_name,
             use_reflection_judge=not args.no_reflection_judge,
+            review_proposals=not args.skip_proposal_review,
             evaluate_final_test=not args.skip_final_test,
+            evaluate_tied_candidates=not args.skip_tied_candidate_test,
         )
         print(f"\nBest val score: {result.val_aggregate_scores[result.best_idx]}")
         print("\nOptimized components:")

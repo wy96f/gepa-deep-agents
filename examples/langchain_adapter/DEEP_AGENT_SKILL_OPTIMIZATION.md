@@ -42,9 +42,9 @@ examples/langchain_adapter/deepagents_gepa/
 It contains the small Deep Agents-specific abstractions used by this example:
 
 - `framework.py`: protocols plus default implementations for dataset providers,
-  evaluators, selectors, reflection templates, constraints, and candidate
-  materializers. There is no separate `DeepAgentsRunner` abstraction; this
-  framework always runs through Deep Agents.
+  evaluators, selectors, reflection templates, proposal review, constraints,
+  and candidate materializers. There is no separate `DeepAgentsRunner`
+  abstraction; this framework always runs through Deep Agents.
 - `artifacts.py`: run artifact persistence for configs, datasets, agent
   rollouts, proposal prompts, rejected proposals, candidates, summaries, and
   materialized best candidates.
@@ -55,6 +55,7 @@ The default implementations are used by `run_configured_skill_optimization(...)`
 - `DefaultEvaluator`
 - `DefaultFeedbackComponentSelector`
 - `DefaultReflectionTemplateRegistry`
+- `DefaultProposalReviewer`
 - `DefaultConstraintSet`
 - `DefaultCandidateMaterializer`
 
@@ -115,11 +116,11 @@ skills/credit-risk-review/reference/learned_expert_patterns.md
 容纳无法归入现有分类的可复用模式。一次 GEPA 优化中的 component key 集合固定，
 不能在中途凭空新增文件；领域需要独立知识分类时，应在运行前预建相应 reference。
 
-评审与反思模板要求经验模式写清机制假设、适用信号、排除条件、动态取证计划、分析
-方法、状态判定、风险传导和审批应用。这些不是所有企业共用的一张固定清单：智能体应
-根据当前企业的商业模式、交易、资产和融资特征选择证据及比较基准。行业案例只用于
-解释经济机制，不是封闭名单。这样可以避免某条规则改善一个样本后被无条件应用到无关
-企业。
+`learned_expert_patterns.md` 不再使用完整的“机制、取证、分析、状态、传导、措施”
+八段式模板。大模型已经掌握常规财务分析和调查方法，learned reference 只保留模型
+不容易稳定想起的专家提示。每条通常是一个标题加一段短文，概括“适用条件或信号 ->
+重点关注 -> 可能后果”；只有确实改变调查或决策时才补充一个关键核验或排除条件。
+一次 proposal 只新增或修订少量提醒，避免把 reference 变成行业知识堆积文件。
 
 数据格式如下：
 
@@ -154,10 +155,13 @@ SKILL.md、智能体文字和最终答案中的关键词都不能作为已取得
 保守匹配。模糊匹配至少需要两个独立能力关键词，避免把内部政策查询误判为企业数据
 查询。
 
-工具能力缺口与文本缺陷可以同时存在。案例既缺少外部数据工具、又漏掉可复用的专家
-分析方法时，框架仍允许优化相应 reference，同时在 feedback 和运行产物中保留
-`TOOL_CAPABILITY_GAP` 供工具开发排期。只有不存在可优化文本问题的纯工具缺口才跳过
-文本 mutation。
+checkpoint 缺失仍会降低分数，但低分不自动意味着应修改文本。框架另行计算
+`mutation_eligible`：只有轨迹中已有与 trace expectation 对齐的成功工具证据，或者
+智能体跳过了一个确实可用的匹配工具，隐藏审批意见才可以推动 skill/reference
+优化。当前工具无法取得所需事实时归为 `TOOL_CAPABILITY_GAP`；无法证明隐藏意见与
+运行时可观察证据之间关系时归为 `INSUFFICIENT_RUNTIME_EVIDENCE`。这两类都会保留
+低分和诊断信息，但不会给 component selector 投票，也不会把审批意见中的企业事实
+背进 reference。
 
 批量清洗审批意见：
 
@@ -373,6 +377,16 @@ must require observable business or transaction evidence, and numeric
 thresholds must come from policy/evidence or be labeled as adjustable stress
 assumptions.
 
+Learned references use compact reminders rather than full analysis templates.
+The proposer should add only a few focused condition -> concern -> consequence
+rules and rely on the runtime model for standard evidence collection,
+calculation, and approval-writing knowledge. A default pre-runtime proposal
+reviewer checks component ownership, hidden-data leakage, entity-name-only
+triggers, unsupported thresholds, cross-case overfitting, duplication, and
+unnecessary growth. It returns `ACCEPT`, `REVISE`, or `REJECT`; a rejection is
+converted to an exact no-op replacement so GEPA can reject it without running a
+memorized hidden answer.
+
 ```text
 Failure pattern
 Evidence across examples
@@ -502,12 +516,14 @@ score saturation:
 }
 ```
 
-Each checkpoint is a reusable expert judgment point. The evaluator reports
-matched and missing checkpoints, caps open-ended scores when checkpoints are
-missing, and pushes feedback toward the most specific skill/reference component
-that should preserve the lesson. Trace expectations remain diagnostics rather
-than a hard score gate, but their matched/missing state is deterministic and
-uses only successful tool evidence. Failed tool results are retained separately.
+Each checkpoint is an expert judgment point used to score behavior. The
+evaluator reports matched and missing checkpoints and caps open-ended scores
+when checkpoints are missing. A checkpoint is not automatically a reusable
+runtime lesson: `mutation_eligible` becomes true only when the trace has
+successful matching evidence or skipped a matching available tool. Trace
+expectations remain diagnostics rather than a direct score gate, but their
+matched/missing state is deterministic and uses only successful tool evidence.
+Failed tool results are retained separately.
 
 Dataset splitting is deterministic and stratified by default:
 
@@ -526,7 +542,10 @@ Explicit split labels take precedence. Unlabeled rows are distributed by the
 configured strata using a stable hash, so JSONL ordering does not place whole
 industries only in train or test. After GEPA finishes, the harness evaluates
 seed and the deployment candidate on the held-out test split. This final test
-does not influence optimization, acceptance, or Pareto selection.
+does not influence optimization, acceptance, or Pareto selection. When multiple
+candidates tie for the best validation score, non-deployed tied candidates are
+also evaluated on test as `diagnostic_only`. Their scores are saved for
+regression analysis but never change candidate selection.
 
 Langfuse import supports two dataset styles:
 
@@ -556,6 +575,9 @@ vary by domain:
 - `ComponentSelector`: which component should be mutated next. Use this when
   feedback should prefer a specific family, such as `reference/*.md` for expert
   methodology extraction.
+- `ProposalReviewer`: how a generated proposal is checked before candidate
+  rollout. The default reviewer can accept, compact/revise, or reject a
+  proposal while preserving both the original and reviewed text as artifacts.
 - `Constraint`: generic hard/advisory checks for candidate validity. Keep hard
   checks high-confidence and domain-neutral when possible; put softer judgment
   into the evaluator.
@@ -571,6 +593,7 @@ run_configured_skill_optimization(
     evaluator=...,
     template_registry=...,
     component_selector=...,
+    proposal_reviewer=...,
     constraint_policy=...,
 )
 ```
@@ -628,11 +651,12 @@ required structured answer, the deterministic fallback caps the composite score.
 The reflection judge is also capped by that correctness rule, so a fluent answer
 that does not return the expected route/label cannot be accepted as a high-score
 improvement. For expert-data rows with `metadata.checkpoints`, the judge
-is also capped by checkpoint coverage; missing expert points are classified as
-`SKILL_DEFECT` so the next proposal is encouraged to update `SKILL.md` or a
-focused `reference/*.md` file. If the missing point requires evidence that no
-declared seed tool can obtain, it is classified as `TOOL_CAPABILITY_GAP`
-instead. If a hard deterministic gate fails, the final
+is also capped by checkpoint coverage. Scoring and mutation eligibility are
+separate: a missing expert point becomes `SKILL_DEFECT` only when a successful
+runtime evidence path exists; skipping a supported path is
+`EXECUTION_LAPSE`; an unavailable path is `TOOL_CAPABILITY_GAP`; and an expert
+opinion with no established runtime evidence link is
+`INSUFFICIENT_RUNTIME_EVIDENCE`. If a hard deterministic gate fails, the final
 judge score is capped to zero. Advisory notes do not cap the score by
 themselves; they are fed to the judge so it can decide whether the issue
 actually matters.
@@ -660,11 +684,12 @@ Feedback includes:
 - trace expectation and tool capability diagnostics
 - weakest dimension
 - failure classification
+- mutation eligibility and its reason
 - recommended component key
 - short reason for the recommendation
 - knowledge scope and applicability conditions
 - cross-case regression risk
-- an operational rule shape: trigger -> evidence -> analysis -> transmission -> action
+- the smallest reusable lesson supported by runtime evidence
 
 Failures are classified as:
 
@@ -672,6 +697,7 @@ Failures are classified as:
 SKILL_DEFECT
 EXECUTION_LAPSE
 TOOL_CAPABILITY_GAP
+INSUFFICIENT_RUNTIME_EVIDENCE
 NO_FAILURE
 ```
 
@@ -701,12 +727,20 @@ minibatches return an empty component selection, so the unchanged proposal is
 rejected rather than teaching prompts to invent unavailable data. The gap is
 still saved for the tool/MCP backlog.
 
+`INSUFFICIENT_RUNTIME_EVIDENCE` means the evaluator-only opinion identifies a
+miss, but the run does not establish which observable evidence or available
+tool could have allowed the agent to discover it. It also recommends no text
+component. Add trace-expectation mappings, successful tool evidence, or more
+independent examples before promoting the lesson.
+
 The component selector aggregates recommendations across feedback records. It
 prefers component keys that appear most often in low-scoring trajectories. If
 the same component is repeatedly selected for the same candidate without
 producing an accepted improvement, it cools that component down and tries
 another surface. If no valid key is found, it falls back to round-robin
 selection. `TOOL_CAPABILITY_GAP` trajectories are excluded from this vote.
+`INSUFFICIENT_RUNTIME_EVIDENCE`, `NO_FAILURE`, and any feedback explicitly
+marked `mutation_eligible: false` are excluded as well.
 
 When the selected component is an explicitly managed learned/expert/experience
 reference, the selector first checks whether its owning `SKILL.md` already
@@ -827,6 +861,21 @@ that and use the deterministic fallback evaluator with:
 --no-reflection-judge
 ```
 
+The reflection model also reviews each generated proposal before candidate
+rollout. Disable this extra call only when debugging or supplying a custom
+review path:
+
+```text
+--skip-proposal-review
+```
+
+Held-out diagnostics for non-deployed validation-tied candidates are enabled by
+default. They never affect selection and can be disabled to reduce model calls:
+
+```text
+--skip-tied-candidate-test
+```
+
 If a run still fails with `ConnectError: [Errno 1] Operation not permitted`
 after no-proxy is configured, the process itself is not allowed to open the
 local TCP socket. Run the same command from PyCharm or a normal terminal rather
@@ -910,9 +959,18 @@ reflection_errors/
   index.jsonl
   <call-index>.json
   <call-index>.prompt.txt
+proposal_reviews/
+  index.jsonl
+  <call-index>/
+    metadata.json
+    reflection_prompt.txt
+    original_proposal.txt
+    raw_review.txt
+    reviewed_proposal.txt
 final_test/
   seed.json
   best.json
+  candidate_<tied-index>.json
   summary.json
 materialized_best_candidate/
   AGENTS.md
@@ -932,7 +990,9 @@ accepted candidates and diffs remain available for review.
 `result_summary.json` records the deployment choice as `best_idx`, preserves
 GEPA's original choice as `gepa_best_idx`, and includes `selection_policy`,
 `tie_break_applied`, and `tied_best_indices`. The held-out test set remains
-diagnostic and is never used for candidate selection.
+diagnostic and is never used for candidate selection. Tied candidates evaluated
+for analysis appear under `final_test.diagnostic_candidates` with
+`selection_effect="diagnostic_only"`.
 
 `agent_logs/` records each rollout: input, expected answer or rubric, final
 agent response, baseline response, score, fitness dimensions, constraints, and a
@@ -971,6 +1031,12 @@ the review rationale, the proposal is marked with
 by GEPA's subsample acceptance check are saved even though they never enter the
 final candidate pool.
 
+`proposal_reviews/` preserves the proposal before review, the review decision
+and issues, and the revised proposal when applicable. GEPA proposal status
+`accepted` means accepted into the candidate pool after the subsample check, not
+selected for deployment; proposal metadata records
+`acceptance_scope="candidate_pool_not_deployment"`.
+
 Rejected proposal summaries are also injected into later reflection prompts as
 short negative evidence. The prompt tells the model not to copy rejected text,
 only to avoid repeating the same failure pattern.
@@ -990,11 +1056,11 @@ python examples/langchain_adapter/analyze_deepagents_gepa_run.py \
 ```
 
 The analyzer reports baseline score, best score, improvement, proposal status
-counts, rejected proposal patterns, missing proposal-rationale markers, runtime
-errors, missing trace expectations, tool capability gaps, and whether the run is
-valid for algorithm-effectiveness analysis. If every rollout failed with a
-local-model connection error, it says so explicitly instead of treating the
-scores as useful.
+counts, proposal-review decisions, rejected proposal patterns, missing
+proposal-rationale markers, runtime errors, missing trace expectations, tool
+capability gaps, and whether the run is valid for algorithm-effectiveness
+analysis. If every rollout failed with a local-model connection error, it says
+so explicitly instead of treating the scores as useful.
 
 `proposals/index.jsonl` is intentionally a lifecycle event stream and may hold
 started, proposed, evaluated, and terminal rows for one iteration. The analyzer

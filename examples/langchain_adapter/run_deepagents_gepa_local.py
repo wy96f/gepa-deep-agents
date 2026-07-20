@@ -60,8 +60,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reflection-minibatch-size", type=int, default=3)
     parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-reflection-judge", action="store_true", help="Use deterministic eval instead of LLM judge.")
+    parser.add_argument(
+        "--no-reflection-judge", action="store_true", help="Use deterministic eval instead of LLM judge."
+    )
+    parser.add_argument("--skip-proposal-review", action="store_true", help="Skip the pre-runtime LLM proposal review.")
     parser.add_argument("--skip-final-test", action="store_true", help="Skip held-out seed/best test evaluation.")
+    parser.add_argument(
+        "--skip-tied-candidate-test",
+        action="store_true",
+        help="Do not evaluate non-deployed validation-tied candidates on held-out data for diagnostics.",
+    )
     parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--log-file", help="Optional file path for detailed Python logs.")
     parser.add_argument("--summary-file", help="Optional JSON file path for a compact GEPA run summary.")
@@ -162,9 +170,7 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
     tied_best_indices: list[int] = []
     if val_scores:
         max_score = max(float(score) for score in val_scores)
-        tied_best_indices = [
-            index for index, score in enumerate(val_scores) if abs(float(score) - max_score) <= 1e-12
-        ]
+        tied_best_indices = [index for index, score in enumerate(val_scores) if abs(float(score) - max_score) <= 1e-12]
     best_candidate = (
         candidates[best_idx]
         if best_idx is not None and 0 <= best_idx < len(candidates)
@@ -225,7 +231,9 @@ def main() -> None:
         artifact_dir=args.artifact_dir,
         artifact_run_name=args.artifact_run_name,
         use_reflection_judge=not args.no_reflection_judge,
+        review_proposals=not args.skip_proposal_review,
         evaluate_final_test=not args.skip_final_test,
+        evaluate_tied_candidates=not args.skip_tied_candidate_test,
     )
     write_summary(args, result)
 

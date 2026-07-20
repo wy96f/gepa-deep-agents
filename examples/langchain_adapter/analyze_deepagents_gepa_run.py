@@ -50,6 +50,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     proposal_events = read_jsonl(run_dir / "proposals" / "index.jsonl")
     rejected_proposal_events = read_jsonl(run_dir / "rejected_proposals" / "index.jsonl")
     reflection_errors = read_jsonl(run_dir / "reflection_errors" / "index.jsonl")
+    proposal_reviews = read_jsonl(run_dir / "proposal_reviews" / "index.jsonl")
     proposals = latest_proposal_events(proposal_events)
     rejected_proposals = latest_proposal_events(rejected_proposal_events)
     optimization_rollouts = [
@@ -84,9 +85,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     )
     runtime_skipped_count = sum(1 for detail in rollout_details if bool(detail.get("candidate_runtime_skipped", False)))
     tool_capability_gaps = Counter(
-        gap
-        for detail in rollout_details
-        for gap in detail.get("fitness", {}).get("tool_capability_gaps", [])
+        gap for detail in rollout_details for gap in detail.get("fitness", {}).get("tool_capability_gaps", [])
     )
     missed_supported_expectations = Counter(
         gap
@@ -94,21 +93,11 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         for gap in detail.get("fitness", {}).get("tool_supported_missing_expectations", [])
     )
     missing_trace_expectations = Counter(
-        gap
-        for detail in rollout_details
-        for gap in detail.get("fitness", {}).get("missing_trace_expectations", [])
+        gap for detail in rollout_details for gap in detail.get("fitness", {}).get("missing_trace_expectations", [])
     )
     proposal_statuses = Counter(str(row.get("status", "unknown")) for row in proposals)
-    proposed_components = Counter(
-        component
-        for row in proposals
-        for component in row.get("components", [])
-    )
-    rejected_components = Counter(
-        component
-        for row in rejected_proposals
-        for component in row.get("components", [])
-    )
+    proposed_components = Counter(component for row in proposals for component in row.get("components", []))
+    rejected_components = Counter(component for row in rejected_proposals for component in row.get("components", []))
     failure_classes = Counter(
         failure_class
         for row in rejected_proposals
@@ -116,10 +105,12 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         if failure_class != "NO_FAILURE"
     )
     rollout_failure_classes = Counter(
-        str(row.get("failure_classification"))
-        for row in optimization_rollouts
-        if row.get("failure_classification")
+        str(row.get("failure_classification")) for row in optimization_rollouts if row.get("failure_classification")
     )
+    mutation_ineligible_count = sum(
+        1 for detail in rollout_details if detail.get("fitness", {}).get("mutation_eligible") is False
+    )
+    proposal_review_decisions = Counter(str(row.get("decision", "unknown")) for row in proposal_reviews)
     proposal_artifacts = proposal_artifact_counts(run_dir, proposals, rejected_proposals)
     final_test = summary.get("final_test") or read_json(run_dir / "final_test" / "summary.json")
 
@@ -166,10 +157,13 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "rejected_components": dict(rejected_components.most_common()),
         "rejected_failure_classes": dict(failure_classes.most_common()),
         "rollout_failure_classes": dict(rollout_failure_classes.most_common()),
+        "mutation_ineligible_count": mutation_ineligible_count,
         "rejected_proposal_count": len(rejected_proposals),
         "rejected_proposal_event_count": len(rejected_proposal_events),
         "reflection_error_count": len(reflection_errors),
         "reflection_errors": reflection_errors,
+        "proposal_review_count": len(proposal_reviews),
+        "proposal_review_decisions": dict(proposal_review_decisions),
         "final_test": final_test,
         **proposal_artifacts,
         "experiment_valid_for_effectiveness": not connection_blocked,
@@ -178,9 +172,11 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             connection_blocked=connection_blocked,
             rejected_proposals=rejected_proposals,
             reflection_errors=reflection_errors,
+            proposal_review_decisions=proposal_review_decisions,
             proposal_statuses=proposal_statuses,
             proposed_components=proposed_components,
             failure_classes=failure_classes,
+            rollout_failure_classes=rollout_failure_classes,
             boundary_failures=boundary_failures,
             unloadable_skill_failures=unloadable_skill_failures,
             runtime_skipped_count=runtime_skipped_count,
@@ -213,9 +209,11 @@ def diagnose(
     connection_blocked: bool,
     rejected_proposals: list[dict[str, Any]],
     reflection_errors: list[dict[str, Any]],
+    proposal_review_decisions: Counter[str],
     proposal_statuses: Counter[str],
     proposed_components: Counter[str],
     failure_classes: Counter[str],
+    rollout_failure_classes: Counter[str],
     boundary_failures: Counter[str],
     unloadable_skill_failures: Counter[str],
     runtime_skipped_count: int,
@@ -232,7 +230,9 @@ def diagnose(
         notes.append(
             "The run is not valid for algorithm-effectiveness analysis: every rollout failed to connect to the local model."
         )
-        notes.append("Run the same command from PyCharm or a non-sandboxed terminal, then analyze the new artifact dir.")
+        notes.append(
+            "Run the same command from PyCharm or a non-sandboxed terminal, then analyze the new artifact dir."
+        )
         return notes
     if improvement is None:
         notes.append("No baseline/best validation score pair was available; inspect result_summary.json.")
@@ -246,9 +246,9 @@ def diagnose(
     if rejected_proposals:
         notes.append(f"{len(rejected_proposals)} proposals were rejected at subsample acceptance.")
     if reflection_errors:
-        dominant_error, count = Counter(str(item.get("error_type", "unknown")) for item in reflection_errors).most_common(
-            1
-        )[0]
+        dominant_error, count = Counter(
+            str(item.get("error_type", "unknown")) for item in reflection_errors
+        ).most_common(1)[0]
         notes.append(
             f"{len(reflection_errors)} reflection calls failed before proposal generation; "
             f"dominant error: {dominant_error} ({count}). Inspect reflection_errors/index.jsonl."
@@ -259,9 +259,18 @@ def diagnose(
             "text. This artifact predates reflection error capture; inspect the external debug log for the provider "
             "exception."
         )
+    if proposal_review_decisions:
+        decisions = ", ".join(f"{name}={count}" for name, count in proposal_review_decisions.most_common())
+        notes.append(f"Pre-runtime proposal reviews: {decisions}.")
     if failure_classes:
         dominant_class, count = failure_classes.most_common(1)[0]
         notes.append(f"Dominant rejected failure class: {dominant_class} ({count}).")
+    if rollout_failure_classes.get("INSUFFICIENT_RUNTIME_EVIDENCE", 0):
+        count = rollout_failure_classes["INSUFFICIENT_RUNTIME_EVIDENCE"]
+        notes.append(
+            f"{count} rollout evaluations lacked a defensible link between evaluator-only facts and runtime evidence; "
+            "they were excluded from text-component voting."
+        )
     if boundary_failures:
         dominant_gate, count = boundary_failures.most_common(1)[0]
         notes.append(f"Boundary gate failures observed: {dominant_gate} ({count}).")
@@ -323,7 +332,9 @@ def diagnose(
                 "full validation. It remains useful as an artifact, not as the deployment candidate."
             )
     elif not rejected_proposals and not proposal_statuses:
-        notes.append("If no proposal text was generated, inspect proposals/*/metadata.json for reflection/runtime failures.")
+        notes.append(
+            "If no proposal text was generated, inspect proposals/*/metadata.json for reflection/runtime failures."
+        )
     return notes
 
 
@@ -404,10 +415,12 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
     print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
     print(f"Missing trace expectations: {summary['missing_trace_expectations']}")
+    print(f"Mutation-ineligible rollouts: {summary['mutation_ineligible_count']}")
     print(f"Proposal statuses: {summary['proposal_statuses']}")
     print(f"Proposals: {summary['proposal_count']} ({summary['proposal_event_count']} lifecycle events)")
     print(f"Rejected proposals: {summary['rejected_proposal_count']}")
     print(f"Reflection errors: {summary['reflection_error_count']}")
+    print(f"Proposal reviews: {summary['proposal_review_count']} {summary['proposal_review_decisions']}")
     print(f"Proposal rationale files: {summary['proposal_rationale_files']}")
     print(f"Proposal missing rationale files: {summary['proposal_missing_rationale_files']}")
     print(f"Proposal diff files: {summary['proposal_diff_files']}")

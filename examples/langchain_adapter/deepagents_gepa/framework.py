@@ -19,6 +19,14 @@ SOFTENER_PATTERN = re.compile(
     re.I,
 )
 SUGGESTED_COMPONENT_RE = re.compile(r"(?m)^-\s*suggested_component:\s*(?P<component>\S+)\s*$")
+MUTATION_ELIGIBLE_RE = re.compile(r"(?mi)^-\s*mutation_eligible:\s*(?P<eligible>true|false)\s*$")
+NON_ACTIONABLE_FAILURES = frozenset(
+    {
+        "TOOL_CAPABILITY_GAP",
+        "INSUFFICIENT_RUNTIME_EVIDENCE",
+        "NO_FAILURE",
+    }
+)
 
 
 class DatasetProvider(Protocol):
@@ -92,8 +100,7 @@ class DefaultFeedbackComponentSelector:
         del state, subsample_scores
         suggested: dict[str, dict[str, float]] = {}
         actionable_trajectories = 0
-        capability_gap_trajectories = 0
-        no_failure_trajectories = 0
+        non_actionable_trajectories = 0
         sorted_trajectories = sorted(
             trajectories or [],
             key=lambda item: float(item.get("score", 0.0)) if isinstance(item, dict) else 0.0,
@@ -104,11 +111,8 @@ class DefaultFeedbackComponentSelector:
             score = float(trajectory.get("score", 0.0))
             feedback = str(trajectory.get("feedback", ""))
             failure_classification = self._failure_classification(feedback)
-            if failure_classification == "TOOL_CAPABILITY_GAP":
-                capability_gap_trajectories += 1
-                continue
-            if failure_classification == "NO_FAILURE":
-                no_failure_trajectories += 1
+            if failure_classification in NON_ACTIONABLE_FAILURES or self._mutation_eligible(feedback) is False:
+                non_actionable_trajectories += 1
                 continue
             actionable_trajectories += 1
             component = self._component_from_feedback(feedback, candidate)
@@ -137,7 +141,7 @@ class DefaultFeedbackComponentSelector:
                     self._round_robin_fallback(candidate_idx, candidate, excluded=set(ranked_components)),
                 )
             ]
-        if (capability_gap_trajectories or no_failure_trajectories) and not actionable_trajectories:
+        if non_actionable_trajectories and not actionable_trajectories:
             return []
         return [self._record_selection(candidate_idx, self._round_robin_fallback(candidate_idx, candidate))]
 
@@ -160,6 +164,13 @@ class DefaultFeedbackComponentSelector:
     def _failure_classification(feedback: str) -> str | None:
         match = re.search(r"(?m)^-\s*failure_classification:\s*(\S+)\s*$", feedback)
         return match.group(1).strip().rstrip(".,;") if match else None
+
+    @staticmethod
+    def _mutation_eligible(feedback: str) -> bool | None:
+        match = MUTATION_ELIGIBLE_RE.search(feedback)
+        if match is None:
+            return None
+        return match.group("eligible").lower() == "true"
 
     def _component_from_feedback(self, feedback: str, candidate: dict[str, str]) -> str | None:
         for match in SUGGESTED_COMPONENT_RE.finditer(feedback):
@@ -241,8 +252,11 @@ class DefaultReflectionTemplateRegistry:
             "model, mark unsupported acquisition as TOOL_CAPABILITY_GAP, and keep an unverified risk as a hypothesis.\n"
             "- Check cross-example regression risk. If a rule helps one scope but may hurt another, make the condition "
             "explicit instead of applying the rule globally.\n"
-            "- Every added rule must be operational: include a trigger, evidence to obtain, analysis or comparison, "
-            "risk transmission, and an approval action or verification consequence.\n"
+            "- Add only the knowledge increment the runtime model is unlikely to recover reliably on its own. Prefer a "
+            "short signal -> concern -> consequence reminder over a full textbook explanation.\n"
+            "- Keep operational detail proportional to what is non-obvious. Include evidence, comparison, or action "
+            "only when it changes how the agent should investigate or decide; do not expand every reminder into a "
+            "fixed multi-section template.\n"
             "- Avoid empty guidance such as 'analyze comprehensively', 'strengthen attention', or 'verify as needed' "
             "unless it is followed by concrete evidence, method, and decision criteria.\n"
             "- Keep names, paths, tool names, and output contracts consistent with the current component and feedback.\n"
@@ -304,9 +318,10 @@ class DefaultReflectionTemplateRegistry:
             )
         if ":reference/" in key:
             return (
-                "Return a complete Markdown reference file containing reusable scoped rules, facts, examples, or lookup "
-                "tables. Each learned rule should state applicability signals, evidence, analysis method, risk "
-                "transmission, decision use, and exclusions."
+                "Return a complete Markdown reference file containing reusable scoped reminders, facts, examples, or "
+                "lookup tables. For a learned reference, keep each new pattern compact: normally a heading plus one "
+                "short paragraph or a few bullets describing when it matters, what to notice, and the likely "
+                "consequence. Rely on the runtime model's general knowledge for standard analysis steps."
             )
         if ":tool:" in key and key.endswith(":description"):
             return "Return only a concise tool description. Explain when to call it, parameters, and boundaries."
@@ -349,15 +364,17 @@ class DefaultReflectionTemplateRegistry:
                 "- Scope: reusable domain facts, rules, rubrics, examples, and lookup material.\n"
                 "- Do not write agent persona, delegation instructions, tool descriptions, or workflow prose here.\n"
                 "- Keep references structured for lookup and reuse by a skill.\n"
-                "- For a learned reference, merge evidence by shared economic mechanism and add the smallest number "
-                "of reusable patterns; do not append one section per evaluation example, company, or industry.\n"
+                "- For a learned reference, merge evidence by shared economic mechanism and add at most a few focused "
+                "reminders per proposal; do not append one section per evaluation example, company, or industry.\n"
                 "- Scope each learned pattern by observable signals or business model. Include non-applicability "
                 "conditions so an improvement for one sector does not become a global rule.\n"
                 "- Treat entity-name keywords as discovery clues only, never sufficient applicability evidence.\n"
                 "- Do not invent fixed cutoffs. Tie thresholds to policy/evidence or label them as adjustable stress "
                 "assumptions.\n"
-                "- Make each rule concrete enough to execute: evidence source, comparison or calculation, risk "
-                "transmission, and resulting verification or approval action."
+                "- Prefer compact signal -> concern -> consequence language. Add an evidence source, comparison, "
+                "exclusion, or approval action only when it is non-obvious and materially changes execution.\n"
+                "- Do not repeat generic finance, risk, or investigation knowledge that a capable runtime model already "
+                "knows. Preserve context budget for genuinely learned expert cues."
             )
         if ":tool:" in key and key.endswith(":description"):
             return (
@@ -376,6 +393,108 @@ class DefaultReflectionTemplateRegistry:
                 "- Do not copy full SKILL.md or reference files; tell the subagent when to consult them."
             )
         return "- Preserve the selected component's runtime role and do not paste unrelated components into it."
+
+
+@dataclass(frozen=True)
+class ProposalReview:
+    """Structured result from a pre-runtime proposal quality review."""
+
+    decision: str
+    issues: tuple[str, ...]
+    reviewed_response: str | None
+    raw_output: str
+
+
+class ProposalReviewer(Protocol):
+    """Review a reflected proposal before GEPA evaluates the candidate."""
+
+    def review(
+        self,
+        *,
+        reflection_prompt: str,
+        proposal_response: str,
+        review_lm: Callable[[str], str],
+    ) -> ProposalReview:
+        """Return ACCEPT, REVISE, or REJECT with optional corrected response."""
+
+
+class DefaultProposalReviewer:
+    """LLM reviewer for component ownership, learnability, and overfitting risk."""
+
+    def review(
+        self,
+        *,
+        reflection_prompt: str,
+        proposal_response: str,
+        review_lm: Callable[[str], str],
+    ) -> ProposalReview:
+        prompt = self._build_prompt(reflection_prompt, proposal_response)
+        raw_output = str(review_lm(prompt))
+        return self._parse_output(raw_output)
+
+    @staticmethod
+    def _build_prompt(reflection_prompt: str, proposal_response: str) -> str:
+        return (
+            "You are the final proposal reviewer for a Deep Agents text-surface optimizer. Review the proposed "
+            "drop-in replacement before any expensive agent rollout.\n\n"
+            "Judge the proposal holistically:\n"
+            "1. Mutation eligibility: hidden evaluator facts may score behavior, but they may drive a text mutation "
+            "only when runtime evidence, an available-but-skipped tool, or repeated independent examples support a "
+            "reusable lesson. Missing external data alone is a tool backlog item, not knowledge to memorize.\n"
+            "2. Component ownership: keep global behavior in prompts/memory, invariant workflow in SKILL.md, compact "
+            "domain cues in reference files, and invocation semantics in tool descriptions.\n"
+            "3. Generalization: reject company-specific answers, entity-name-only triggers, closed industry lists, and "
+            "rules extrapolated from one case without observable conditions.\n"
+            "4. Evidence integrity: reject unsupported fixed thresholds, dates, amounts, facts, or tool capabilities.\n"
+            "5. Minimality: preserve existing good text and make the smallest coherent edit. For learned references, "
+            "add at most a few compact signal -> concern -> consequence reminders. Do not produce long mechanism / "
+            "evidence / analysis / status / transmission / approval templates when the runtime model already knows "
+            "those standard steps. For prompts and AGENTS.md, prefer one precise instruction over repeated prose.\n"
+            "6. Regression risk: contain a scoped lesson with observable applicability signals; do not improve one "
+            "sample by imposing a universal checklist on unrelated samples.\n\n"
+            "Return exactly this format:\n"
+            "Decision: ACCEPT | REVISE | REJECT\n"
+            "Issues:\n"
+            "- concise issue, or `none`\n"
+            "Reviewed response:\n"
+            "<for REVISE, a complete replacement response with `Proposal rationale:` and `Final replacement:`; "
+            "otherwise write `same`>\n\n"
+            "REJECT means the evidence does not justify any text mutation. REVISE means return a complete corrected "
+            "proposal, not commentary or a patch.\n\n"
+            "Original optimization prompt:\n"
+            f"{reflection_prompt}\n\n"
+            "Original proposal:\n"
+            f"{proposal_response}"
+        )
+
+    @staticmethod
+    def _parse_output(raw_output: str) -> ProposalReview:
+        decision_match = re.search(r"(?mi)^Decision:\s*(ACCEPT|REVISE|REJECT)\s*$", raw_output)
+        decision = decision_match.group(1).upper() if decision_match else "ACCEPT"
+        issues_match = re.search(
+            r"(?ms)^Issues:\s*(.*?)\nReviewed response:\s*(.*)\Z",
+            raw_output,
+        )
+        issues_text = issues_match.group(1).strip() if issues_match else ""
+        reviewed_text = issues_match.group(2).strip() if issues_match else ""
+        issues = tuple(
+            line.removeprefix("-").strip()
+            for line in issues_text.splitlines()
+            if line.removeprefix("-").strip().lower() not in {"", "none", "`none`"}
+        )
+        reviewed_response = None
+        if decision == "REVISE" and reviewed_text.lower() != "same":
+            if "Proposal rationale:" in reviewed_text and "Final replacement:" in reviewed_text:
+                reviewed_response = reviewed_text
+            else:
+                decision = "ACCEPT"
+                issues = (*issues, "reviewer revision was malformed; original proposal retained")
+        return ProposalReview(
+            decision=decision,
+            issues=issues,
+            reviewed_response=reviewed_response,
+            raw_output=raw_output,
+        )
 
 
 def select_deployment_candidate_index(result: Any, *, score_tolerance: float = 1e-12) -> int | None:

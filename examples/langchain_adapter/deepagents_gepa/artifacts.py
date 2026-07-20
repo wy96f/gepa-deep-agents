@@ -383,8 +383,14 @@ class RunArtifactStore:
             "feedback_preview": feedback[:500],
             "fitness": record["fitness"],
             "failure_classification": record["fitness"].get("failure_classification"),
+            "remediation_type": record["fitness"].get("remediation_type"),
+            "remediation_owner": record["fitness"].get("remediation_owner"),
+            "remediation_actions": record["fitness"].get("remediation_actions", []),
             "tool_capability_gaps": record["fitness"].get("tool_capability_gaps", []),
             "tool_supported_missing_expectations": record["fitness"].get("tool_supported_missing_expectations", []),
+            "skipped_supported_expectations": record["fitness"].get("skipped_supported_expectations", []),
+            "failed_tool_expectations": record["fitness"].get("failed_tool_expectations", []),
+            "incomplete_tool_result_expectations": record["fitness"].get("incomplete_tool_result_expectations", []),
             "evaluation_phase": record["evaluation_phase"],
             "error": record["state"]["error"],
             "candidate_runtime_skipped": record["candidate_runtime_skipped"],
@@ -393,6 +399,25 @@ class RunArtifactStore:
         with self._lock:
             _append_jsonl(self.run_dir / "agent_logs" / "rollouts.jsonl", compact_record)
             _write_json(self.run_dir / "agent_logs" / "rollouts" / f"{index:06d}.json", record)
+            for action in record["fitness"].get("remediation_actions", []):
+                if action.get("type") == "NO_ACTION":
+                    continue
+                _append_jsonl(
+                    self.run_dir / "diagnostics" / "remediation_actions.jsonl",
+                    {
+                        "rollout_index": index,
+                        "candidate_hash": record["candidate_hash"],
+                        "input": record["input"],
+                        "evaluation_phase": record["evaluation_phase"],
+                        "score": score,
+                        "failure_classification": record["fitness"].get("failure_classification"),
+                        "type": action.get("type"),
+                        "owner": action.get("owner"),
+                        "targets": action.get("targets", []),
+                        "reason": action.get("reason"),
+                        "detail_file": f"agent_logs/rollouts/{index:06d}.json",
+                    },
+                )
 
     def create_callback(self) -> RunArtifactCallback:
         return RunArtifactCallback(self)

@@ -4,7 +4,7 @@ name = "信贷审批专家经验萃取示例"
 [agent]
 mode = "manual"
 project_root = "../deepagents_gepa_credit_approval_project"
-system_prompt = "你是企业信贷审批风险审查助手。收到企业名称后，先使用 credit-risk-review 技能并调用现有工具取得企业专属证据，再形成项目风险点分析和审批建议。明确区分已核实事实、待验证假设和工具能力缺口。"
+system_prompt = "你是企业项目风险点分析助手。收到企业名称后，先使用 credit-risk-review 技能并调用现有工具取得企业专属信息。只输出已有事实能够支持的风险点及其影响；缺少信息的维度不推测、不用通用模板补齐；不输出审批意见、授信结论或放款条件。"
 memory = ["AGENTS.md"]
 skills = ["skills"]
 tools = ["./tools.py:lookup_policy", "./tools.py:record_review_note"]

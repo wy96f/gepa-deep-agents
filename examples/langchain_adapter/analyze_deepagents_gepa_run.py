@@ -95,6 +95,26 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     missing_trace_expectations = Counter(
         gap for detail in rollout_details for gap in detail.get("fitness", {}).get("missing_trace_expectations", [])
     )
+    failed_tool_expectations = Counter(
+        gap for detail in rollout_details for gap in detail.get("fitness", {}).get("failed_tool_expectations", [])
+    )
+    incomplete_tool_result_expectations = Counter(
+        gap
+        for detail in rollout_details
+        for gap in detail.get("fitness", {}).get("incomplete_tool_result_expectations", [])
+    )
+    remediation_types = Counter(
+        str(action.get("type"))
+        for detail in rollout_details
+        for action in detail.get("fitness", {}).get("remediation_actions", [])
+        if action.get("type") and action.get("type") != "NO_ACTION"
+    )
+    remediation_owners = Counter(
+        str(action.get("owner"))
+        for detail in rollout_details
+        for action in detail.get("fitness", {}).get("remediation_actions", [])
+        if action.get("owner") and action.get("type") != "NO_ACTION"
+    )
     proposal_statuses = Counter(str(row.get("status", "unknown")) for row in proposals)
     proposed_components = Counter(component for row in proposals for component in row.get("components", []))
     rejected_components = Counter(component for row in rejected_proposals for component in row.get("components", []))
@@ -110,6 +130,14 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     mutation_ineligible_count = sum(
         1 for detail in rollout_details if detail.get("fitness", {}).get("mutation_eligible") is False
     )
+    deterministic_judge_disagreement_count = sum(
+        1
+        for detail in rollout_details
+        if detail.get("expected")
+        and float(detail.get("fitness", {}).get("hard", 0.0)) >= 1.0
+        and float(detail.get("fitness", {}).get("judge_score", 1.0)) < 1.0
+    )
+    no_actionable_proposal_count = sum(1 for row in proposals if not row.get("components"))
     proposal_review_decisions = Counter(str(row.get("decision", "unknown")) for row in proposal_reviews)
     proposal_artifacts = proposal_artifact_counts(run_dir, proposals, rejected_proposals)
     final_test = summary.get("final_test") or read_json(run_dir / "final_test" / "summary.json")
@@ -150,6 +178,10 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "tool_capability_gaps": dict(tool_capability_gaps.most_common()),
         "missed_supported_expectations": dict(missed_supported_expectations.most_common()),
         "missing_trace_expectations": dict(missing_trace_expectations.most_common()),
+        "failed_tool_expectations": dict(failed_tool_expectations.most_common()),
+        "incomplete_tool_result_expectations": dict(incomplete_tool_result_expectations.most_common()),
+        "remediation_types": dict(remediation_types.most_common()),
+        "remediation_owners": dict(remediation_owners.most_common()),
         "proposal_statuses": dict(proposal_statuses),
         "proposal_count": len(proposals),
         "proposal_event_count": len(proposal_events),
@@ -158,6 +190,8 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "rejected_failure_classes": dict(failure_classes.most_common()),
         "rollout_failure_classes": dict(rollout_failure_classes.most_common()),
         "mutation_ineligible_count": mutation_ineligible_count,
+        "deterministic_judge_disagreement_count": deterministic_judge_disagreement_count,
+        "no_actionable_proposal_count": no_actionable_proposal_count,
         "rejected_proposal_count": len(rejected_proposals),
         "rejected_proposal_event_count": len(rejected_proposal_events),
         "reflection_error_count": len(reflection_errors),
@@ -180,8 +214,13 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             boundary_failures=boundary_failures,
             unloadable_skill_failures=unloadable_skill_failures,
             runtime_skipped_count=runtime_skipped_count,
+            deterministic_judge_disagreement_count=deterministic_judge_disagreement_count,
+            no_actionable_proposal_count=no_actionable_proposal_count,
             tool_capability_gaps=tool_capability_gaps,
             missed_supported_expectations=missed_supported_expectations,
+            failed_tool_expectations=failed_tool_expectations,
+            incomplete_tool_result_expectations=incomplete_tool_result_expectations,
+            remediation_types=remediation_types,
             proposal_artifacts=proposal_artifacts,
             selection_policy=str(summary.get("selection_policy", "unknown")),
             final_test=final_test if isinstance(final_test, dict) else None,
@@ -217,8 +256,13 @@ def diagnose(
     boundary_failures: Counter[str],
     unloadable_skill_failures: Counter[str],
     runtime_skipped_count: int,
+    deterministic_judge_disagreement_count: int,
+    no_actionable_proposal_count: int,
     tool_capability_gaps: Counter[str],
     missed_supported_expectations: Counter[str],
+    failed_tool_expectations: Counter[str],
+    incomplete_tool_result_expectations: Counter[str],
+    remediation_types: Counter[str],
     proposal_artifacts: dict[str, int],
     selection_policy: str,
     final_test: dict[str, Any] | None,
@@ -285,6 +329,16 @@ def diagnose(
             f"{runtime_skipped_count} candidate rollouts were skipped before agent execution because a critical "
             "deterministic constraint failed."
         )
+    if deterministic_judge_disagreement_count:
+        notes.append(
+            f"{deterministic_judge_disagreement_count} rollout evaluations had an exact authoritative target match "
+            "but a lower LLM-judge score. Treat deterministic correctness as the score anchor for these tasks."
+        )
+    if no_actionable_proposal_count:
+        notes.append(
+            f"{no_actionable_proposal_count} proposal iterations had no actionable text component. Their feedback is "
+            "diagnostic evidence for a tool/data backlog, not a text mutation."
+        )
     if tool_capability_gaps:
         dominant_gap, count = tool_capability_gaps.most_common(1)[0]
         notes.append(
@@ -297,6 +351,21 @@ def diagnose(
             f"Agent skipped an apparently available data-acquisition path: {dominant_miss} ({count}); "
             "optimize skill/prompt/tool descriptions to call the existing tool more reliably."
         )
+    if failed_tool_expectations:
+        dominant_failure, count = failed_tool_expectations.most_common(1)[0]
+        notes.append(
+            f"A matching tool call failed for: {dominant_failure} ({count}). Inspect its arguments and result; "
+            "fix invocation guidance only for argument errors, otherwise repair the tool or runtime."
+        )
+    if incomplete_tool_result_expectations:
+        dominant_result, count = incomplete_tool_result_expectations.most_common(1)[0]
+        notes.append(
+            f"A matching tool returned without usable expected evidence: {dominant_result} ({count}). "
+            "Review query construction, returned fields, and the advertised tool capability."
+        )
+    if remediation_types:
+        dominant_remediation, count = remediation_types.most_common(1)[0]
+        notes.append(f"Dominant recommended remediation: {dominant_remediation} ({count}).")
     if proposed_components:
         dominant_component, count = proposed_components.most_common(1)[0]
         notes.append(f"Most frequently selected component: {dominant_component} ({count}).")
@@ -415,7 +484,13 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
     print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
     print(f"Missing trace expectations: {summary['missing_trace_expectations']}")
+    print(f"Failed tool expectations: {summary['failed_tool_expectations']}")
+    print(f"Incomplete tool results: {summary['incomplete_tool_result_expectations']}")
+    print(f"Remediation types: {summary['remediation_types']}")
+    print(f"Remediation owners: {summary['remediation_owners']}")
     print(f"Mutation-ineligible rollouts: {summary['mutation_ineligible_count']}")
+    print(f"Deterministic/judge disagreements: {summary['deterministic_judge_disagreement_count']}")
+    print(f"No-actionable proposals: {summary['no_actionable_proposal_count']}")
     print(f"Proposal statuses: {summary['proposal_statuses']}")
     print(f"Proposals: {summary['proposal_count']} ({summary['proposal_event_count']} lifecycle events)")
     print(f"Rejected proposals: {summary['rejected_proposal_count']}")

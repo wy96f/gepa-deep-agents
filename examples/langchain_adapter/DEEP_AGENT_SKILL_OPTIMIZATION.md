@@ -110,8 +110,8 @@ skills/credit-risk-review/reference/industry_management_and_warnings.md
 skills/credit-risk-review/reference/learned_expert_patterns.md
 ```
 
-`SKILL.md` 负责稳定的审查流程：形成假设、取得证据、判定状态、分析风险传导并形成
-审批措施。有行业、商业模式或交易结构适用范围的经验应进入最具体的
+`SKILL.md` 负责稳定的风险识别流程：形成假设、取得证据、分析风险传导并输出当前
+事实能够支持的风险点。有行业、商业模式或交易结构适用范围的经验应进入最具体的
 `reference/*.md`。`learned_expert_patterns.md` 是预先声明的专家经验沉淀面，用于
 容纳无法归入现有分类的可复用模式。一次 GEPA 优化中的 component key 集合固定，
 不能在中途凭空新增文件；领域需要独立知识分类时，应在运行前预建相应 reference。
@@ -119,7 +119,7 @@ skills/credit-risk-review/reference/learned_expert_patterns.md
 `learned_expert_patterns.md` 不再使用完整的“机制、取证、分析、状态、传导、措施”
 八段式模板。大模型已经掌握常规财务分析和调查方法，learned reference 只保留模型
 不容易稳定想起的专家提示。每条通常是一个标题加一段短文，概括“适用条件或信号 ->
-重点关注 -> 可能后果”；只有确实改变调查或决策时才补充一个关键核验或排除条件。
+重点关注 -> 可能后果”；只有确实改变风险识别或解释时才补充一个关键核验或排除条件。
 一次 proposal 只新增或修订少量提醒，避免把 reference 变成行业知识堆积文件。
 
 数据格式如下：
@@ -155,13 +155,24 @@ SKILL.md、智能体文字和最终答案中的关键词都不能作为已取得
 保守匹配。模糊匹配至少需要两个独立能力关键词，避免把内部政策查询误判为企业数据
 查询。
 
-checkpoint 缺失仍会降低分数，但低分不自动意味着应修改文本。框架另行计算
-`mutation_eligible`：只有轨迹中已有与 trace expectation 对齐的成功工具证据，或者
-智能体跳过了一个确实可用的匹配工具，隐藏审批意见才可以推动 skill/reference
-优化。当前工具无法取得所需事实时归为 `TOOL_CAPABILITY_GAP`；无法证明隐藏意见与
-运行时可观察证据之间关系时归为 `INSUFFICIENT_RUNTIME_EVIDENCE`。这两类都会保留
-低分和诊断信息，但不会给 component selector 投票，也不会把审批意见中的企业事实
-背进 reference。
+checkpoint 缺失始终会降低分数；不会因为当前缺工具或信息有限就放宽覆盖 cap。低分
+和“改什么”是两个问题，框架会结合轨迹生成 `remediation_actions`：
+
+- 没有匹配工具：`ADD_TOOL_OR_MCP`，进入工具能力清单；
+- 有工具但未调用：`IMPROVE_TOOL_USAGE`，优化 skill、prompt 或 tool description 中
+  的条件化调用触发；
+- 参数或校验错误：`IMPROVE_TOOL_INVOCATION`，优先检查 tool description 和调用指导；
+- 工具运行时或上游失败：`FIX_TOOL_RUNTIME`，保留低分但不给文本 component 投票；
+- 工具成功但结果不足：`IMPROVE_TOOL_QUERY_OR_RESULT`，检查查询意图、返回字段和真实
+  工具能力；
+- 已取得相关证据但最终风险逻辑遗漏：`IMPROVE_SKILL_OR_REFERENCE`；
+- 专家 checkpoint 与运行时证据没有可证明映射：`IMPROVE_EVAL_MAPPING`。
+
+只有轨迹支持文本可解决的原因时，`mutation_eligible` 才为真。当前工具无法取得所需
+事实时仍归为 `TOOL_CAPABILITY_GAP`；无法证明隐藏专家风险点与运行时证据之间关系时
+归为 `INSUFFICIENT_RUNTIME_EVIDENCE`。这些诊断会保留在 rollout artifact 中，但不会
+把评价意见中的企业事实背进 reference。信贷示例的输出边界是“有事实支持的风险点及
+影响”，不要求或奖励审批意见、额度建议、放款条件或大段待补资料清单。
 
 批量清洗审批意见：
 
@@ -380,7 +391,7 @@ assumptions.
 Learned references use compact reminders rather than full analysis templates.
 The proposer should add only a few focused condition -> concern -> consequence
 rules and rely on the runtime model for standard evidence collection,
-calculation, and approval-writing knowledge. A default pre-runtime proposal
+calculation, and domain-writing knowledge. A default pre-runtime proposal
 reviewer checks component ownership, hidden-data leakage, entity-name-only
 triggers, unsupported thresholds, cross-case overfitting, duplication, and
 unnecessary growth. It returns `ACCEPT`, `REVISE`, or `REJECT`; a rejection is
@@ -389,6 +400,8 @@ memorized hidden answer.
 
 ```text
 Failure pattern
+Runtime trajectory diagnosis
+Recommended remediation category
 Evidence across examples
 Selected component
 Why this component
@@ -502,10 +515,10 @@ score saturation:
 {
   "input": "江北化工新材料股份有限公司",
   "data": "七、项目风险点\n1、技改项目合规闭环风险...",
-  "rubric": "评价 agent 是否自主获取相关信息, 覆盖专家风险点, 并讲清风险逻辑。",
+  "rubric": "评价 agent 是否自主获取相关信息、覆盖专家风险点并讲清风险逻辑；最终只输出有事实支持的风险点及影响。",
   "metadata": {
     "checkpoints": [
-      {"label": "环评安评提款前置", "keywords": ["环评", "安全验收", "提款前置"]},
+      {"label": "技改项目合规闭环风险", "keywords": ["环评", "安全验收", "合规闭环"]},
       {"label": "客户集中压力测试", "keywords": ["三家大型客户", "客户集中", "集中度压力测试"]}
     ],
     "trace_expectations": [
@@ -519,11 +532,12 @@ score saturation:
 Each checkpoint is an expert judgment point used to score behavior. The
 evaluator reports matched and missing checkpoints and caps open-ended scores
 when checkpoints are missing. A checkpoint is not automatically a reusable
-runtime lesson: `mutation_eligible` becomes true only when the trace has
-successful matching evidence or skipped a matching available tool. Trace
-expectations remain diagnostics rather than a direct score gate, but their
-matched/missing state is deterministic and uses only successful tool evidence.
-Failed tool results are retained separately.
+runtime lesson: `mutation_eligible` becomes true only when the trace identifies
+a text-actionable cause, such as successful matching evidence, a skipped
+available tool, or an argument error that call guidance can repair. Runtime tool
+failures remain scored misses but do not trigger text mutation. Trace
+expectations remain diagnostics rather than a direct score gate, and only
+successful matching results count as acquired evidence.
 
 Dataset splitting is deterministic and stratified by default:
 
@@ -650,12 +664,18 @@ If an example has an `expected` answer but the agent does not produce the
 required structured answer, the deterministic fallback caps the composite score.
 The reflection judge is also capped by that correctness rule, so a fluent answer
 that does not return the expected route/label cannot be accepted as a high-score
-improvement. For expert-data rows with `metadata.checkpoints`, the judge
-is also capped by checkpoint coverage. Scoring and mutation eligibility are
-separate: a missing expert point becomes `SKILL_DEFECT` only when a successful
-runtime evidence path exists; skipping a supported path is
-`EXECUTION_LAPSE`; an unavailable path is `TOOL_CAPABILITY_GAP`; and an expert
-opinion with no established runtime evidence link is
+improvement. Conversely, an exact machine-verifiable target match is the score
+anchor: an inconsistent judge JSON score cannot turn a correct route or label
+into a failure. The feedback records `score_source=deterministic_expected` for
+this case. Open-ended rubric-only examples remain LLM-judged.
+
+For expert-data rows with `metadata.checkpoints`, the judge is also capped by
+checkpoint coverage. The cap remains strict even when the current agent lacks
+data or tools. Scoring and mutation eligibility are separate: a missing expert
+point becomes `SKILL_DEFECT` only when a successful runtime evidence path
+exists; skipping or miscalling a supported path is `EXECUTION_LAPSE`; an
+unavailable path is `TOOL_CAPABILITY_GAP`; and an expert opinion with no
+established runtime evidence link is
 `INSUFFICIENT_RUNTIME_EVIDENCE`. If a hard deterministic gate fails, the final
 judge score is capped to zero. Advisory notes do not cap the score by
 themselves; they are fed to the judge so it can decide whether the issue
@@ -685,6 +705,7 @@ Feedback includes:
 - weakest dimension
 - failure classification
 - mutation eligibility and its reason
+- remediation type, owner, reason, and all mixed remediation actions
 - recommended component key
 - short reason for the recommendation
 - knowledge scope and applicability conditions
@@ -711,8 +732,10 @@ subagent:...:skill:...:SKILL.md
 ...:tool:...:description
 ```
 
-`EXECUTION_LAPSE` means the needed guidance exists but the agent did not use it
-reliably. It tends to recommend:
+`EXECUTION_LAPSE` means the needed path exists but execution did not use it
+reliably. A skipped tool tends to select its owning `SKILL.md`; an argument
+failure or insufficient result tends to select the matching tool description;
+a general output-contract lapse tends to recommend:
 
 ```text
 memory:AGENTS.md
@@ -724,8 +747,10 @@ subagent:<name>:description
 `TOOL_CAPABILITY_GAP` means the required external evidence has no matching
 current tool capability. It recommends no text component. Capability-gap-only
 minibatches return an empty component selection, so the unchanged proposal is
-rejected rather than teaching prompts to invent unavailable data. The gap is
-still saved for the tool/MCP backlog.
+rejected rather than teaching prompts to invent unavailable data. The
+no-op-aware adapter reuses the just-completed evaluation for that unchanged
+candidate, so GEPA can record the diagnostic rejection without repeating the
+same expensive agent rollouts. The gap is still saved for the tool/MCP backlog.
 
 `INSUFFICIENT_RUNTIME_EVIDENCE` means the evaluator-only opinion identifies a
 miss, but the run does not establish which observable evidence or available
@@ -754,7 +779,7 @@ failure mode where a model copies the reference body into an already-correct
 The default reflection minibatch size is `3`, so a proposal normally sees more
 than one trajectory and must explain evidence across examples. For small,
 heterogeneous datasets, keep validation coverage across multiple industries;
-scope a rule by observable borrower signals when it helps one segment but could
+scope a rule by observable entity signals when it helps one segment but could
 reduce quality in another.
 
 GEPA's own acceptance and Pareto frontier act as the in-memory ratchet. This
@@ -929,6 +954,8 @@ rejected_candidates/
 agent_logs/
   rollouts.jsonl
   rollouts/*.json
+diagnostics/
+  remediation_actions.jsonl
 proposals/
   index.jsonl
   <iteration>/
@@ -1006,6 +1033,12 @@ is not part of runtime summarization and is not required by the reflection
 model; it exists only when artifacts are enabled and is intended for human or
 offline analysis.
 
+`diagnostics/remediation_actions.jsonl` flattens the actionable diagnosis from
+all rollouts. Each row links back to the detailed rollout and records the
+remediation type, owner, targets, and reason. This is the quickest source for a
+tool/MCP backlog, failed-tool repair queue, skipped-tool routing work, and
+skill/reference improvements after a long run.
+
 Candidates that cannot load at runtime, including `SKILL.md` files with missing
 or invalid YAML frontmatter or missing `name`/`description`, receive a zero
 constraint cap. The harness skips Deep Agent creation for those candidates and
@@ -1058,9 +1091,10 @@ python examples/langchain_adapter/analyze_deepagents_gepa_run.py \
 The analyzer reports baseline score, best score, improvement, proposal status
 counts, proposal-review decisions, rejected proposal patterns, missing
 proposal-rationale markers, runtime errors, missing trace expectations, tool
-capability gaps, and whether the run is valid for algorithm-effectiveness
-analysis. If every rollout failed with a local-model connection error, it says
-so explicitly instead of treating the scores as useful.
+capability gaps, empty-component proposals, deterministic/judge scoring
+disagreements, and whether the run is valid for algorithm-effectiveness analysis.
+If every rollout failed with a local-model connection error, it says so
+explicitly instead of treating the scores as useful.
 
 `proposals/index.jsonl` is intentionally a lifecycle event stream and may hold
 started, proposed, evaluated, and terminal rows for one iteration. The analyzer
@@ -1179,6 +1213,8 @@ It covers:
 - failure classification into `SKILL_DEFECT`, `EXECUTION_LAPSE`, and
   `TOOL_CAPABILITY_GAP`
 - successful-tool-only trace acquisition matching
+- skipped-tool, bad-invocation, runtime-failure, insufficient-result, and
+  evidence-not-used remediation diagnostics
 - evaluator fitness write-back to rollout artifacts
 - lifecycle-event deduplication in the run analyzer
 - deterministic stratified train/validation/test splitting
@@ -1187,7 +1223,9 @@ It covers:
 - repeated-component cooldown
 - correctness score caps
 - reflection-judge correctness caps
+- deterministic expected-result score anchors
 - rubric checkpoint coverage caps
+- no-op evaluation reuse when no text component is actionable
 - component-boundary hard gates
 - bare candidate-key boundary gates
 - advisory constraints that do not hard-fail candidates
@@ -1203,11 +1241,7 @@ Run:
 uv run --frozen pytest tests/test_deep_agent_skill_directory_example.py -q
 ```
 
-Expected result:
-
-```text
-52 passed
-```
+The command should complete without failures.
 
 ## Production Notes
 

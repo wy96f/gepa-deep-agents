@@ -23,9 +23,12 @@ from xml.etree import ElementTree
 DEFAULT_RUBRIC = (
     "将评估材料视为审批官风险评价意见中的“项目风险点”章节. 评价智能体仅根据企业名称自主检索"
     "和分析后形成的轨迹与最终输出: 1. 是否通过成功的工具调用取得与企业特征相关的行业、财务、"
-    "债务结构、集团穿透、环保安监、司法工商等证据; 2. 是否覆盖评估材料中的核心风险点; 3. 是否"
-    "说明事实依据、比较方法和风险传导; 4. 是否识别缺失信息、工具能力缺口并提出补充核验; 5. 不"
-    "奖励只套模板、未查证或针对单一样本硬编码的表述."
+    "债务结构、集团穿透、环保安监、司法工商等证据; 2. 是否覆盖评估材料中的核心风险点, 未覆盖"
+    "的隐藏 checkpoint 仍应降低任务分数; 3. 是否说明企业事实、必要比较和风险传导; 4. 缺少信息"
+    "时是否避免编造, 并根据轨迹区分无对应工具、跳过可用工具、工具调用失败、工具结果不足或已有"
+    "证据但分析遗漏; 5. 最终输出只评价有事实支持的风险点及可能影响, 不要求或奖励审批意见、授信"
+    "结论、额度建议、放款条件、贷后方案或大段待补资料清单; 6. 不奖励只套模板、未查证或针对单一"
+    "样本硬编码的表述。"
 )
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".docx", ".pdf"}
@@ -47,6 +50,11 @@ RISK_HEADING_RE = re.compile(
     r"^\s*(?:\d+|[一二三四五六七八九十]+)[\u3001.\uff0e]\s*(?P<label>[^\n]{2,80}?风险[^\n]*)\s*$",
     re.M,
 )
+ACTION_ONLY_CHECKPOINT_PATTERN = re.compile(
+    r"(?:审批建议|授信建议|授信压降|额度调整|放款条件|提款条件|贷后方案|"
+    r"回款监管必要性|追加担保|现金保证金|否决建议)"
+)
+RISK_SEMANTIC_PATTERN = re.compile(r"(?:风险|压力|恶化|异常|缺口|不确定|失效|不足|波动|背离)")
 
 
 @dataclass(frozen=True)
@@ -262,6 +270,8 @@ def build_checkpoints(risk_points: list[dict[str, Any]]) -> list[dict[str, Any]]
     checkpoints = []
     for point in risk_points:
         label = str(point.get("label") or "项目风险点")
+        if is_action_only_checkpoint(label):
+            continue
         keywords = [str(item) for item in point.get("keywords", []) if str(item).strip()]
         checkpoints.append({"label": label, "keywords": keywords or [label]})
     return checkpoints
@@ -269,7 +279,11 @@ def build_checkpoints(risk_points: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def build_trace_expectations(risk_points: list[dict[str, Any]]) -> list[dict[str, Any]]:
     labels: dict[str, list[str]] = {}
-    joined_points = "\n".join(f"{point.get('label', '')}\n{point.get('text', '')}" for point in risk_points)
+    joined_points = "\n".join(
+        f"{point.get('label', '')}\n{point.get('text', '')}"
+        for point in risk_points
+        if not is_action_only_checkpoint(str(point.get("label") or ""))
+    )
     compact = re.sub(r"\s+", "", joined_points)
     for label, keywords in KEYWORD_GROUPS:
         matched = [keyword for keyword in keywords if keyword in compact]
@@ -279,6 +293,13 @@ def build_trace_expectations(risk_points: list[dict[str, Any]]) -> list[dict[str
         {"label": label, "tool_intent_keywords": keywords}
         for label, keywords in sorted(labels.items(), key=lambda item: item[0])
     ]
+
+
+def is_action_only_checkpoint(label: str) -> bool:
+    normalized = normalize_label(label)
+    return bool(ACTION_ONLY_CHECKPOINT_PATTERN.search(normalized)) and not bool(
+        RISK_SEMANTIC_PATTERN.search(normalized)
+    )
 
 
 if __name__ == "__main__":

@@ -143,7 +143,7 @@ class DefaultFeedbackComponentSelector:
 
     @staticmethod
     def _with_component_dependencies(component: str, candidate: Mapping[str, str]) -> list[str]:
-        """Keep learned knowledge and the workflow that routes to it in one proposal."""
+        """Add the owning workflow only when it does not yet route to the learned reference."""
         selected = [component]
         if ":reference/" not in component:
             return selected
@@ -151,7 +151,8 @@ class DefaultFeedbackComponentSelector:
         if not any(marker in reference_name for marker in ("learned", "expert", "experience")):
             return selected
         skill_component = component.split(":reference/", maxsplit=1)[0] + ":SKILL.md"
-        if skill_component in candidate:
+        skill_text = str(candidate.get(skill_component, "")).lower()
+        if skill_component in candidate and reference_name not in skill_text:
             selected.append(skill_component)
         return selected
 
@@ -230,6 +231,11 @@ class DefaultReflectionTemplateRegistry:
             "tool backlog item rather than pretending the replacement can retrieve it.\n"
             "- Do not universalize a rule from one example. State observable applicability signals, relevant industries "
             "or business models, and non-applicable cases. Use examples to clarify scope, not as a closed hardcoded list.\n"
+            "- A company name or keyword is only a weak discovery clue. Do not use it alone to activate a risk "
+            "conclusion; require business-model, transaction, financial, asset, or financing evidence.\n"
+            "- Do not persist evaluator-only company names, dates, amounts, or invented numeric thresholds. A threshold "
+            "must cite an applicable policy or evidence basis; otherwise express a borrower-relative comparison or a "
+            "clearly labeled adjustable stress scenario.\n"
             "- Applicability signals are conditional observations, not one universal checklist. Evidence to obtain is a "
             "borrower-specific acquisition plan, not a fixed value known in advance. Adapt both to the current business "
             "model, mark unsupported acquisition as TOOL_CAPABILITY_GAP, and keep an unverified risk as a hypothesis.\n"
@@ -273,9 +279,12 @@ class DefaultReflectionTemplateRegistry:
                 "before that final section. The fenced block must be the only fenced code block and must contain only "
                 "the replacement text for the selected component. If you omit `Proposal rationale:`, the run artifact "
                 "will mark this proposal as missing_rationale.\n\n"
-                "Current component:\n```\n<curr_param>\n```\n\n"
                 "Evaluation data and feedback:\n```\n<side_info>\n```\n\n"
-                "Now write both required sections."
+                f"Authoritative target component: `{key}`\n"
+                "Current target component (this is the only text you may replace):\n"
+                "```\n<curr_param>\n```\n\n"
+                f"Before answering, verify that the replacement is valid for `{key}` and not for any component "
+                "suggested inside the evaluation evidence. Now write both required sections."
             )
         return templates
 
@@ -344,6 +353,9 @@ class DefaultReflectionTemplateRegistry:
                 "of reusable patterns; do not append one section per evaluation example, company, or industry.\n"
                 "- Scope each learned pattern by observable signals or business model. Include non-applicability "
                 "conditions so an improvement for one sector does not become a global rule.\n"
+                "- Treat entity-name keywords as discovery clues only, never sufficient applicability evidence.\n"
+                "- Do not invent fixed cutoffs. Tie thresholds to policy/evidence or label them as adjustable stress "
+                "assumptions.\n"
                 "- Make each rule concrete enough to execute: evidence source, comparison or calculation, risk "
                 "transmission, and resulting verification or approval action."
             )
@@ -367,11 +379,11 @@ class DefaultReflectionTemplateRegistry:
 
 
 def select_deployment_candidate_index(result: Any, *, score_tolerance: float = 1e-12) -> int | None:
-    """Select the newest accepted candidate when validation scores are tied.
+    """Select the first validation winner, preserving the incumbent on a tie.
 
-    GEPA reports the first maximum as ``best_idx``. Deep Agents deployment
-    prefers the newest candidate on a validation tie because candidates only
-    enter ``result.candidates`` after acceptance.
+    A validation tie is not evidence that a newer candidate is better. All
+    accepted candidates remain in the artifacts for review, but deployment
+    follows GEPA's conservative first-maximum behavior.
     """
     scores = list(getattr(result, "val_aggregate_scores", []) or [])
     candidates = list(getattr(result, "candidates", []) or [])
@@ -384,7 +396,7 @@ def select_deployment_candidate_index(result: Any, *, score_tolerance: float = 1
         for index, score in enumerate(scores[:usable_count])
         if isclose(float(score), best_score, rel_tol=0.0, abs_tol=max(0.0, score_tolerance))
     ]
-    return max(tied_indices)
+    return min(tied_indices)
 
 
 class Constraint(Protocol):

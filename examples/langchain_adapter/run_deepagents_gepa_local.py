@@ -181,7 +181,7 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
         "best_idx": best_idx,
         "gepa_best_idx": gepa_best_idx,
         "tie_break_applied": best_idx != gepa_best_idx,
-        "selection_policy": "latest_accepted_on_validation_tie",
+        "selection_policy": "incumbent_on_validation_tie",
         "tied_best_indices": tied_best_indices,
         "best_val_score": (
             result.val_aggregate_scores[best_idx]

@@ -67,6 +67,22 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         and not constraint.get("passed", True)
         and ":boundary:" in str(constraint.get("name", ""))
     )
+    hard_constraint_failures = Counter(
+        constraint.get("name")
+        for detail in rollout_details
+        for constraint in detail.get("constraints", [])
+        if isinstance(constraint, dict)
+        and not constraint.get("passed", True)
+        and str(constraint.get("severity", "hard")) == "hard"
+    )
+    unloadable_skill_failures = Counter(
+        {
+            name: count
+            for name, count in hard_constraint_failures.items()
+            if str(name).endswith((":frontmatter", ":frontmatter_yaml", ":name_description"))
+        }
+    )
+    runtime_skipped_count = sum(1 for detail in rollout_details if bool(detail.get("candidate_runtime_skipped", False)))
     tool_capability_gaps = Counter(
         gap
         for detail in rollout_details
@@ -125,6 +141,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "best_idx": summary.get("best_idx"),
         "gepa_best_idx": summary.get("gepa_best_idx", summary.get("best_idx")),
         "tie_break_applied": bool(summary.get("tie_break_applied", False)),
+        "selection_policy": summary.get("selection_policy", "unknown"),
         "tied_best_indices": summary.get("tied_best_indices", []),
         "num_candidates": summary.get("num_candidates"),
         "total_metric_calls": summary.get("total_metric_calls"),
@@ -136,6 +153,9 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "rollout_score_max": max(scores) if scores else None,
         "runtime_errors": dict(errors),
         "boundary_failures": dict(boundary_failures.most_common()),
+        "hard_constraint_failures": dict(hard_constraint_failures.most_common()),
+        "unloadable_skill_failures": dict(unloadable_skill_failures.most_common()),
+        "candidate_runtime_skipped_count": runtime_skipped_count,
         "tool_capability_gaps": dict(tool_capability_gaps.most_common()),
         "missed_supported_expectations": dict(missed_supported_expectations.most_common()),
         "missing_trace_expectations": dict(missing_trace_expectations.most_common()),
@@ -162,9 +182,15 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             proposed_components=proposed_components,
             failure_classes=failure_classes,
             boundary_failures=boundary_failures,
+            unloadable_skill_failures=unloadable_skill_failures,
+            runtime_skipped_count=runtime_skipped_count,
             tool_capability_gaps=tool_capability_gaps,
             missed_supported_expectations=missed_supported_expectations,
             proposal_artifacts=proposal_artifacts,
+            selection_policy=str(summary.get("selection_policy", "unknown")),
+            final_test=final_test if isinstance(final_test, dict) else None,
+            val_scores=[float(score) for score in val_scores],
+            tied_best_indices=list(summary.get("tied_best_indices", [])),
         ),
     }
 
@@ -191,9 +217,15 @@ def diagnose(
     proposed_components: Counter[str],
     failure_classes: Counter[str],
     boundary_failures: Counter[str],
+    unloadable_skill_failures: Counter[str],
+    runtime_skipped_count: int,
     tool_capability_gaps: Counter[str],
     missed_supported_expectations: Counter[str],
     proposal_artifacts: dict[str, int],
+    selection_policy: str,
+    final_test: dict[str, Any] | None,
+    val_scores: list[float],
+    tied_best_indices: list[int],
 ) -> list[str]:
     notes: list[str] = []
     if connection_blocked:
@@ -233,6 +265,17 @@ def diagnose(
     if boundary_failures:
         dominant_gate, count = boundary_failures.most_common(1)[0]
         notes.append(f"Boundary gate failures observed: {dominant_gate} ({count}).")
+    if unloadable_skill_failures:
+        dominant_gate, count = unloadable_skill_failures.most_common(1)[0]
+        notes.append(
+            f"Runtime-unloadable SKILL.md candidate observed: {dominant_gate} ({count}). "
+            "Reject this candidate before creating the Deep Agent."
+        )
+    if runtime_skipped_count:
+        notes.append(
+            f"{runtime_skipped_count} candidate rollouts were skipped before agent execution because a critical "
+            "deterministic constraint failed."
+        )
     if tool_capability_gaps:
         dominant_gap, count = tool_capability_gaps.most_common(1)[0]
         notes.append(
@@ -256,11 +299,29 @@ def diagnose(
         )
     if proposal_artifacts.get("proposal_diff_files", 0):
         notes.append(f"Proposal diff files: {proposal_artifacts['proposal_diff_files']}.")
-    if proposal_statuses.get("accepted", 0) and improvement == 0:
+    if final_test is not None and float(final_test.get("improvement", 0.0)) < 0:
         notes.append(
-            "An accepted candidate tied the baseline aggregate validation score; inspect per-example deltas and "
-            "the deployment tie-break rather than treating this as a missing proposal."
+            f"Held-out test regressed by {abs(float(final_test['improvement'])):.3f}. "
+            "The test set is diagnostic only and must not select a candidate, but this is strong evidence against "
+            "deploying a validation-tied proposal."
         )
+    if proposal_statuses.get("accepted", 0) and improvement == 0:
+        if len(tied_best_indices) > 1 and selection_policy == "latest_accepted_on_validation_tie":
+            notes.append(
+                "An accepted candidate tied the baseline validation score and the legacy policy deployed the newest "
+                "candidate. A tie is not improvement evidence; retain the incumbent and keep the proposal as an "
+                "artifact for review."
+            )
+        elif len(tied_best_indices) > 1:
+            notes.append(
+                "An accepted candidate tied the baseline validation score. The incumbent remains the deployment "
+                "candidate; inspect the proposal artifact and per-example deltas before broadening validation data."
+            )
+        elif len(val_scores) > 1:
+            notes.append(
+                "A proposal entered the candidate pool after subsample/Pareto acceptance but did not improve aggregate "
+                "full validation. It remains useful as an artifact, not as the deployment candidate."
+            )
     elif not rejected_proposals and not proposal_statuses:
         notes.append("If no proposal text was generated, inspect proposals/*/metadata.json for reflection/runtime failures.")
     return notes
@@ -329,7 +390,7 @@ def print_report(summary: dict[str, Any]) -> None:
     print(
         "Candidate selection: "
         f"deployment={summary['best_idx']} gepa={summary['gepa_best_idx']} "
-        f"tie_break={summary['tie_break_applied']}"
+        f"tie_break={summary['tie_break_applied']} policy={summary['selection_policy']}"
     )
     print(f"Metric calls: {summary['total_metric_calls']}")
     print(f"Candidates: {summary['num_candidates']}")
@@ -337,6 +398,9 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Final test rollouts: {summary['final_test_rollout_count']}")
     print(f"Runtime errors: {summary['runtime_errors']}")
     print(f"Boundary failures: {summary['boundary_failures']}")
+    print(f"Hard constraint failures: {summary['hard_constraint_failures']}")
+    print(f"Unloadable skill failures: {summary['unloadable_skill_failures']}")
+    print(f"Runtime-skipped candidates: {summary['candidate_runtime_skipped_count']}")
     print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
     print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
     print(f"Missing trace expectations: {summary['missing_trace_expectations']}")

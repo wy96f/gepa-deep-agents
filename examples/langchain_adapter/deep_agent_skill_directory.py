@@ -81,6 +81,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.10 fallback when tomli is installed.
     import tomli as tomllib  # type: ignore[no-redef]
 
+import yaml
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -1317,11 +1318,19 @@ def rollout(
             "trace_context_ratio": trace_context_ratio(),
             "evaluation_phase": example.get("evaluation_phase", "optimization"),
         }
-        try:
-            agent = create_deep_agent_from_application(application, llm)
-            state = agent.invoke({"messages": [HumanMessage(content=example["input"])]})
-        except Exception as exc:
-            state = {"messages": [], "error": exc}
+        critical_failures = critical_constraint_results(constraints)
+        if critical_failures:
+            state = {
+                "messages": [],
+                "candidate_runtime_skipped": True,
+                "candidate_runtime_skip_reason": critical_failure_summary(critical_failures),
+            }
+        else:
+            try:
+                agent = create_deep_agent_from_application(application, llm)
+                state = agent.invoke({"messages": [HumanMessage(content=example["input"])]})
+            except Exception as exc:
+                state = {"messages": [], "error": exc}
         if not isinstance(state, dict):
             state = {"messages": getattr(state, "messages", [])}
         state.update(state_extras)
@@ -1329,7 +1338,9 @@ def rollout(
         state["candidate_excerpt"] = summarize_candidate(candidate)
         state["candidate_constraints"] = [constraint.__dict__ for constraint in constraints]
         state["candidate_metrics"] = candidate_metrics(candidate, baseline_candidate)
-        state["baseline_response"] = run_baseline_for_example(example, llm, seed_spec, surfaces, baseline_candidate)
+        state["baseline_response"] = (
+            "" if critical_failures else run_baseline_for_example(example, llm, seed_spec, surfaces, baseline_candidate)
+        )
         return state
 
 
@@ -1361,7 +1372,12 @@ def configured_rollout(
                 project.surfaces,
             )
         ).check(candidate, {"materialized_root": temp_root})
-        runtime_application = configured_runtime_application(application, mcp_loader)
+        critical_failures = critical_constraint_results(constraints)
+        runtime_application = (
+            application.deep_agent_application
+            if critical_failures
+            else configured_runtime_application(application, mcp_loader)
+        )
         runtime_inventory = tool_inventory_from_kwargs(runtime_application.kwargs)
         state_extras = {
             "available_tools": runtime_inventory,
@@ -1370,11 +1386,18 @@ def configured_rollout(
             "trace_context_ratio": trace_context_ratio(),
             "evaluation_phase": example.get("evaluation_phase", "optimization"),
         }
-        try:
-            agent = create_deep_agent_from_application(runtime_application, llm)
-            state = agent.invoke({"messages": messages_for_example(example)})
-        except Exception as exc:
-            state = {"messages": [], "error": exc}
+        if critical_failures:
+            state = {
+                "messages": [],
+                "candidate_runtime_skipped": True,
+                "candidate_runtime_skip_reason": critical_failure_summary(critical_failures),
+            }
+        else:
+            try:
+                agent = create_deep_agent_from_application(runtime_application, llm)
+                state = agent.invoke({"messages": messages_for_example(example)})
+            except Exception as exc:
+                state = {"messages": [], "error": exc}
         if not isinstance(state, dict):
             state = {"messages": getattr(state, "messages", [])}
         state.update(state_extras)
@@ -1382,12 +1405,16 @@ def configured_rollout(
         state["candidate_excerpt"] = summarize_candidate(candidate)
         state["candidate_constraints"] = [constraint.__dict__ for constraint in constraints]
         state["candidate_metrics"] = candidate_metrics(candidate, baseline_candidate)
-        state["baseline_response"] = run_configured_baseline_for_example(
-            example,
-            llm,
-            project,
-            baseline_candidate,
-            mcp_loader,
+        state["baseline_response"] = (
+            ""
+            if critical_failures
+            else run_configured_baseline_for_example(
+                example,
+                llm,
+                project,
+                baseline_candidate,
+                mcp_loader,
+            )
         )
         return state
 
@@ -1810,7 +1837,30 @@ def skill_script_reference_constraints(
 
 
 def skill_structure_constraints(key: str, text: str) -> list[ConstraintResult]:
-    frontmatter = text[:600]
+    frontmatter_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
+    frontmatter_data: dict[str, Any] | None = None
+    if frontmatter_match is not None:
+        try:
+            parsed = yaml.safe_load(frontmatter_match.group(1))
+        except yaml.YAMLError:
+            parsed = None
+        if isinstance(parsed, dict):
+            frontmatter_data = parsed
+    skill_name = str((frontmatter_data or {}).get("name", "")).strip()
+    description = str((frontmatter_data or {}).get("description", "")).strip()
+    expected_name = key.rsplit(":", maxsplit=2)[-2]
+    valid_name = (
+        bool(skill_name)
+        and len(skill_name) <= 64
+        and skill_name == expected_name
+        and not skill_name.startswith("-")
+        and not skill_name.endswith("-")
+        and "--" not in skill_name
+        and all(
+            character == "-" or character.isdigit() or (character.isalpha() and character.islower())
+            for character in skill_name
+        )
+    )
     lowered = text.lower()
     has_ordered_workflow = "workflow" in lowered or "工作流程" in text or re.search(r"^\s*1[.、]", text, re.M) is not None
     has_failure_modes = (
@@ -1821,11 +1871,26 @@ def skill_structure_constraints(key: str, text: str) -> list[ConstraintResult]:
         marker in lowered for marker in ["do not", "never", "avoid", "guardrail", "blacklist"]
     ) or any(marker in text for marker in ["不得", "禁止", "避免", "约束", "护栏", "不应"])
     return [
-        ConstraintResult(text.strip().startswith("---"), f"{key}:frontmatter", "SKILL.md starts with YAML frontmatter"),
         ConstraintResult(
-            "name:" in frontmatter and "description:" in frontmatter,
+            frontmatter_match is not None,
+            f"{key}:frontmatter",
+            "SKILL.md starts with a complete YAML frontmatter block",
+        ),
+        ConstraintResult(
+            frontmatter_data is not None,
+            f"{key}:frontmatter_yaml",
+            "SKILL.md frontmatter is a valid YAML mapping",
+        ),
+        ConstraintResult(
+            bool(skill_name and description),
             f"{key}:name_description",
-            "frontmatter includes name and description",
+            "frontmatter includes non-empty name and description",
+        ),
+        ConstraintResult(
+            valid_name,
+            f"{key}:name_validation",
+            f"frontmatter name matches skill directory '{expected_name}' and follows Agent Skills naming rules",
+            "advisory",
         ),
         ConstraintResult(
             has_ordered_workflow,
@@ -1856,11 +1921,29 @@ def hard_constraint_failures(state: dict) -> list[dict[str, Any]]:
     ]
 
 
+def critical_constraint_results(constraints: Sequence[ConstraintResult]) -> list[ConstraintResult]:
+    return [
+        constraint
+        for constraint in constraints
+        if not constraint.passed
+        and constraint.severity == "hard"
+        and is_critical_constraint_failure(constraint.__dict__)
+    ]
+
+
+def critical_failure_summary(failures: Sequence[ConstraintResult]) -> str:
+    return "; ".join(f"{failure.name}: {failure.message}" for failure in failures)
+
+
 def is_critical_constraint_failure(failure: dict[str, Any]) -> bool:
     name = str(failure.get("name", ""))
     return (
-        name.endswith(":size_limit")
+        name.endswith(":non_empty")
+        or name.endswith(":size_limit")
         or name.endswith(":growth_limit")
+        or name.endswith(":frontmatter")
+        or name.endswith(":frontmatter_yaml")
+        or name.endswith(":name_description")
         or "runtime_neutrality" in name
         or ":script:" in name
         or ":boundary:" in name
@@ -2354,6 +2437,12 @@ def evaluate_response_with_judge(
         return deterministic_score, deterministic_feedback
 
     failures = hard_constraint_failures(state)
+    if constraint_cap(failures) == 0.0:
+        return (
+            deterministic_score,
+            f"{deterministic_feedback}\n\nReflection judge skipped: a deterministic critical constraint rejected "
+            "the candidate before runtime.",
+        )
     prompt = build_judge_prompt(example, state, deterministic_score, deterministic_feedback, failures)
     try:
         raw_judge = judge_lm(prompt)
@@ -3037,11 +3126,49 @@ def reflective_record(example: dict[str, Any], state: dict, score: float, feedba
         "Score": score,
         "Fitness": fitness,
         "Feedback": compact_feedback_for_reflection(feedback),
-        "Constraints": state.get("candidate_constraints", []),
-        "Candidate metrics": state.get("candidate_metrics", {}),
+        "Failed constraints": [
+            constraint
+            for constraint in state.get("candidate_constraints", [])
+            if isinstance(constraint, dict) and not constraint.get("passed", True)
+        ],
+        "Changed candidate metrics": compact_candidate_metrics_for_reflection(state.get("candidate_metrics", {})),
         "Recent trace": summarize_messages(state),
-        "Candidate excerpt": state.get("candidate_excerpt", {}),
+        "Project component map": compact_candidate_map_for_reflection(state.get("candidate_excerpt", {})),
     }
+
+
+def compact_candidate_metrics_for_reflection(metrics: Any) -> dict[str, Any]:
+    if not isinstance(metrics, Mapping):
+        return {}
+    growth = metrics.get("growth")
+    lengths = metrics.get("lengths")
+    if not isinstance(growth, Mapping):
+        return {}
+    changed_growth = {
+        str(key): float(value)
+        for key, value in growth.items()
+        if isinstance(value, int | float) and abs(float(value)) > 1e-12
+    }
+    changed_lengths = (
+        {key: lengths[key] for key in changed_growth if isinstance(lengths, Mapping) and key in lengths}
+        if changed_growth
+        else {}
+    )
+    return {"lengths": changed_lengths, "growth": changed_growth} if changed_growth else {}
+
+
+def compact_candidate_map_for_reflection(candidate: Any, limit_per_component: int = 500) -> dict[str, str]:
+    if not isinstance(candidate, Mapping):
+        return {}
+    compact: dict[str, str] = {}
+    for key, value in candidate.items():
+        text = str(value)
+        compact[str(key)] = (
+            text
+            if len(text) <= limit_per_component
+            else text[:limit_per_component] + "\n...[component excerpt truncated]"
+        )
+    return compact
 
 
 def compact_feedback_for_reflection(feedback: str) -> str:
@@ -3554,7 +3681,7 @@ def run_configured_skill_optimization(
     )
     if deployment_best_idx is not None and deployment_best_idx != result.best_idx:
         LOGGER.info(
-            "deployment candidate tie-break selected candidate=%d instead of gepa_best=%d at val_score=%.3f",
+            "deployment candidate selection chose candidate=%d instead of gepa_best=%d at val_score=%.3f",
             deployment_best_idx,
             result.best_idx,
             result.val_aggregate_scores[deployment_best_idx],

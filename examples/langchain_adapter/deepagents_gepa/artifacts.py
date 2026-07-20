@@ -83,6 +83,8 @@ def _state_summary(state: Mapping[str, Any]) -> dict[str, Any]:
         "trace_context_ratio": state.get("trace_context_ratio"),
         "evaluation_trace_mode": state.get("evaluation_trace_mode"),
         "evaluation_phase": state.get("evaluation_phase", "optimization"),
+        "candidate_runtime_skipped": bool(state.get("candidate_runtime_skipped", False)),
+        "candidate_runtime_skip_reason": state.get("candidate_runtime_skip_reason"),
     }
 
 
@@ -365,6 +367,8 @@ class RunArtifactStore:
             "fitness": state.get("fitness", {}),
             "constraints": state.get("candidate_constraints", []),
             "candidate_metrics": state.get("candidate_metrics", {}),
+            "candidate_runtime_skipped": bool(state.get("candidate_runtime_skipped", False)),
+            "candidate_runtime_skip_reason": state.get("candidate_runtime_skip_reason"),
             "state": _state_summary(state),
         }
         compact_record = {
@@ -382,6 +386,7 @@ class RunArtifactStore:
             "tool_supported_missing_expectations": record["fitness"].get("tool_supported_missing_expectations", []),
             "evaluation_phase": record["evaluation_phase"],
             "error": record["state"]["error"],
+            "candidate_runtime_skipped": record["candidate_runtime_skipped"],
             "detail_file": f"rollouts/{index:06d}.json",
         }
         with self._lock:
@@ -590,7 +595,7 @@ class RunArtifactStore:
             "best_idx": selected_best_idx,
             "gepa_best_idx": gepa_best_idx,
             "tie_break_applied": selected_best_idx != gepa_best_idx,
-            "selection_policy": "latest_accepted_on_validation_tie",
+            "selection_policy": "incumbent_on_validation_tie",
             "tied_best_indices": tied_best_indices,
             "best_val_score": (
                 val_scores[selected_best_idx]

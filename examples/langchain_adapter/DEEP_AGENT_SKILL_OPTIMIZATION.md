@@ -361,8 +361,17 @@ global diagnosis -> scoped component replacement
 
 The reflection model sees the candidate excerpt and feedback so it can diagnose
 the project globally, but it must still return only the selected component as a
-drop-in replacement. The prompt asks for an explicit proposal rationale before
-the final fenced replacement:
+drop-in replacement. For long evaluation contexts, the template repeats the
+authoritative component key and current component after the evaluation data so
+the model does not accidentally return a neighboring reference or skill. Passed
+constraints and unchanged size metrics are omitted from proposer input; their
+complete values remain in rollout artifacts. The prompt asks for an explicit
+proposal rationale before the final fenced replacement:
+
+Company-name keywords are treated only as weak discovery clues. Learned rules
+must require observable business or transaction evidence, and numeric
+thresholds must come from policy/evidence or be labeled as adjustable stress
+assumptions.
 
 ```text
 Failure pattern
@@ -700,12 +709,13 @@ another surface. If no valid key is found, it falls back to round-robin
 selection. `TOOL_CAPABILITY_GAP` trajectories are excluded from this vote.
 
 When the selected component is an explicitly managed learned/expert/experience
-reference, the selector mutates that reference together with its owning
-`SKILL.md`. The reference proposal captures scoped domain knowledge; the skill
-proposal adds or repairs the applicability trigger and lookup step that makes
-the runtime agent consult it. Ordinary reference files remain single-component
-mutations. This avoids accepting domain knowledge that is never read without
-turning every proposal into an unrestricted whole-project rewrite.
+reference, the selector first checks whether its owning `SKILL.md` already
+routes to that reference. If it does, only the reference is mutated. Otherwise,
+the selector also mutates the owning `SKILL.md` so the workflow can add the
+missing applicability trigger and lookup step. Ordinary reference files remain
+single-component mutations. This avoids both unread learned knowledge and the
+failure mode where a model copies the reference body into an already-correct
+`SKILL.md`.
 
 The default reflection minibatch size is `3`, so a proposal normally sees more
 than one trajectory and must explain evidence across examples. For small,
@@ -916,11 +926,13 @@ candidate. It is meant for review and diffing. The framework does not write the
 best candidate back into the source project automatically.
 
 GEPA's `best_idx` chooses the first candidate with the maximum validation
-score. For deployment artifacts, this harness chooses the newest accepted
-candidate when multiple candidates tie at that maximum. `result_summary.json`
-records the deployment choice as `best_idx`, preserves GEPA's original choice
-as `gepa_best_idx`, and includes `tie_break_applied` and `tied_best_indices`.
-The tie-break never changes scores and never consults the held-out test set.
+score. The deployment harness now follows the same conservative rule: a newer
+accepted candidate that merely ties does not replace the incumbent. All
+accepted candidates and diffs remain available for review.
+`result_summary.json` records the deployment choice as `best_idx`, preserves
+GEPA's original choice as `gepa_best_idx`, and includes `selection_policy`,
+`tie_break_applied`, and `tied_best_indices`. The held-out test set remains
+diagnostic and is never used for candidate selection.
 
 `agent_logs/` records each rollout: input, expected answer or rubric, final
 agent response, baseline response, score, fitness dimensions, constraints, and a
@@ -933,6 +945,12 @@ trace remains in the detailed rollout artifact for audit. Saving that raw file
 is not part of runtime summarization and is not required by the reflection
 model; it exists only when artifacts are enabled and is intended for human or
 offline analysis.
+
+Candidates that cannot load at runtime, including `SKILL.md` files with missing
+or invalid YAML frontmatter or missing `name`/`description`, receive a zero
+constraint cap. The harness skips Deep Agent creation for those candidates and
+records `candidate_runtime_skipped` with the failed gate, avoiding repeated
+Deep Agents loader warnings and wasted model calls.
 
 The proposer receives a compact reflective record: agent output, baseline,
 adaptive trace, and structured feedback are each included once. Duplicate

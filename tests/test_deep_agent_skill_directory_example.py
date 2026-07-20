@@ -384,14 +384,17 @@ def test_component_selector_ignores_no_failure_votes(tmp_path):
     assert selector(None, [{"score": 1.0, "feedback": no_failure_feedback}], [1.0], 1, candidate) == []
 
 
-def test_component_selector_mutates_learned_reference_with_owning_skill():
+def test_component_selector_only_mutates_owning_skill_when_reference_route_is_missing():
     example = _load_example_module()
     learned_key = "skill:credit-risk-review:reference/learned_expert_patterns.md"
     skill_key = "skill:credit-risk-review:SKILL.md"
     ordinary_reference_key = "skill:credit-risk-review:reference/cashflow_and_repayment.md"
     candidate = {
         learned_key: "# Learned",
-        skill_key: "---\nname: credit-risk-review\n---\n# Workflow",
+        skill_key: (
+            "---\nname: credit-risk-review\ndescription: Review credit risk.\n---\n"
+            "# Workflow\nRead `reference/learned_expert_patterns.md` when applicable."
+        ),
         ordinary_reference_key: "# Cash flow",
     }
     selector = example.DarwinFeedbackComponentSelector()
@@ -401,9 +404,7 @@ def test_component_selector_mutates_learned_reference_with_owning_skill():
         [
             {
                 "score": 0.2,
-                "feedback": "Scores:\n"
-                "- failure_classification: SKILL_DEFECT\n"
-                f"- suggested_component: {learned_key}",
+                "feedback": f"Scores:\n- failure_classification: SKILL_DEFECT\n- suggested_component: {learned_key}",
             }
         ],
         [0.2],
@@ -424,12 +425,29 @@ def test_component_selector_mutates_learned_reference_with_owning_skill():
         1,
         candidate,
     )
+    candidate_without_route = dict(candidate)
+    candidate_without_route[skill_key] = (
+        "---\nname: credit-risk-review\ndescription: Review credit risk.\n---\n# Workflow"
+    )
+    selected_without_route = selector(
+        None,
+        [
+            {
+                "score": 0.2,
+                "feedback": f"Scores:\n- failure_classification: SKILL_DEFECT\n- suggested_component: {learned_key}",
+            }
+        ],
+        [0.2],
+        2,
+        candidate_without_route,
+    )
 
-    assert selected == [learned_key, skill_key]
+    assert selected == [learned_key]
+    assert selected_without_route == [learned_key, skill_key]
     assert ordinary_selected == [ordinary_reference_key]
 
 
-def test_deployment_candidate_selection_prefers_latest_validation_tie():
+def test_deployment_candidate_selection_preserves_incumbent_on_validation_tie():
     example = _load_example_module()
     result = SimpleNamespace(
         candidates=[{"prompt": "seed"}, {"prompt": "accepted"}, {"prompt": "lower"}],
@@ -437,7 +455,7 @@ def test_deployment_candidate_selection_prefers_latest_validation_tie():
         best_idx=0,
     )
 
-    assert example.select_deployment_candidate_index(result) == 1
+    assert example.select_deployment_candidate_index(result) == 0
     result.val_aggregate_scores = [1.0, 1.0 + 1e-8, 0.8]
     assert example.select_deployment_candidate_index(result) == 1
 
@@ -495,6 +513,44 @@ def test_boundary_gate_blocks_skill_content_pasted_into_system_prompt(tmp_path):
     assert any(":boundary:" in failure["name"] for failure in failures)
     assert "- constraint_cap: 0.00" in feedback
     assert "- suggested_component: main:system_prompt" in feedback
+
+
+def test_invalid_skill_frontmatter_is_a_zero_cap_runtime_gate(tmp_path):
+    example = _load_example_module()
+    seed_spec = example.create_seed_workspace(tmp_path)
+    candidate, surfaces = example.build_candidate_from_deep_agent_spec(seed_spec)
+    baseline_candidate = dict(candidate)
+    skill_key = "skill:support-router:SKILL.md"
+    candidate[skill_key] = "# Support Router\n\nRoute support requests."
+    constraints = example.validate_candidate_constraints(candidate, baseline_candidate, surfaces)
+    failures = [constraint.__dict__ for constraint in constraints if not constraint.passed]
+    state = {
+        "messages": [example.AIMessage(content="<route>billing</route>")],
+        "baseline_response": "<route>billing</route>",
+        "candidate_excerpt": candidate,
+        "candidate_constraints": [constraint.__dict__ for constraint in constraints],
+    }
+
+    score, feedback = example.evaluate_response(
+        {"input": "I need my invoice.", "expected": "billing"},
+        state,
+    )
+
+    assert score == 0.0
+    assert any(failure["name"] == f"{skill_key}:frontmatter" for failure in failures)
+    assert any(failure["name"] == f"{skill_key}:frontmatter_yaml" for failure in failures)
+    assert "- constraint_cap: 0.00" in feedback
+
+    judge_calls = []
+    judged_score, judged_feedback = example.evaluate_response_with_judge(
+        {"input": "I need my invoice.", "expected": "billing"},
+        state,
+        lambda prompt: judge_calls.append(prompt) or '{"score": 1.0}',
+    )
+
+    assert judged_score == 0.0
+    assert judge_calls == []
+    assert "Reflection judge skipped" in judged_feedback
 
 
 def test_boundary_gate_blocks_bare_candidate_key_in_component_text(tmp_path):
@@ -1198,6 +1254,8 @@ def test_memory_reflection_template_discourages_copying_skill_content(tmp_path):
     assert "trigger, evidence to obtain, analysis or comparison" in template
     assert "not one universal checklist" in template
     assert "Preserve the natural language used by the current component" in template
+    assert template.rfind("Authoritative target component: `memory:AGENTS.md`") > template.index("<side_info>")
+    assert template.rfind("<curr_param>") > template.index("<side_info>")
 
 
 def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
@@ -1226,6 +1284,8 @@ def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
     assert "borrower-specific acquisition plan" in template
     assert "shared economic mechanism" in template
     assert "do not append one section per evaluation example" in template
+    assert "company name or keyword is only a weak discovery clue" in template
+    assert "Do not invent fixed cutoffs" in template
 
 
 def test_artifact_callback_writes_agent_logs_and_rejected_proposals(tmp_path):
@@ -1360,7 +1420,7 @@ def test_reflection_provider_errors_are_written_to_artifacts(tmp_path):
     assert (tmp_path / "run" / "reflection_errors" / "000000.prompt.txt").read_text(encoding="utf-8") == prompt
 
 
-def test_artifacts_materialize_selected_candidate_on_validation_tie(tmp_path):
+def test_artifacts_materialize_explicitly_selected_candidate(tmp_path):
     example = _load_example_module()
     run_dir = tmp_path / "run"
     store = example.RunArtifactStore(run_dir)
@@ -1402,6 +1462,7 @@ def test_artifacts_materialize_selected_candidate_on_validation_tie(tmp_path):
     assert summary["best_idx"] == 1
     assert summary["gepa_best_idx"] == 0
     assert summary["tie_break_applied"] is True
+    assert summary["selection_policy"] == "incumbent_on_validation_tie"
     assert summary["tied_best_indices"] == [0, 1]
     assert best_candidate == accepted_candidate
     assert (run_dir / "materialized_best_candidate" / "selected.txt").read_text(
@@ -1525,7 +1586,13 @@ def test_run_analyzer_deduplicates_proposal_lifecycle_events(tmp_path):
     (run_dir / "proposals" / "0001").mkdir(parents=True)
     (run_dir / "rejected_proposals" / "0001").mkdir(parents=True)
     (run_dir / "result_summary.json").write_text(
-        json.dumps({"best_val_score": 0.5, "val_aggregate_scores": [0.5]}),
+        json.dumps(
+            {
+                "best_val_score": 0.5,
+                "val_aggregate_scores": [0.5, 0.5],
+                "tied_best_indices": [0, 1],
+            }
+        ),
         encoding="utf-8",
     )
     (run_dir / "agent_logs" / "rollouts.jsonl").write_text("", encoding="utf-8")
@@ -1574,6 +1641,60 @@ def test_run_analyzer_deduplicates_proposal_lifecycle_events(tmp_path):
     assert summary["proposed_components"] == {"main:system_prompt": 1}
     assert summary["proposal_rationale_files"] == 1
     assert any("accepted candidate tied" in note for note in summary["diagnosis"])
+
+
+def test_run_analyzer_reports_unloadable_skill_and_held_out_regression(tmp_path):
+    analyzer = _load_analyzer_module()
+    run_dir = tmp_path / "run"
+    (run_dir / "agent_logs" / "rollouts").mkdir(parents=True)
+    (run_dir / "proposals").mkdir(parents=True)
+    (run_dir / "rejected_proposals").mkdir(parents=True)
+    (run_dir / "result_summary.json").write_text(
+        json.dumps(
+            {
+                "best_idx": 1,
+                "gepa_best_idx": 0,
+                "selection_policy": "latest_accepted_on_validation_tie",
+                "best_val_score": 1.0,
+                "val_aggregate_scores": [1.0, 1.0],
+                "tied_best_indices": [0, 1],
+                "final_test": {"improvement": -0.5},
+            }
+        ),
+        encoding="utf-8",
+    )
+    detail = {
+        "constraints": [
+            {
+                "passed": False,
+                "name": "skill:credit-risk-review:SKILL.md:frontmatter",
+                "message": "missing",
+                "severity": "hard",
+            }
+        ],
+        "candidate_runtime_skipped": True,
+        "fitness": {},
+    }
+    (run_dir / "agent_logs" / "rollouts" / "000000.json").write_text(
+        json.dumps(detail),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_logs" / "rollouts.jsonl").write_text(
+        json.dumps({"score": 0.0, "detail_file": "rollouts/000000.json"}) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "proposals" / "index.jsonl").write_text(
+        json.dumps({"iteration": 1, "status": "accepted", "components": ["skill:credit-risk-review:SKILL.md"]}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = analyzer.summarize_run(run_dir)
+
+    assert summary["candidate_runtime_skipped_count"] == 1
+    assert summary["unloadable_skill_failures"] == {"skill:credit-risk-review:SKILL.md:frontmatter": 1}
+    assert any("Runtime-unloadable SKILL.md" in note for note in summary["diagnosis"])
+    assert any("Held-out test regressed by 0.500" in note for note in summary["diagnosis"])
+    assert any("legacy policy deployed the newest" in note for note in summary["diagnosis"])
 
 
 def test_run_analyzer_excludes_no_failure_from_rejected_failure_class(tmp_path):
@@ -1765,6 +1886,35 @@ def test_repository_toml_examples_load_and_run(config_name, tmp_path):
         graph = graph_entry({})
         assert type(graph).__name__ == "CompiledStateGraph"
         assert not hasattr(graph, "gepa_deep_agent_spec")
+
+
+def test_configured_rollout_skips_agent_creation_for_unloadable_skill(monkeypatch):
+    example = _load_example_module()
+    config_path = (
+        Path(__file__).parents[1] / "examples" / "langchain_adapter" / "deepagents_gepa_configs" / "manual.toml"
+    )
+    project = example.build_candidate_from_deep_agent_project(example.load_deepagents_gepa_config(config_path))
+    candidate = dict(project.candidate)
+    candidate["skill:support-router:SKILL.md"] = "# Missing frontmatter"
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("critical candidate should be rejected before agent or baseline execution")
+
+    monkeypatch.setattr(example, "create_deep_agent_from_application", unexpected_call)
+    monkeypatch.setattr(example, "run_configured_baseline_for_example", unexpected_call)
+    monkeypatch.setattr(example, "configured_runtime_application", unexpected_call)
+
+    state = example.configured_rollout(
+        candidate,
+        {"input": "I need an invoice."},
+        ToolFriendlyFakeChatModel(responses=[]),
+        project,
+        project.candidate,
+    )
+
+    assert state["candidate_runtime_skipped"] is True
+    assert "frontmatter" in state["candidate_runtime_skip_reason"]
+    assert state["baseline_response"] == ""
 
 
 def test_credit_approval_demo_loads_expert_risk_section_dataset():

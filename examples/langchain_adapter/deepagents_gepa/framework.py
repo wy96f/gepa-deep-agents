@@ -14,10 +14,6 @@ from math import isclose
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-SOFTENER_PATTERN = re.compile(
-    r"\b(consider|maybe|perhaps|flexibly|as appropriate|if possible|you may want to)\b",
-    re.I,
-)
 SUGGESTED_COMPONENT_RE = re.compile(r"(?m)^-\s*suggested_component:\s*(?P<component>\S+)\s*$")
 MUTATION_ELIGIBLE_RE = re.compile(r"(?mi)^-\s*mutation_eligible:\s*(?P<eligible>true|false)\s*$")
 NON_ACTIONABLE_FAILURES = frozenset(
@@ -245,17 +241,18 @@ class DefaultReflectionTemplateRegistry:
             "- Tool gaps can coexist with text-actionable failures. Improve missing reusable methodology or supported "
             "tool usage when feedback selects this component, while preserving each unavailable source as an explicit "
             "tool backlog item rather than pretending the replacement can retrieve it.\n"
-            "- Do not universalize a rule from one example. State observable applicability signals, relevant industries "
-            "or business models, and non-applicable cases. Use examples to clarify scope, not as a closed hardcoded list.\n"
+            "- Do not universalize a rule from one example. Scope it with the smallest observable condition that matters "
+            "when it could regress other cases. Use industries as examples of a mechanism, not a closed hardcoded list.\n"
             "- A company name or keyword is only a weak discovery clue. Do not use it alone to activate a risk "
             "conclusion; require business-model, transaction, financial, asset, or financing evidence.\n"
             "- Do not persist evaluator-only company names, dates, amounts, or invented numeric thresholds. A threshold "
             "must cite an applicable policy or evidence basis; otherwise express an entity-relative comparison or a "
             "clearly labeled adjustable stress scenario.\n"
-            "- Applicability signals are conditional observations, not one universal checklist. Evidence to obtain is a "
-            "task-specific acquisition plan, not a fixed value known in advance. Adapt both to the current business "
-            "model and mark unsupported acquisition as TOOL_CAPABILITY_GAP. Follow the current output contract when "
-            "deciding whether uncertainty should be omitted or briefly labeled; never present it as fact.\n"
+            "- Do not force every lesson into a full trigger/evidence/analysis/consequence template. Include only the "
+            "non-obvious condition, evidence distinction, comparison, or transmission logic that changes behavior. "
+            "Adapt it to the current business model and mark unsupported acquisition as TOOL_CAPABILITY_GAP. Follow the "
+            "current output contract when deciding whether uncertainty should be omitted or briefly labeled; never "
+            "present it as fact.\n"
             "- Check cross-example regression risk. If a rule helps one scope but may hurt another, make the condition "
             "explicit instead of applying the rule globally.\n"
             "- Add only the knowledge increment the runtime model is unlikely to recover reliably on its own. Prefer a "
@@ -264,8 +261,8 @@ class DefaultReflectionTemplateRegistry:
             "or a task-required decision criterion "
             "only when it changes how the agent should investigate or decide; do not expand every reminder into a "
             "fixed multi-section template.\n"
-            "- Avoid empty guidance such as 'analyze comprehensively', 'strengthen attention', or 'verify as needed' "
-            "unless it is followed by concrete evidence, method, and decision criteria.\n"
+            "- Avoid empty guidance such as 'analyze comprehensively', 'strengthen attention', or 'verify as needed'. A "
+            "new reminder must name at least one concrete distinction or relationship that changes investigation or reasoning.\n"
             "- Keep names, paths, tool names, and output contracts consistent with the current component and feedback.\n"
             "- Preserve the natural language used by the current component unless the feedback explicitly requires a "
             "language change.\n"
@@ -449,8 +446,9 @@ class DefaultProposalReviewer:
             "drop-in replacement before any expensive agent rollout.\n\n"
             "Judge the proposal holistically:\n"
             "1. Mutation eligibility: hidden evaluator facts may score behavior, but they may drive a text mutation "
-            "only when runtime evidence, an available-but-skipped tool, or repeated independent examples support a "
-            "reusable lesson. Missing external data alone is a tool backlog item, not knowledge to memorize.\n"
+            "only when checkpoint-specific runtime evidence or an available-but-skipped matching tool supports a reusable "
+            "lesson. Repeated examples may strengthen generalization, but cannot substitute for unavailable runtime data. "
+            "Missing external data alone is a tool backlog item, not knowledge to memorize.\n"
             "2. Trajectory attribution: distinguish a missing tool, a skipped tool, bad call arguments, runtime/upstream "
             "failure, insufficient tool results, and successful evidence omitted from analysis. REJECT a text mutation "
             "when the remediation belongs only to tool implementation, credentials, dependencies, or dataset mapping.\n"

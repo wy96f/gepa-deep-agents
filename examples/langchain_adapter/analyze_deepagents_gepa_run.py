@@ -61,19 +61,21 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
 
     scores = [float(row.get("score", 0.0)) for row in optimization_rollouts]
     errors = Counter(error for row in optimization_rollouts if (error := rollout_error(row)))
-    boundary_failures = Counter(
-        constraint.get("name")
+    boundary_failures: Counter[str] = Counter(
+        str(constraint["name"])
         for detail in rollout_details
         for constraint in detail.get("constraints", [])
         if isinstance(constraint, dict)
+        and constraint.get("name")
         and not constraint.get("passed", True)
         and ":boundary:" in str(constraint.get("name", ""))
     )
-    hard_constraint_failures = Counter(
-        constraint.get("name")
+    hard_constraint_failures: Counter[str] = Counter(
+        str(constraint["name"])
         for detail in rollout_details
         for constraint in detail.get("constraints", [])
         if isinstance(constraint, dict)
+        and constraint.get("name")
         and not constraint.get("passed", True)
         and str(constraint.get("severity", "hard")) == "hard"
     )
@@ -111,6 +113,24 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         gap
         for detail in rollout_details
         for gap in detail.get("fitness", {}).get("incomplete_tool_result_expectations", [])
+    )
+    runtime_supported_missing_checkpoints = Counter(
+        item
+        for detail in rollout_details
+        for item in detail.get("fitness", {}).get("runtime_supported_missing_checkpoints", [])
+    )
+    tool_actionable_missing_checkpoints = Counter(
+        item
+        for detail in rollout_details
+        for item in detail.get("fitness", {}).get("tool_actionable_missing_checkpoints", [])
+    )
+    tool_blocked_missing_checkpoints = Counter(
+        item
+        for detail in rollout_details
+        for item in detail.get("fitness", {}).get("tool_blocked_missing_checkpoints", [])
+    )
+    unmapped_missing_checkpoints = Counter(
+        item for detail in rollout_details for item in detail.get("fitness", {}).get("unmapped_missing_checkpoints", [])
     )
     remediation_types = Counter(
         str(action.get("type"))
@@ -187,12 +207,14 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "tool_capability_gaps": dict(tool_capability_gaps.most_common()),
         "tool_capability_gap_unique_inputs": dict(tool_capability_gap_unique_inputs.most_common()),
         "missed_supported_expectations": dict(missed_supported_expectations.most_common()),
-        "missed_supported_expectation_unique_inputs": dict(
-            missed_supported_expectation_unique_inputs.most_common()
-        ),
+        "missed_supported_expectation_unique_inputs": dict(missed_supported_expectation_unique_inputs.most_common()),
         "missing_trace_expectations": dict(missing_trace_expectations.most_common()),
         "failed_tool_expectations": dict(failed_tool_expectations.most_common()),
         "incomplete_tool_result_expectations": dict(incomplete_tool_result_expectations.most_common()),
+        "runtime_supported_missing_checkpoints": dict(runtime_supported_missing_checkpoints.most_common()),
+        "tool_actionable_missing_checkpoints": dict(tool_actionable_missing_checkpoints.most_common()),
+        "tool_blocked_missing_checkpoints": dict(tool_blocked_missing_checkpoints.most_common()),
+        "unmapped_missing_checkpoints": dict(unmapped_missing_checkpoints.most_common()),
         "remediation_types": dict(remediation_types.most_common()),
         "remediation_owners": dict(remediation_owners.most_common()),
         "proposal_statuses": dict(proposal_statuses),
@@ -418,9 +440,7 @@ def diagnose(
         )
     if final_test is not None:
         positive_diagnostics = [
-            item
-            for item in final_test.get("diagnostic_candidates", [])
-            if float(item.get("delta_vs_seed", 0.0)) > 0.0
+            item for item in final_test.get("diagnostic_candidates", []) if float(item.get("delta_vs_seed", 0.0)) > 0.0
         ]
         if positive_diagnostics:
             strongest = max(positive_diagnostics, key=lambda item: float(item.get("delta_vs_seed", 0.0)))
@@ -530,10 +550,7 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
     print(f"Tool capability gaps by unique input: {summary['tool_capability_gap_unique_inputs']}")
     print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
-    print(
-        "Missed supported expectations by unique input: "
-        f"{summary['missed_supported_expectation_unique_inputs']}"
-    )
+    print(f"Missed supported expectations by unique input: {summary['missed_supported_expectation_unique_inputs']}")
     print(f"Missing trace expectations: {summary['missing_trace_expectations']}")
     print(f"Failed tool expectations: {summary['failed_tool_expectations']}")
     print(f"Incomplete tool results: {summary['incomplete_tool_result_expectations']}")

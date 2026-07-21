@@ -128,11 +128,19 @@ skills/credit-risk-review/reference/learned_expert_patterns.md
 {
   "input": "华东钢铁集团有限公司",
   "data": "七、项目风险点\n1、钢铁行业周期性风险...",
-  "rubric": "评价智能体是否自主取得相关证据、覆盖专家风险点并讲清风险逻辑。",
   "metadata": {
     "checkpoints": [
-      {"label": "钢铁行业周期性风险", "keywords": ["钢铁行业", "周期", "库存减值"]},
-      {"label": "高负债规模与债务结构压力风险", "keywords": ["资产负债率", "短贷长投"]}
+      {
+        "label": "钢铁行业周期性风险",
+        "keywords": ["钢铁行业", "周期", "库存减值"],
+        "evidence_expectations": ["行业周期信息获取"],
+        "evidence_mode": "all"
+      },
+      {
+        "label": "高负债规模与债务结构压力风险",
+        "keywords": ["资产负债率", "短贷长投"],
+        "evidence_expectations": ["债务结构信息获取"]
+      }
     ],
     "trace_expectations": [
       {
@@ -146,6 +154,10 @@ skills/credit-risk-review/reference/learned_expert_patterns.md
 }
 ```
 
+本示例把所有企业共用的评价标准放在 `credit_approval.toml` 的
+`[dataset].rubric`，JSONL 不再逐行复制同一段 rubric。行级 `rubric` 仍受支持，适合
+同一数据集中评价目标不同的样本，并优先于配置级默认值。
+
 数据没有 `expected` 标准答案。评审模型评价轨迹是否显示相关信息获取、最终输出是否
 覆盖专家风险点，以及是否说明风险传导。`metadata` 可选但很有用：
 `metadata.checkpoints` 是最终答案的严格覆盖清单；trace expectation 只有在轨迹中
@@ -157,6 +169,12 @@ SKILL.md、智能体文字和最终答案中的关键词都不能作为已取得
 因此应明确写出“查询什么事实、不查询什么、参数语义和返回边界”。工具调用参数、
 `task` 委派文字或智能体声称“准备查询某数据”都不用于推断工具能力；它们只能证明
 调用意图，不能证明系统确实具备该数据源。
+
+每个 checkpoint 通过 `evidence_expectations` 绑定自己需要的证据类别，默认
+`evidence_mode="all"`。因此，一次成功的财务查询不会再替客户、抵押、环保等无关
+风险点解锁文本优化。`evidence_mode="any"` 只用于多种证据来源任一即可支持同一判断
+的场景。中文 checkpoint 匹配会做 Unicode、全半角、空格和标点归一化；语义同义词
+仍应由清洗器生成少量 `keywords`/aliases，而不是依赖机械分词猜测。
 
 checkpoint 缺失始终会降低分数；不会因为当前缺工具或信息有限就放宽覆盖 cap。低分
 和“改什么”是两个问题，框架会结合轨迹生成 `remediation_actions`：
@@ -181,9 +199,22 @@ checkpoint 缺失始终会降低分数；不会因为当前缺工具或信息有
 
 ```bash
 uv run --no-sync python examples/langchain_adapter/clean_credit_risk_dataset.py \
+  --config examples/langchain_adapter/deepagents_gepa_configs/credit_approval.toml \
   --input-dir /path/to/risk-opinions \
   --output examples/langchain_adapter/deepagents_gepa_credit_approval_project/evals/project_risk_sections.jsonl
 ```
+
+清洗器优先从文件名取得企业名，再回退到 LLM 结果和正文。它读取同一份 agent config，
+从实际 tool name/description 建立工具清单，并保守填充 `tool_names`。需要更准确地从复杂
+专家章节提取 checkpoint、证据映射和工具名时可加：
+
+```bash
+  --extraction-model openai:your-model \
+  --extraction-model-kwargs '{"temperature": 0}'
+```
+
+LLM 只能从真实工具清单选择 `tool_names`；未知工具名会被删除。描述明确为政策查询、
+记录写入或“不查询企业事实”的工具不会被启发式当作证据获取能力。
 
 运行优化：
 
@@ -508,7 +539,8 @@ Fields mean:
 
 For deterministic tasks, `expected` is useful. For open-ended work such as due
 diligence report generation, `rubric` is usually more valuable than exact-match
-text.
+text. A rubric shared by the whole dataset should normally be written once as
+`[dataset].rubric` in TOML; a row-level rubric is only needed for an override.
 
 For expert-experience distillation, `data` can hold the expert section and
 `metadata.checkpoints` can make open-ended examples harder and less prone to
@@ -518,11 +550,10 @@ score saturation:
 {
   "input": "江北化工新材料股份有限公司",
   "data": "七、项目风险点\n1、技改项目合规闭环风险...",
-  "rubric": "评价 agent 是否自主获取相关信息、覆盖专家风险点并讲清风险逻辑；最终只输出有事实支持的风险点及影响。",
   "metadata": {
     "checkpoints": [
-      {"label": "技改项目合规闭环风险", "keywords": ["环评", "安全验收", "合规闭环"]},
-      {"label": "客户集中压力测试", "keywords": ["三家大型客户", "客户集中", "集中度压力测试"]}
+      {"label": "技改项目合规闭环风险", "keywords": ["环评", "安全验收", "合规闭环"], "evidence_expectations": ["环保安监信息获取"]},
+      {"label": "客户集中压力测试", "keywords": ["三家大型客户", "客户集中", "集中度压力测试"], "evidence_expectations": ["客户交易信息获取"]}
     ],
     "trace_expectations": [
       {"label": "环保安监信息获取", "tool_intent_keywords": ["环保", "安全生产", "环评"]},
@@ -595,10 +626,11 @@ vary by domain:
 - `ProposalReviewer`: how a generated proposal is checked before candidate
   rollout. The default reviewer can accept, compact/revise, or reject a
   proposal while preserving both the original and reviewed text as artifacts.
-  A revised proposal is reviewed once more by default, so a response that only
-  promises to remove duplication but does not actually do so is not silently
-  treated as approved. If the second review still requests revision, the
-  wrapper records `REVISE_EXHAUSTED` and emits an exact no-change proposal.
+  The first two passes may revise the proposal. The third and final pass must
+  accept or reject the corrected result, so a response that only promises to
+  remove duplication is not silently approved. If the terminal reviewer still
+  returns `REVISE`, the wrapper records `REVISE_EXHAUSTED` and emits an exact
+  no-change proposal.
 - `Constraint`: generic hard/advisory checks for candidate validity. Keep hard
   checks high-confidence and domain-neutral when possible; put softer judgment
   into the evaluator.
@@ -757,7 +789,9 @@ minibatches return an empty component selection, so the unchanged proposal is
 rejected rather than teaching prompts to invent unavailable data. The
 no-op-aware adapter reuses the just-completed evaluation for that unchanged
 candidate, so GEPA can record the diagnostic rejection without repeating the
-same expensive agent rollouts. The gap is still saved for the tool/MCP backlog.
+same expensive agent rollouts. It also recognizes proposals that differ only in
+trailing whitespace, which can arise when GEPA extracts a fenced replacement.
+The gap is still saved for the tool/MCP backlog.
 
 `INSUFFICIENT_RUNTIME_EVIDENCE` means the evaluator-only opinion identifies a
 miss, but the run does not establish which observable evidence or available
@@ -1078,8 +1112,11 @@ selected for deployment; proposal metadata records
 `acceptance_scope="candidate_pool_not_deployment"`.
 
 Rejected proposal summaries are also injected into later reflection prompts as
-short negative evidence. The prompt tells the model not to copy rejected text,
-only to avoid repeating the same failure pattern.
+short negative evidence. They include changed components, the compact proposal
+rationale, a bounded parent diff preview, score/rejection reason, and whether
+the edit was a semantic no-op. The prompt tells the model not to copy or
+paraphrase rejected text, but to choose a different causal fix or preserve the
+incumbent when no text mutation is justified.
 
 After a run, summarize effectiveness and failure patterns with:
 

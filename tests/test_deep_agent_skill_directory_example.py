@@ -525,6 +525,33 @@ def test_noop_aware_adapter_reuses_evaluation_when_selector_returns_no_component
     assert rollout_calls == 2
 
 
+def test_noop_aware_adapter_reuses_trailing_whitespace_only_proposal():
+    example = _load_example_module()
+    rollout_calls = 0
+
+    def rollout(_candidate, _row):
+        nonlocal rollout_calls
+        rollout_calls += 1
+        return {"messages": [example.AIMessage(content="same behavior")]}
+
+    adapter = example.NoOpAwareLangChainAdapter(
+        rollout_fn=rollout,
+        eval_fn=lambda _row, _state: (0.5, "same"),
+        num_threads=1,
+        show_progress=False,
+    )
+    batch = [{"input": "example"}]
+    parent = {"memory:AGENTS.md": "Keep the current behavior.\n"}
+    whitespace_only = {"memory:AGENTS.md": "Keep the current behavior."}
+
+    current = adapter.evaluate(batch, parent, capture_traces=True)
+    reused = adapter.evaluate(batch, whitespace_only, capture_traces=True)
+
+    assert rollout_calls == 1
+    assert reused.scores == current.scores
+    assert reused.num_metric_calls == 0
+
+
 def test_eval_caps_score_when_expected_route_is_missing(tmp_path):
     example = _load_example_module()
     seed_spec = example.create_seed_workspace(tmp_path)
@@ -1067,6 +1094,118 @@ def test_undeclared_task_delegation_does_not_claim_data_capability():
     assert diagnostics["tool_capability_gaps"] == ["集团穿透信息获取"]
 
 
+def test_successful_explicit_tool_with_empty_payload_is_incomplete_not_matched():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "trace_expectations": [
+                {
+                    "label": "客户交易信息获取",
+                    "tool_names": ["lookup_customers"],
+                    "tool_intent_keywords": ["客户", "回款"],
+                }
+            ]
+        }
+    }
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_customers",
+                        "args": {"company": "示例企业"},
+                        "id": "customers-empty-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="暂无可用数据",
+                tool_call_id="customers-empty-1",
+                name="lookup_customers",
+            ),
+        ],
+        "capability_tools": [{"owner": "main", "name": "lookup_customers", "description": "查询客户集中和回款信息。"}],
+    }
+
+    diagnostics = example.data_acquisition_diagnostics(row, state)
+
+    assert diagnostics["matched_trace_expectations"] == []
+    assert diagnostics["incomplete_tool_result_expectations"] == ["客户交易信息获取"]
+
+
+def test_unrelated_successful_tool_does_not_unlock_missing_checkpoint_mutation():
+    example = _load_example_module()
+    row = {
+        "input": "示例企业",
+        "rubric": "覆盖客户集中风险。",
+        "metadata": {
+            "checkpoints": [
+                {
+                    "label": "客户集中风险",
+                    "keywords": ["客户集中"],
+                    "evidence_expectations": ["客户交易信息获取"],
+                }
+            ],
+            "trace_expectations": [
+                {
+                    "label": "财务信息获取",
+                    "tool_names": ["lookup_financial"],
+                    "tool_intent_keywords": ["财务", "利润"],
+                },
+                {
+                    "label": "客户交易信息获取",
+                    "tool_names": ["lookup_customers"],
+                    "tool_intent_keywords": ["客户", "回款"],
+                },
+            ],
+        },
+    }
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_financial",
+                        "args": {"company": "示例企业"},
+                        "id": "financial-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="净利润增长10%。",
+                tool_call_id="financial-1",
+                name="lookup_financial",
+            ),
+            example.AIMessage(content="盈利保持增长。"),
+        ],
+        "baseline_response": "",
+        "candidate_excerpt": {"skill:risk:reference/learned.md": "# Learned"},
+        "candidate_constraints": [],
+        "capability_tools": [{"owner": "main", "name": "lookup_financial", "description": "查询企业财务、利润信息。"}],
+    }
+
+    _score, feedback = example.evaluate_response(row, state)
+
+    assert state["fitness"]["matched_trace_expectations"] == ["财务信息获取"]
+    assert state["fitness"]["tool_blocked_missing_checkpoints"] == ["客户集中风险"]
+    assert state["fitness"]["mutation_eligible"] is False
+    assert state["fitness"]["failure_classification"] == "TOOL_CAPABILITY_GAP"
+    assert "- suggested_component: none" in feedback
+
+
+def test_chinese_keyword_matching_ignores_full_width_punctuation_and_spacing():
+    example = _load_example_module()
+
+    assert example.checkpoint_matches(
+        "企业经营性\u3001现金流连续下降\uff0c短期偿债压力上升。",
+        {"label": "现金流风险", "keywords": ["经营性现金流"]},
+    )
+
+
 def test_missing_data_tool_is_classified_as_tool_capability_gap():
     example = _load_example_module()
     row = {
@@ -1099,7 +1238,13 @@ def test_failed_tool_runtime_is_reported_without_text_mutation():
         "input": "示例企业",
         "rubric": "覆盖司法执行风险。",
         "metadata": {
-            "checkpoints": [{"label": "司法执行风险", "keywords": ["司法执行", "被执行"]}],
+            "checkpoints": [
+                {
+                    "label": "司法执行风险",
+                    "keywords": ["司法执行", "被执行"],
+                    "evidence_expectations": ["司法工商信息获取"],
+                }
+            ],
             "trace_expectations": [
                 {
                     "label": "司法工商信息获取",
@@ -1160,7 +1305,13 @@ def test_failed_tool_arguments_prefer_tool_description_mutation():
         "input": "示例企业",
         "rubric": "覆盖司法执行风险。",
         "metadata": {
-            "checkpoints": [{"label": "司法执行风险", "keywords": ["司法执行", "被执行"]}],
+            "checkpoints": [
+                {
+                    "label": "司法执行风险",
+                    "keywords": ["司法执行", "被执行"],
+                    "evidence_expectations": ["司法工商信息获取"],
+                }
+            ],
             "trace_expectations": [
                 {
                     "label": "司法工商信息获取",
@@ -1332,7 +1483,13 @@ def test_runtime_tool_evidence_can_make_missing_expert_logic_text_actionable():
         "input": "示例制造企业",
         "rubric": "识别客户集中导致的回款和流动性风险。",
         "metadata": {
-            "checkpoints": [{"label": "客户集中风险", "keywords": ["客户集中", "流动性风险"]}],
+            "checkpoints": [
+                {
+                    "label": "客户集中风险",
+                    "keywords": ["客户集中", "流动性风险"],
+                    "evidence_expectations": ["客户交易信息获取"],
+                }
+            ],
             "trace_expectations": [
                 {
                     "label": "客户交易信息获取",
@@ -1601,7 +1758,7 @@ def test_memory_reflection_template_discourages_copying_skill_content(tmp_path):
     assert "Cross-case regression risk" in template
     assert "short signal -> concern -> consequence reminder" in template
     assert "do not expand every reminder into a fixed multi-section template" in template
-    assert "not one universal checklist" in template
+    assert "Do not force every lesson into a full trigger/evidence/analysis/consequence template" in template
     assert "Preserve the natural language used by the current component" in template
     assert template.rfind("Authoritative target component: `memory:AGENTS.md`") > template.index("<side_info>")
     assert template.rfind("<curr_param>") > template.index("<side_info>")
@@ -1630,7 +1787,7 @@ def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
     assert "observable signals or business model" in template
     assert "non-applicability" in template
     assert "signal -> concern -> consequence" in template
-    assert "task-specific acquisition plan" in template
+    assert "non-obvious condition, evidence distinction, comparison, or transmission logic" in template
     assert "shared economic mechanism" in template
     assert "do not append one section per evaluation example" in template
     assert "Do not repeat generic finance" in template
@@ -1720,10 +1877,7 @@ def test_proposal_reviewer_exhausted_revision_returns_no_change(tmp_path):
         "Proposal rationale:\n- add a universal workflow\n\n"
         "Final replacement:\n```markdown\n# Existing memory\n\nRepeat every skill and reference path here.\n```"
     )
-    review_output = (
-        "Decision: REVISE\nIssues:\n- still duplicates skill-owned workflow\n"
-        f"Reviewed response:\n{bloated}"
-    )
+    review_output = f"Decision: REVISE\nIssues:\n- still duplicates skill-owned workflow\nReviewed response:\n{bloated}"
     reflection = example.with_proposal_quality_review(
         lambda _prompt: bloated,
         lambda _prompt: review_output,
@@ -1739,7 +1893,7 @@ def test_proposal_reviewer_exhausted_revision_returns_no_change(tmp_path):
         json.loads(line)
         for line in (tmp_path / "run" / "proposal_reviews" / "index.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert [row["decision"] for row in review_index] == ["REVISE", "REVISE_EXHAUSTED"]
+    assert [row["decision"] for row in review_index] == ["REVISE", "REVISE", "REVISE_EXHAUSTED"]
 
 
 def test_final_test_artifact_records_tied_candidate_as_diagnostic_only(tmp_path):
@@ -1867,7 +2021,11 @@ def test_artifact_callback_writes_agent_logs_and_rejected_proposals(tmp_path):
     assert (tmp_path / "run" / "rejected_proposals" / "0001" / "candidate.json").exists()
     assert (tmp_path / "run" / "rejected_proposals" / "0001" / "diff_against_parent.patch").exists()
     assert (tmp_path / "run" / "rejected_proposals" / "0001" / "proposal_rationale.json").exists()
-    assert "Recent rejected proposal lessons" in callback.rejected_history_prompt_block()
+    rejected_history = callback.rejected_history_prompt_block()
+    assert "Recent rejected proposal lessons" in rejected_history
+    assert "Rejected rationale:" in rejected_history
+    assert "Rejected diff preview:" in rejected_history
+    assert "memory:AGENTS.md" in rejected_history
 
 
 def test_artifact_callback_marks_missing_proposal_rationale(tmp_path):
@@ -2513,9 +2671,7 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert "skill:credit-risk-review:SKILL.md" in project.candidate
     assert "main:tool:lookup_financial_snapshot:description" in project.candidate
     assert "不查询具体企业事实" in project.candidate["main:tool:lookup_policy:description"]
-    assert "利润、现金流、负债借款、票据和用信" in project.candidate[
-        "main:tool:lookup_financial_snapshot:description"
-    ]
+    assert "利润、现金流、负债借款、票据和用信" in project.candidate["main:tool:lookup_financial_snapshot:description"]
     assert "skill:credit-risk-review:reference/financial_statement_analysis.md" in project.candidate
     assert "skill:credit-risk-review:reference/cashflow_and_repayment.md" in project.candidate
     assert "skill:credit-risk-review:reference/collateral_and_guarantee.md" in project.candidate
@@ -2525,12 +2681,13 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert all("data" in row for row in rows)
     assert all("answer" not in row and "expected" not in row for row in rows)
     assert all("项目风险点" in row["data"] for row in rows)
-    assert all("智能体仅根据企业名称自主检索" in row["rubric"] for row in rows)
-    assert all("隐藏 checkpoint 仍应降低任务分数" in row["rubric"] for row in rows)
+    assert all("根据企业名称自主检索" in row["rubric"] for row in rows)
+    assert all("未覆盖的 checkpoint 仍降低任务分数" in row["rubric"] for row in rows)
     assert all("不要求或奖励审批意见" in row["rubric"] for row in rows)
     assert len(rows) >= 8
     assert all(row["metadata"].get("checkpoints") for row in rows)
     assert all(row["metadata"].get("trace_expectations") for row in rows)
+    assert all(checkpoint.get("evidence_expectations") for row in rows for checkpoint in row["metadata"]["checkpoints"])
     financial_expectations = [
         expectation
         for row in rows
@@ -2674,6 +2831,34 @@ def test_golden_dataset_supports_rubric_without_expected(tmp_path):
     assert rows[1]["metadata"]["topic"] == "auth"
 
 
+def test_dataset_level_rubric_is_applied_without_repeating_it_in_jsonl(tmp_path):
+    example = _load_example_module()
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "golden.jsonl").write_text(
+        "\n".join(json.dumps({"input": f"企业-{index}", "data": "专家风险点"}) for index in range(5)),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "deepagents_gepa.toml"
+    config_path.write_text(
+        f"""
+[agent]
+project_root = "{project_root.as_posix()}"
+
+[dataset]
+source = "golden_jsonl"
+path = "golden.jsonl"
+rubric = "统一评价规则"
+split_strategy = "random"
+""",
+        encoding="utf-8",
+    )
+
+    splits = example.load_dataset_from_config(example.load_deepagents_gepa_config(config_path))
+
+    assert all(row["rubric"] == "统一评价规则" for split in splits for row in split)
+
+
 def test_dataset_split_is_stratified_deterministic_and_disjoint():
     example = _load_example_module()
     rows = [
@@ -2790,6 +2975,45 @@ def test_credit_risk_cleaner_extracts_project_risk_section(tmp_path):
     assert any(item["label"] == "行业周期信息获取" for item in cleaned.metadata["trace_expectations"])
 
 
+def test_credit_risk_cleaner_prefers_filename_and_validates_llm_tool_names(tmp_path):
+    cleaner = _load_cleaner_module()
+    source = tmp_path / "南城建材实业有限公司风险评价意见书.txt"
+    source.write_text(
+        "七、项目风险点\n1、地产链客户信用传导风险\n客户集中且应收账款回款放缓。\n八、审批意见",
+        encoding="utf-8",
+    )
+
+    def extractor(_path, _section, _points, _inventory):
+        return {
+            "company_name": "LLM误识别企业",
+            "checkpoints": [
+                {
+                    "label": "地产链客户信用传导风险",
+                    "keywords": ["客户集中", "应收账款"],
+                    "evidence_expectations": ["客户交易信息获取"],
+                }
+            ],
+            "trace_expectations": [
+                {
+                    "label": "客户交易信息获取",
+                    "tool_intent_keywords": ["客户", "回款"],
+                    "tool_names": ["lookup_customers", "invented_tool"],
+                }
+            ],
+        }
+
+    cleaned = cleaner.clean_one_file(
+        source,
+        tool_inventory=[{"owner": "main", "name": "lookup_customers", "description": "查询企业客户集中度和回款信息。"}],
+        metadata_extractor=extractor,
+    )
+
+    assert cleaned is not None
+    assert cleaned.company_name == "南城建材实业有限公司"
+    assert cleaned.metadata["trace_expectations"][0]["tool_names"] == ["lookup_customers"]
+    assert cleaned.metadata["checkpoints"][0]["evidence_expectations"] == ["客户交易信息获取"]
+
+
 def test_credit_risk_cleaner_excludes_action_only_checkpoints():
     cleaner = _load_cleaner_module()
     risk_points = [
@@ -2810,8 +3034,15 @@ def test_credit_risk_cleaner_excludes_action_only_checkpoints():
 
     assert [item["label"] for item in checkpoints] == ["地产链客户信用传导风险"]
     assert all(item["label"] != "授信压降和回款监管必要性" for item in checkpoints)
-    assert "隐藏 checkpoint 仍应降低任务分数" in cleaner.DEFAULT_RUBRIC
-    assert "不要求或奖励审批意见" in cleaner.DEFAULT_RUBRIC
+    config_text = (
+        Path(__file__).parents[1]
+        / "examples"
+        / "langchain_adapter"
+        / "deepagents_gepa_configs"
+        / "credit_approval.toml"
+    ).read_text(encoding="utf-8")
+    assert "未覆盖的 checkpoint 仍降低任务分数" in config_text
+    assert "不要求或奖励审批意见" in config_text
     assert isinstance(expectations, list)
 
 

@@ -51,3 +51,5 @@ description = "Search filing excerpts for due-diligence risk evidence and source
 # or langfuse_labeled when traces have explicit scores/accepted outputs.
 source = "golden_jsonl"
 path = "evals/golden.jsonl"
+# Put one shared open-ended evaluation rubric here. A JSONL row may still override it.
+# rubric = "Evaluate evidence acquisition, task coverage, reasoning quality, and unsupported claims."

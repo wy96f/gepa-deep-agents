@@ -15,7 +15,7 @@
 
 信息获取只认可工具调用与成功结果成对出现。提示词、技能、智能体文字或最终答案中出现关键词，都不能证明已取得证据。工具能力判断使用种子版本的工具描述，避免通过修改描述虚构工具实现并不存在的数据源。
 
-专家 checkpoint 未覆盖时仍会降低分数。框架再根据轨迹区分后续动作：没有对应工具时新增工具或 MCP；有工具但未调用时优化调用触发；参数错误时优化调用语义；运行时失败时修工具或环境；已有证据但未形成风险点时再优化 skill/reference。评分不会因为缺工具而放宽，文本优化也不会替工具故障背锅。
+专家 checkpoint 未覆盖时仍会降低分数。每个 checkpoint 通过 `evidence_expectations` 关联自己的运行时证据，避免一次财务查询错误地替客户、抵押等风险点解锁文本优化。框架再根据轨迹区分后续动作：没有对应工具时新增工具或 MCP；有工具但未调用时优化调用触发；参数错误时优化调用语义；运行时失败时修工具或环境；已有对应证据但未形成风险点时再优化 skill/reference。评分不会因为缺工具而放宽，文本优化也不会替工具故障背锅。
 
 优化目标是萃取审批经验：
 
@@ -28,6 +28,13 @@
 
 示例使用混合工具能力：`lookup_financial_snapshot` 为部分企业返回独立的模拟财务数据，用于验证“已有证据但调用或分析不足”时的文本优化；客户交易、司法、抵质押等数据仍故意不提供，用于验证 `TOOL_CAPABILITY_GAP` 和工具建设清单。政策查询与风险记录工具不会被误认为企业数据源。GEPA 可以优化工具描述，但不会修改工具实现。
 
-可使用 `examples/langchain_adapter/clean_credit_risk_dataset.py` 将多份审批意见清洗为本示例的 JSONL 格式。
+统一评价规则保存在 `deepagents_gepa_configs/credit_approval.toml` 的 `[dataset].rubric`，不在每条 JSONL 中重复。可使用下列命令将多份审批意见清洗为本示例格式；清洗器会读取同一份配置中的真实工具名称和 description，LLM 结构化提取可通过 `--extraction-model` 按需启用。
+
+```bash
+uv run --no-sync python examples/langchain_adapter/clean_credit_risk_dataset.py \
+  --config examples/langchain_adapter/deepagents_gepa_configs/credit_approval.toml \
+  --input-dir /path/to/risk-opinions \
+  --output examples/langchain_adapter/deepagents_gepa_credit_approval_project/evals/project_risk_sections.jsonl
+```
 
 配置会按难度进行确定性的分层训练集、验证集和测试集划分。优化结束后，框架自动在留出的测试集上比较种子与最佳候选，并将结果保存在运行目录的 `final_test/` 中。

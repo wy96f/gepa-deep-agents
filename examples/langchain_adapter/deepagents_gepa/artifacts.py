@@ -891,23 +891,57 @@ class RunArtifactCallback:
         lines = ["Recent rejected proposal lessons (negative evidence, not text to copy):"]
         for item in self._rejected_history[-self.max_rejected_history :]:
             lines.append(
-                "- iteration {iteration}, components={components}, old_score={old_score}, new_score={new_score}, "
-                "reason={reason}, failure_classes={failure_classifications}".format(**item)
+                "- iteration {iteration}, changed={changed_components}, old_score={old_score}, new_score={new_score}, "
+                "reason={reason}, failure_classes={failure_classifications}, semantic_noop={semantic_noop}".format(
+                    **item
+                )
             )
+            if item.get("proposal_lessons"):
+                lines.append("  Rejected rationale: " + " | ".join(item["proposal_lessons"]))
+            if item.get("diff_preview"):
+                lines.append("  Rejected diff preview:\n" + str(item["diff_preview"]))
         lines.append(
-            "Use these lessons to avoid repeating the same failure pattern while still making the smallest useful change."
+            "Do not resubmit the rejected edit or merely paraphrase it. Use the evidence to choose a different causal fix, "
+            "or preserve the incumbent when no text mutation is justified."
         )
         return "\n".join(lines)
 
     def _remember_rejected(self, iteration: int, pending: Mapping[str, Any]) -> None:
+        parent_candidate = dict(pending.get("parent_candidate") or {})
+        candidate = dict(pending.get("candidate") or parent_candidate)
+        changed_components = [
+            key
+            for key in sorted(set(parent_candidate) | set(candidate))
+            if parent_candidate.get(key) != candidate.get(key)
+        ]
+        semantic_noop = bool(changed_components) and all(
+            str(parent_candidate.get(key, "")).rstrip() == str(candidate.get(key, "")).rstrip()
+            for key in changed_components
+        )
+        proposal_lessons = []
+        for component, raw_output in (pending.get("raw_lm_outputs") or {}).items():
+            rationale = _extract_proposal_rationale(str(raw_output))
+            if rationale:
+                compact = re.sub(r"\s+", " ", rationale).strip()[:700]
+                proposal_lessons.append(f"{component}: {compact}")
+        diff_preview = _candidate_diff(
+            candidate,
+            parent_candidate,
+            baseline_label="parent",
+            candidate_label="rejected",
+        )[:1200]
         self._rejected_history.append(
             {
                 "iteration": iteration,
                 "components": list(pending.get("components") or []),
+                "changed_components": changed_components,
                 "old_score": pending.get("old_score"),
                 "new_score": pending.get("new_score"),
                 "reason": str(pending.get("reason", ""))[:500],
                 "failure_classifications": list(pending.get("failure_classifications") or []),
+                "semantic_noop": semantic_noop,
+                "proposal_lessons": proposal_lessons[:3],
+                "diff_preview": diff_preview,
             }
         )
         if len(self._rejected_history) > self.max_rejected_history:

@@ -166,6 +166,7 @@ def clean_one_file(
             extracted_metadata.get("trace_expectations"),
             tool_inventory,
         ) or build_trace_expectations(risk_points, tool_inventory=tool_inventory)
+        expectations = ensure_financial_scope_expectation(expectations, risk_points, tool_inventory)
         metadata["trace_expectations"] = expectations
         linked_checkpoints = link_checkpoints_to_evidence(checkpoints, risk_points, expectations)
         metadata["checkpoints"] = linked_checkpoints
@@ -192,6 +193,7 @@ def enrich_existing_record(
     expectations = normalize_trace_expectations(metadata.get("trace_expectations"), tool_inventory)
     if not expectations:
         expectations = build_trace_expectations(risk_points, tool_inventory=tool_inventory)
+    expectations = ensure_financial_scope_expectation(expectations, risk_points, tool_inventory)
     metadata["trace_expectations"] = expectations
     linked_checkpoints = link_checkpoints_to_evidence(checkpoints, risk_points, expectations)
     metadata["checkpoints"] = linked_checkpoints
@@ -313,6 +315,10 @@ KEYWORD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("盈利质量信息获取", ("盈利", "利润", "毛利", "净利", "收入", "现金流", "回款")),
     ("债务结构信息获取", ("负债", "债务", "短期借款", "长期借款", "票据", "短贷长投", "财务费用", "融资")),
     ("集团穿透信息获取", ("集团", "合并报表", "子公司", "贸易板块", "生产基地", "担保", "互保", "隐性融资")),
+    (
+        "财务口径限制信息获取",
+        ("数据口径", "合并口径", "合并报表", "单体数据", "单体财务", "数据限制", "无法穿透", "信息不对称"),
+    ),
     ("合规处罚信息获取", ("环保", "安全生产", "行政处罚", "监管", "执法", "安监", "处罚")),
     ("司法工商信息获取", ("诉讼", "执行", "司法", "股权", "实控人", "工商", "变更")),
     ("抵质押担保信息获取", ("抵押", "质押", "担保", "顺位", "评估", "权属")),
@@ -369,6 +375,9 @@ def make_llm_metadata_extractor(model_name: str, model_kwargs: Mapping[str, Any]
             "trace expectation; 默认 evidence_mode=all。trace expectation 描述取得该证据的意图, 并且 "
             "tool_names 只能从给定工具清单中选择。工具描述明确为政策查询、写入/保存或不查询企业事实时, "
             "不得把它当成企业证据获取工具。没有对应工具就省略 tool_names, 不能猜工具能力。\n"
+            "如果风险点来自工具结果明确披露的数据范围限制(例如仅有集团合并口径、未取得子公司单体数据), "
+            "应把“财务口径限制信息获取”作为“集团穿透信息获取”的替代证据路径, checkpoint 使用 "
+            "evidence_mode=any; 不得把已经取得的口径限制误判为必须先取得完整集团穿透数据。\n"
             "不得把单个企业材料中的计算结果、比例或金额改写成通用阈值。只有材料明确表述为政策、制度或"
             "审批规则的阈值才能保留为规则, 其他情形使用趋势、同业、历史或结构比较。\n"
             "排除授信额度、放款条件、审批结论、贷后措施等纯行动项。\n"
@@ -451,12 +460,37 @@ def build_trace_expectations(
     for label, keywords in KEYWORD_GROUPS:
         matched = [keyword for keyword in keywords if keyword in compact]
         if matched:
-            labels[label] = matched
+            labels[label] = list(keywords) if label == "财务口径限制信息获取" else matched
     expectations = [
         {"label": label, "tool_intent_keywords": keywords}
         for label, keywords in sorted(labels.items(), key=lambda item: item[0])
     ]
     return attach_tool_names(expectations, tool_inventory)
+
+
+def ensure_financial_scope_expectation(
+    expectations: Sequence[Mapping[str, Any]],
+    risk_points: Sequence[Mapping[str, Any]],
+    tool_inventory: Sequence[Mapping[str, str]],
+) -> list[dict[str, Any]]:
+    """Keep the high-confidence scope-limit path even when an LLM extractor omits it."""
+    normalized = [dict(item) for item in expectations]
+    has_scope_risk = any(
+        is_financial_scope_limitation_risk(f"{point.get('label', '')} {point.get('text', '')}") for point in risk_points
+    )
+    if not has_scope_risk or any(item.get("label") == "财务口径限制信息获取" for item in normalized):
+        return normalized
+    keywords = next(keywords for label, keywords in KEYWORD_GROUPS if label == "财务口径限制信息获取")
+    return attach_tool_names(
+        [
+            *normalized,
+            {
+                "label": "财务口径限制信息获取",
+                "tool_intent_keywords": list(keywords),
+            },
+        ],
+        tool_inventory,
+    )
 
 
 def normalize_checkpoints(raw_checkpoints: Any) -> list[dict[str, Any]]:
@@ -575,11 +609,37 @@ def link_checkpoints_to_evidence(
             if scored:
                 best_score = max(score for score, _label in scored)
                 declared = sorted({label for score, label in scored if score == best_score and label})
+        checkpoint_text = " ".join(
+            [
+                str(checkpoint.get("label") or ""),
+                " ".join(_string_list(checkpoint.get("keywords"))),
+                str(points_by_label.get(str(checkpoint.get("label") or ""), {}).get("text") or ""),
+            ]
+        )
+        if is_financial_scope_limitation_risk(checkpoint_text):
+            alternative_paths = [
+                label for label in ("集团穿透信息获取", "财务口径限制信息获取") if label in valid_expectations
+            ]
+            if "财务口径限制信息获取" in alternative_paths:
+                unrelated_paths = [item for item in declared if item not in alternative_paths]
+                declared = [*unrelated_paths, *alternative_paths]
+                checkpoint["evidence_mode"] = "any"
         if declared:
             checkpoint["evidence_expectations"] = declared
             checkpoint["evidence_mode"] = "any" if str(checkpoint.get("evidence_mode")).lower() == "any" else "all"
         linked.append(checkpoint)
     return linked
+
+
+def is_financial_scope_limitation_risk(text: str) -> bool:
+    """Recognize explicit consolidated-only data limitations as observable evidence."""
+    compact = re.sub(r"\s+", "", text)
+    has_risk = any(term in compact for term in ("信息不对称", "数据穿透", "口径限制", "穿透缺失"))
+    has_consolidated_scope = any(term in compact for term in ("合并口径", "合并报表", "合并层面"))
+    has_missing_detail = any(
+        term in compact for term in ("单体", "子公司", "无法穿透", "未取得", "缺失", "仅有", "仅能")
+    )
+    return has_risk and has_consolidated_scope and has_missing_detail
 
 
 def tool_coverage_metadata(

@@ -30,7 +30,7 @@ def lookup_policy(topic: str) -> str:
 
 @tool
 def lookup_financial_snapshot(company_name: str) -> str:
-    """查询演示数据源中的企业财务快照; 覆盖利润、现金流、负债借款、票据和用信, 不提供其他外部信息."""
+    """查询演示数据源中的企业财务快照; 覆盖利润、现金流、负债借款、票据和用信, 并返回数据口径及数据限制."""
     snapshots = json.loads(FINANCIAL_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     snapshot = snapshots.get(company_name.strip())
     if snapshot is None:

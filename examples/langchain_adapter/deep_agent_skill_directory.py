@@ -4483,8 +4483,19 @@ def with_proposal_quality_review(
         original_response = proposal_callable(prompt)
         current_response = original_response
         review_passes = max(1, max_review_passes)
+        pending_revision_issues: tuple[str, ...] = ()
         for review_pass in range(1, review_passes + 1):
             terminal_pass = review_pass == review_passes
+
+            review_reflection_prompt = prompt
+            if pending_revision_issues:
+                issue_lines = "\n".join(f"- {issue}" for issue in pending_revision_issues)
+                review_reflection_prompt += (
+                    "\n\nA previous review returned REVISE but omitted the required complete reviewed_response. "
+                    "Do not ACCEPT the unchanged proposal. Return REVISE with a complete corrected Proposal rationale "
+                    "and Final replacement, or REJECT it if the selected component cannot be repaired.\n"
+                    f"Unresolved review issues:\n{issue_lines}"
+                )
 
             def pass_review_lm(review_prompt: str, terminal: bool = terminal_pass) -> str:
                 if terminal:
@@ -4496,14 +4507,14 @@ def with_proposal_quality_review(
 
             try:
                 review = reviewer.review(
-                    reflection_prompt=prompt,
+                    reflection_prompt=review_reflection_prompt,
                     proposal_response=current_response,
                     review_lm=pass_review_lm,
                 )
             except Exception as exc:  # pragma: no cover - provider-specific defensive fallback.
                 if artifact_store is not None:
                     artifact_store.write_proposal_review(
-                        prompt=prompt,
+                        prompt=review_reflection_prompt,
                         original_response=current_response,
                         decision="REVIEW_ERROR",
                         issues=(),
@@ -4522,18 +4533,34 @@ def with_proposal_quality_review(
 
             reviewed_response = current_response
             artifact_decision = review.decision
-            if review.decision == "REVISE" and review.reviewed_response is not None:
+            missing_revision = review.decision == "REVISE" and review.reviewed_response is None
+            if missing_revision:
+                if terminal_pass:
+                    reviewed_response = no_change_proposal_response(prompt, review.issues) or current_response
+                    artifact_decision = "REVISE_EXHAUSTED"
+                else:
+                    artifact_decision = "REVISE_MISSING_RESPONSE"
+                    pending_revision_issues = review.issues or (
+                        "reviewer requested revision without supplying a complete reviewed_response",
+                    )
+            elif review.decision == "REVISE" and review.reviewed_response is not None:
                 if terminal_pass:
                     reviewed_response = no_change_proposal_response(prompt, review.issues) or current_response
                     artifact_decision = "REVISE_EXHAUSTED"
                 else:
                     reviewed_response = review.reviewed_response
+                    pending_revision_issues = ()
             elif review.decision == "REJECT":
                 reviewed_response = no_change_proposal_response(prompt, review.issues) or current_response
+                pending_revision_issues = ()
+            elif review.decision == "ACCEPT" and pending_revision_issues:
+                reviewed_response = no_change_proposal_response(prompt, pending_revision_issues) or current_response
+                artifact_decision = "REJECT_UNRESOLVED_REVISION"
+                pending_revision_issues = ()
 
             if artifact_store is not None:
                 artifact_store.write_proposal_review(
-                    prompt=prompt,
+                    prompt=review_reflection_prompt,
                     original_response=current_response,
                     decision=artifact_decision,
                     issues=review.issues,
@@ -4550,7 +4577,9 @@ def with_proposal_quality_review(
                 len(reviewed_response),
             )
             current_response = reviewed_response
-            if artifact_decision != "REVISE" or review.reviewed_response is None:
+            if artifact_decision == "REVISE_MISSING_RESPONSE":
+                continue
+            if artifact_decision != "REVISE":
                 break
         return current_response
 

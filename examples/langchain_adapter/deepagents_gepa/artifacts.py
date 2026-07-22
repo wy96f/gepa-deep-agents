@@ -594,7 +594,8 @@ class RunArtifactStore:
             "error": error,
             "prompt_chars": len(prompt),
             "original_response_chars": len(original_response),
-            "reviewed_response_chars": len(reviewed_response or original_response),
+            "has_reviewed_response": reviewed_response is not None,
+            "reviewed_response_chars": len(reviewed_response) if reviewed_response is not None else None,
         }
         _write_json(review_dir / "metadata.json", record)
         (review_dir / "reflection_prompt.txt").write_text(prompt, encoding="utf-8")

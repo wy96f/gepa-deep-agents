@@ -492,7 +492,10 @@ class DefaultReflectionTemplateRegistry:
                 "Return a complete AGENTS.md memory file. Keep it concise and focused on durable operating "
                 "instructions, routing priorities, and when to use existing skills/tools. Do not copy SKILL.md, "
                 "reference/*.md, tool descriptions, or subagent prompts into AGENTS.md; refer to them by name "
-                "instead. Avoid large growth unless the feedback explicitly requires it."
+                "instead. AGENTS.md does not own domain methodology, industry risk patterns, case mappings, or "
+                "expert knowledge. When a domain reference is unread or unreachable, make only the smallest "
+                "execution-layer change needed to activate the owning skill/reference; do not move the domain lesson "
+                "into memory. Avoid large growth unless the feedback explicitly requires it."
             )
         if key.endswith(":SKILL.md"):
             return (
@@ -529,6 +532,10 @@ class DefaultReflectionTemplateRegistry:
             return (
                 "- Scope: durable project memory and stable operating preferences.\n"
                 "- Do not include YAML frontmatter, full SKILL.md content, reference files, tool descriptions, or subagent prompts.\n"
+                "- Own only execution policy: skill/tool activation, routing priority, and stable output contracts.\n"
+                "- Do not encode domain heuristics, industry patterns, checkpoint answers, or sample-specific mappings here.\n"
+                "- If feedback says the durable lesson belongs to a skill/reference but that resource was not consumed, "
+                "change only how AGENTS.md makes the existing resource reachable. Leave the lesson itself in its owning component.\n"
                 "- Mention when to consult existing skills/tools; do not duplicate their implementation details."
             )
         if key.endswith(":SKILL.md"):
@@ -670,7 +677,8 @@ class DefaultProposalReviewer:
             '"reviewed_response":"for REVISE, a complete Proposal rationale + Final replacement; otherwise same"}\n\n'
             "REJECT means the evidence does not justify any text mutation. REVISE means return a complete corrected "
             "proposal, not commentary or a patch. Before returning REVISE, re-read every issue you listed and verify "
-            "that the reviewed replacement resolves it rather than merely describing the intended fix.\n\n"
+            "that the reviewed replacement resolves it rather than merely describing the intended fix. A REVISE "
+            "decision without a complete reviewed_response is invalid and will be retried or rejected.\n\n"
             "Original optimization prompt:\n"
             f"{reflection_prompt}\n\n"
             "Original proposal:\n"
@@ -748,8 +756,7 @@ class DefaultProposalReviewer:
             if "Proposal rationale:" in reviewed_text and "Final replacement:" in reviewed_text:
                 reviewed_response = reviewed_text
             else:
-                decision = "ACCEPT"
-                issues = (*issues, "reviewer revision was malformed; original proposal retained")
+                issues = (*issues, "reviewer revision was malformed; a complete reviewed_response is required")
         return ProposalReview(
             decision=decision,
             issues=issues,

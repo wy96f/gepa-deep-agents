@@ -1448,6 +1448,72 @@ def test_unrelated_successful_tool_does_not_unlock_missing_checkpoint_mutation()
     assert "- suggested_component: none" in feedback
 
 
+def test_explicit_financial_scope_limit_unlocks_information_asymmetry_checkpoint():
+    example = _load_example_module()
+    row = {
+        "input": "华东钢铁集团有限公司",
+        "metadata": {
+            "checkpoints": [
+                {
+                    "label": "集团内部信息不对称风险",
+                    "keywords": ["信息不对称"],
+                    "evidence_expectations": ["集团穿透信息获取", "财务口径限制信息获取"],
+                    "evidence_mode": "any",
+                }
+            ],
+            "trace_expectations": [
+                {
+                    "label": "集团穿透信息获取",
+                    "tool_intent_keywords": ["集团", "子公司", "担保"],
+                },
+                {
+                    "label": "财务口径限制信息获取",
+                    "tool_names": ["lookup_financial_snapshot"],
+                    "tool_intent_keywords": ["数据口径", "数据限制"],
+                },
+            ],
+        },
+    }
+    response = "仅有集团合并口径且未取得子公司单体明细, 存在集团内部信息不对称风险。"
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_financial_snapshot",
+                        "args": {"company_name": "华东钢铁集团有限公司"},
+                        "id": "financial-scope-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content='{"数据口径":"集团合并口径","数据限制":"未取得子公司单体财务和担保明细"}',
+                tool_call_id="financial-scope-1",
+                name="lookup_financial_snapshot",
+            ),
+            example.AIMessage(content=response),
+        ],
+        "capability_tools": [
+            {
+                "owner": "main",
+                "name": "lookup_financial_snapshot",
+                "description": "查询企业财务快照以及数据口径和数据限制。",
+            }
+        ],
+    }
+
+    acquisition = example.data_acquisition_diagnostics(row, state)
+    matched, missing, coverage = example.rubric_checkpoint_results(row, response, acquisition)
+
+    assert acquisition["matched_trace_expectations"] == ["财务口径限制信息获取"]
+    assert acquisition["tool_capability_gaps"] == ["集团穿透信息获取"]
+    assert matched == ["集团内部信息不对称风险"]
+    assert missing == []
+    assert coverage == 1.0
+
+
 def test_chinese_keyword_matching_ignores_full_width_punctuation_and_spacing():
     example = _load_example_module()
 
@@ -2167,6 +2233,9 @@ def test_memory_reflection_template_discourages_copying_skill_content(tmp_path):
 
     assert "Do not copy SKILL.md" in template
     assert "reference/*.md" in template
+    assert "AGENTS.md does not own domain methodology" in template
+    assert "change only how AGENTS.md makes the existing resource reachable" in template
+    assert "Do not encode domain heuristics" in template
     assert "Optimize only the selected component" in template
     assert "rejected proposal lessons" in template
     assert "Proposal rationale" in template
@@ -2290,6 +2359,84 @@ def test_proposal_reviewer_rejects_to_exact_no_change():
     assert "Memorize hidden facts." not in result
 
 
+def test_proposal_reviewer_retries_revise_without_reviewed_response(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+    prompt = (
+        "Component boundary rules for `memory:AGENTS.md`:\n"
+        "Current target component (this is the only text you may replace):\n"
+        "```\n# Existing memory\n\nUse the existing skill.\n```\n\n"
+        "Before answering, verify the replacement."
+    )
+    original = (
+        "Proposal rationale:\n- copy a domain rule\n\n"
+        "Final replacement:\n```markdown\n# Existing memory\n\nAlways flag one company's risk.\n```"
+    )
+    revised = (
+        "Proposal rationale:\n- keep only the execution-layer fix\n\n"
+        "Final replacement:\n```markdown\n# Existing memory\n\nAlways load the existing skill before answering.\n```"
+    )
+    prompts: list[str] = []
+    outputs = iter(
+        [
+            json.dumps({"decision": "REVISE", "issues": ["domain knowledge belongs in reference"]}),
+            json.dumps(
+                {
+                    "decision": "REVISE",
+                    "issues": ["retain only skill activation"],
+                    "reviewed_response": revised,
+                }
+            ),
+            json.dumps({"decision": "ACCEPT", "issues": [], "reviewed_response": "same"}),
+        ]
+    )
+
+    def review_lm(review_prompt):
+        prompts.append(review_prompt)
+        return next(outputs)
+
+    reflection = example.with_proposal_quality_review(
+        lambda _prompt: original,
+        review_lm,
+        example.DefaultProposalReviewer(),
+        store,
+    )
+
+    assert reflection(prompt) == revised
+    assert "previous review returned REVISE but omitted" in prompts[1]
+    assert "Do not ACCEPT the unchanged proposal" in prompts[1]
+    review_index = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "proposal_reviews" / "index.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["decision"] for row in review_index] == ["REVISE_MISSING_RESPONSE", "REVISE", "ACCEPT"]
+    assert review_index[0]["has_reviewed_response"] is False
+    assert review_index[0]["reviewed_response_chars"] is None
+
+
+def test_proposal_reviewer_missing_revision_exhaustion_returns_no_change():
+    example = _load_example_module()
+    prompt = (
+        "Component boundary rules for `memory:AGENTS.md`:\n"
+        "Current target component (this is the only text you may replace):\n"
+        "```\n# Existing memory\n\nUse the existing skill.\n```\n\n"
+        "Before answering, verify the replacement."
+    )
+    reflection = example.with_proposal_quality_review(
+        lambda _prompt: (
+            "Proposal rationale:\n- copy hidden facts\n\n"
+            "Final replacement:\n```markdown\n# Existing memory\n\nMemorize hidden company facts.\n```"
+        ),
+        lambda _prompt: json.dumps({"decision": "REVISE", "issues": ["remove hidden facts"]}),
+        example.DefaultProposalReviewer(),
+    )
+
+    result = reflection(prompt)
+
+    assert "# Existing memory\n\nUse the existing skill." in result
+    assert "Memorize hidden company facts." not in result
+
+
 def test_proposal_reviewer_parses_json_and_caps_issue_chatter():
     example = _load_example_module()
     issues = [f"issue {index} " + ("x" * 600) for index in range(8)]
@@ -2306,6 +2453,24 @@ def test_proposal_reviewer_parses_json_and_caps_issue_chatter():
     assert review.decision == "REJECT"
     assert len(review.issues) == 5
     assert all(len(issue) <= 500 for issue in review.issues)
+
+
+def test_proposal_reviewer_does_not_accept_malformed_revision():
+    example = _load_example_module()
+
+    review = example.DefaultProposalReviewer._parse_output(
+        json.dumps(
+            {
+                "decision": "REVISE",
+                "issues": ["remove domain knowledge from memory"],
+                "reviewed_response": "Only reviewer commentary, without a complete replacement.",
+            }
+        )
+    )
+
+    assert review.decision == "REVISE"
+    assert review.reviewed_response is None
+    assert "complete reviewed_response is required" in review.issues[-1]
 
 
 def test_proposal_reviewer_receives_concrete_growth_and_overfit_advisories():
@@ -3321,6 +3486,20 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert all(row["metadata"].get("tool_coverage") in {"complete", "partial", "none"} for row in rows)
     assert all(row["metadata"].get("checkpoint_count") == len(row["metadata"]["checkpoints"]) for row in rows)
     assert all(checkpoint.get("evidence_expectations") for row in rows for checkpoint in row["metadata"]["checkpoints"])
+    steel_row = next(row for row in rows if row["input"] == "华东钢铁集团有限公司")
+    scope_checkpoint = next(
+        checkpoint
+        for checkpoint in steel_row["metadata"]["checkpoints"]
+        if checkpoint["label"] == "集团内部信息不对称风险"
+    )
+    assert scope_checkpoint["evidence_mode"] == "any"
+    assert scope_checkpoint["evidence_expectations"] == ["集团穿透信息获取", "财务口径限制信息获取"]
+    scope_expectation = next(
+        expectation
+        for expectation in steel_row["metadata"]["trace_expectations"]
+        if expectation["label"] == "财务口径限制信息获取"
+    )
+    assert scope_expectation["tool_names"] == ["lookup_financial_snapshot"]
     financial_expectations = [
         expectation
         for row in rows
@@ -3746,6 +3925,59 @@ def test_credit_risk_cleaner_excludes_action_only_checkpoints():
     assert "未覆盖的 checkpoint 仍降低任务分数" in config_text
     assert "不要求或奖励审批意见" in config_text
     assert isinstance(expectations, list)
+
+
+def test_credit_risk_cleaner_treats_explicit_consolidated_scope_limit_as_alternative_evidence(tmp_path):
+    cleaner = _load_cleaner_module()
+    source = tmp_path / "华东钢铁集团有限公司风险评价意见书.txt"
+    source.write_text(
+        "七、项目风险点\n"
+        "1、集团内部信息不对称风险\n"
+        "集团仅有合并口径报表, 未取得子公司单体财务和担保明细, 无法穿透各主体真实情况。\n"
+        "八、审批意见",
+        encoding="utf-8",
+    )
+
+    def extractor(_path, _section, _points, _inventory):
+        return {
+            "company_name": "LLM识别名称",
+            "checkpoints": [
+                {
+                    "label": "集团内部信息不对称风险",
+                    "keywords": ["信息不对称", "合并报表"],
+                    "evidence_expectations": ["集团穿透信息获取"],
+                    "evidence_mode": "all",
+                }
+            ],
+            "trace_expectations": [
+                {
+                    "label": "集团穿透信息获取",
+                    "tool_intent_keywords": ["集团", "子公司", "担保"],
+                }
+            ],
+        }
+
+    cleaned = cleaner.clean_one_file(
+        source,
+        tool_inventory=[
+            {
+                "owner": "main",
+                "name": "lookup_financial_snapshot",
+                "description": "查询企业财务快照以及数据口径和数据限制。",
+            }
+        ],
+        metadata_extractor=extractor,
+    )
+
+    assert cleaned is not None
+    scope_expectation = next(
+        item for item in cleaned.metadata["trace_expectations"] if item["label"] == "财务口径限制信息获取"
+    )
+    assert scope_expectation["tool_names"] == ["lookup_financial_snapshot"]
+    checkpoint = cleaned.metadata["checkpoints"][0]
+    assert checkpoint["evidence_mode"] == "any"
+    assert checkpoint["evidence_expectations"] == ["集团穿透信息获取", "财务口径限制信息获取"]
+    assert cleaned.metadata["tool_coverage"] == "complete"
 
 
 def test_langfuse_experience_mines_user_questions_without_trusting_final_answer(tmp_path):

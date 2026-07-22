@@ -167,7 +167,9 @@ def clean_one_file(
             tool_inventory,
         ) or build_trace_expectations(risk_points, tool_inventory=tool_inventory)
         metadata["trace_expectations"] = expectations
-        metadata["checkpoints"] = link_checkpoints_to_evidence(checkpoints, risk_points, expectations)
+        linked_checkpoints = link_checkpoints_to_evidence(checkpoints, risk_points, expectations)
+        metadata["checkpoints"] = linked_checkpoints
+        metadata.update(tool_coverage_metadata(linked_checkpoints, expectations))
     return CleanedRiskSection(
         source_file=source_file,
         company_name=company_name,
@@ -191,7 +193,9 @@ def enrich_existing_record(
     if not expectations:
         expectations = build_trace_expectations(risk_points, tool_inventory=tool_inventory)
     metadata["trace_expectations"] = expectations
-    metadata["checkpoints"] = link_checkpoints_to_evidence(checkpoints, risk_points, expectations)
+    linked_checkpoints = link_checkpoints_to_evidence(checkpoints, risk_points, expectations)
+    metadata["checkpoints"] = linked_checkpoints
+    metadata.update(tool_coverage_metadata(linked_checkpoints, expectations))
     metadata.pop("risk_points", None)
     enriched["metadata"] = metadata
     return enriched
@@ -358,10 +362,15 @@ def make_llm_metadata_extractor(model_name: str, model_kwargs: Mapping[str, Any]
         prompt = (
             "你是中国规上企业信贷风险评价数据清洗器。只整理专家意见, 不补充材料中没有的企业事实。\n"
             "从项目风险点章节提取: company_name、checkpoints、trace_expectations。\n"
-            "每个 checkpoint 保留风险点名称和少量中文别名, 并通过 evidence_expectations 关联到一项或多项 "
+            "每个 checkpoint 只表达一个可独立评分的风险机制。标题中含“与、和、及”等复合关系时, 如果正文包含"
+            "可分别验证的机制, 应拆成多个 checkpoint; 不要把盈利波动和盈利质量、债务规模和债务结构等合成"
+            "一个全有或全无的 checkpoint。每个 checkpoint 保留风险点名称和少量中文别名, 并通过 "
+            "evidence_expectations 关联到一项或多项 "
             "trace expectation; 默认 evidence_mode=all。trace expectation 描述取得该证据的意图, 并且 "
             "tool_names 只能从给定工具清单中选择。工具描述明确为政策查询、写入/保存或不查询企业事实时, "
             "不得把它当成企业证据获取工具。没有对应工具就省略 tool_names, 不能猜工具能力。\n"
+            "不得把单个企业材料中的计算结果、比例或金额改写成通用阈值。只有材料明确表述为政策、制度或"
+            "审批规则的阈值才能保留为规则, 其他情形使用趋势、同业、历史或结构比较。\n"
             "排除授信额度、放款条件、审批结论、贷后措施等纯行动项。\n"
             "仅返回 JSON:"
             '{"company_name":"", "checkpoints":[{"label":"", "keywords":[], '
@@ -571,6 +580,48 @@ def link_checkpoints_to_evidence(
             checkpoint["evidence_mode"] = "any" if str(checkpoint.get("evidence_mode")).lower() == "any" else "all"
         linked.append(checkpoint)
     return linked
+
+
+def tool_coverage_metadata(
+    checkpoints: Sequence[Mapping[str, Any]],
+    expectations: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize which expert checkpoints have an explicitly declared evidence tool."""
+    supported_expectations = {
+        str(expectation.get("label") or "") for expectation in expectations if trace_expectation_tool_names(expectation)
+    }
+    supported_count = 0
+    linked_count = 0
+    for checkpoint in checkpoints:
+        required = _string_list(checkpoint.get("evidence_expectations"))
+        if not required:
+            continue
+        linked_count += 1
+        if str(checkpoint.get("evidence_mode") or "all").lower() == "any":
+            supported = any(label in supported_expectations for label in required)
+        else:
+            supported = all(label in supported_expectations for label in required)
+        supported_count += int(supported)
+
+    checkpoint_count = len(checkpoints)
+    if not checkpoint_count or not linked_count:
+        coverage = "unmapped"
+    elif supported_count == checkpoint_count:
+        coverage = "complete"
+    elif supported_count:
+        coverage = "partial"
+    else:
+        coverage = "none"
+    return {
+        "tool_coverage": coverage,
+        "tool_supported_checkpoint_count": supported_count,
+        "linked_checkpoint_count": linked_count,
+        "checkpoint_count": checkpoint_count,
+    }
+
+
+def trace_expectation_tool_names(expectation: Mapping[str, Any]) -> list[str]:
+    return _string_list(expectation.get("tool_names"))
 
 
 def keyword_matches(text: str, keyword: str) -> bool:

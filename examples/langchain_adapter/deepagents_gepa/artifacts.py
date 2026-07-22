@@ -14,7 +14,7 @@ from typing import Any
 
 
 def _jsonable(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _jsonable(asdict(value))
     if isinstance(value, Path):
         return str(value)
@@ -266,6 +266,58 @@ def _score_mean(scores: Sequence[float]) -> float:
     return sum(scores) / len(scores) if scores else 0.0
 
 
+def _metric_calls(evaluation: Any, default: int) -> int:
+    calls = getattr(evaluation, "num_metric_calls", None)
+    return default if calls is None else int(calls)
+
+
+def _without_shared_rubric(
+    examples: Sequence[Mapping[str, Any]],
+    shared_rubric: str | None,
+) -> list[dict[str, Any]]:
+    rows = []
+    for example in examples:
+        row = dict(example)
+        if shared_rubric and row.get("rubric") == shared_rubric:
+            row.pop("rubric", None)
+        rows.append(row)
+    return rows
+
+
+def _evaluation_cohort_rows(examples: Sequence[Mapping[str, Any]], evaluation: Any) -> dict[str, Any]:
+    outputs = list(getattr(evaluation, "outputs", []) or [])
+    scores = [float(score) for score in list(getattr(evaluation, "scores", []) or [])]
+    cohorts: dict[str, list[dict[str, Any]]] = {}
+    for index, example in enumerate(examples):
+        output = outputs[index] if index < len(outputs) else None
+        state = output.get("state", {}) if isinstance(output, Mapping) else {}
+        fitness = state.get("fitness", {}) if isinstance(state, Mapping) else {}
+        classification = str(fitness.get("failure_classification") or "UNKNOWN")
+        if bool(fitness.get("mutation_eligible", False)):
+            cohort = "text_actionable"
+        elif classification in {"TOOL_CAPABILITY_GAP", "INSUFFICIENT_RUNTIME_EVIDENCE"}:
+            cohort = "tool_blocked"
+        elif classification == "NO_FAILURE":
+            cohort = "satisfied"
+        else:
+            cohort = "other_diagnostic"
+        cohorts.setdefault(cohort, []).append(
+            {
+                "input": example.get("input"),
+                "score": scores[index] if index < len(scores) else None,
+                "failure_classification": classification,
+            }
+        )
+    return {
+        name: {
+            "count": len(rows),
+            "mean": _score_mean([float(row["score"]) for row in rows if row["score"] is not None]),
+            "rows": rows,
+        }
+        for name, rows in cohorts.items()
+    }
+
+
 class RunArtifactStore:
     """Persist run inputs, candidates, and final materialized artifacts."""
 
@@ -277,6 +329,9 @@ class RunArtifactStore:
         self._reflection_error_counter = 0
         self._proposal_review_counter = 0
         self._seed_candidate: dict[str, str] = {}
+        self._preflight_summary: dict[str, Any] | None = None
+        self._final_test_metric_calls = 0
+        self._shared_rubric: str | None = None
 
     @classmethod
     def create(cls, base_dir: str | Path, run_name: str | None = None) -> RunArtifactStore:
@@ -306,9 +361,66 @@ class RunArtifactStore:
         _write_json(self.run_dir / "project" / "surface_manifest.json", getattr(project, "surfaces", {}))
         self._seed_candidate = dict(getattr(project, "candidate", {}) or {})
         _write_json(self.run_dir / "project" / "seed_candidate_keys.json", list(self._seed_candidate))
-        _write_jsonl(self.run_dir / "datasets" / "train.jsonl", train_set)
-        _write_jsonl(self.run_dir / "datasets" / "val.jsonl", val_set)
-        _write_jsonl(self.run_dir / "datasets" / "test.jsonl", test_set)
+        shared_rubric = getattr(getattr(config, "dataset", None), "rubric", None)
+        self._shared_rubric = str(shared_rubric) if shared_rubric else None
+        if shared_rubric:
+            rubric_path = self.run_dir / "datasets" / "rubric.md"
+            rubric_path.parent.mkdir(parents=True, exist_ok=True)
+            rubric_path.write_text(str(shared_rubric).rstrip() + "\n", encoding="utf-8")
+        _write_jsonl(self.run_dir / "datasets" / "train.jsonl", _without_shared_rubric(train_set, shared_rubric))
+        _write_jsonl(self.run_dir / "datasets" / "val.jsonl", _without_shared_rubric(val_set, shared_rubric))
+        _write_jsonl(self.run_dir / "datasets" / "test.jsonl", _without_shared_rubric(test_set, shared_rubric))
+
+    def write_actionability_preflight(
+        self,
+        *,
+        examples: Sequence[Mapping[str, Any]],
+        evaluation: Any,
+        partition: Any,
+        optimization_examples: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        outputs = list(getattr(evaluation, "outputs", []) or [])
+        trajectories = list(getattr(evaluation, "trajectories", []) or [])
+        scores = [float(score) for score in list(getattr(evaluation, "scores", []) or [])]
+        rows = []
+        for index, example in enumerate(examples):
+            output = outputs[index] if index < len(outputs) else None
+            state = output.get("state", {}) if isinstance(output, Mapping) else {}
+            fitness = state.get("fitness", {}) if isinstance(state, Mapping) else {}
+            feedback = str(trajectories[index].get("feedback", "")) if index < len(trajectories) else ""
+            component_match = re.search(r"(?m)^-\s*suggested_component:\s*(\S+)", feedback)
+            rows.append(
+                {
+                    "index": index,
+                    "input": example.get("input"),
+                    "score": scores[index] if index < len(scores) else None,
+                    "mutation_eligible": bool(fitness.get("mutation_eligible", False)),
+                    "failure_classification": fitness.get("failure_classification"),
+                    "suggested_component": component_match.group(1) if component_match else None,
+                    "tool_capability_gaps": fitness.get("tool_capability_gaps", []),
+                    "tool_data_coverage_gaps": fitness.get("tool_data_coverage_gaps", []),
+                    "runtime_supported_missing_checkpoints": fitness.get("runtime_supported_missing_checkpoints", []),
+                }
+            )
+        summary = {
+            "evaluated_count": len(examples),
+            "metric_calls": _metric_calls(evaluation, len(examples)),
+            "actionable_indices": list(partition.actionable_indices),
+            "regression_guard_indices": list(partition.regression_guard_indices),
+            "tool_blocked_indices": list(partition.tool_blocked_indices),
+            "satisfied_indices": list(partition.satisfied_indices),
+            "other_indices": list(partition.other_indices),
+            "optimization_indices": list(partition.optimization_indices),
+            "fallback_to_unfiltered": bool(partition.fallback_to_unfiltered),
+            "rows": rows,
+        }
+        self._preflight_summary = summary
+        _write_json(self.run_dir / "diagnostics" / "actionability_preflight.json", summary)
+        _write_jsonl(
+            self.run_dir / "datasets" / "optimization_train.jsonl",
+            _without_shared_rubric(optimization_examples, self._shared_rubric),
+        )
+        return summary
 
     def write_candidate(
         self,
@@ -624,8 +736,16 @@ class RunArtifactStore:
         _write_json(self.run_dir / "final_test" / "best.json", best_payload)
         seed_mean = _score_mean(seed_payload["scores"])
         best_mean = _score_mean(best_payload["scores"])
+        distinct_evaluations = {id(seed_evaluation): seed_evaluation, id(best_evaluation): best_evaluation}
+        distinct_evaluations.update(
+            {id(evaluation): evaluation for evaluation in (diagnostic_evaluations or {}).values()}
+        )
+        self._final_test_metric_calls = sum(
+            _metric_calls(evaluation, len(examples)) for evaluation in distinct_evaluations.values()
+        )
         comparison = {
             "count": len(examples),
+            "metric_calls": self._final_test_metric_calls,
             "seed_mean": seed_mean,
             "best_mean": best_mean,
             "improvement": best_mean - seed_mean,
@@ -638,6 +758,8 @@ class RunArtifactStore:
                 }
                 for index, example in enumerate(examples)
             ],
+            "seed_cohorts": _evaluation_cohort_rows(examples, seed_evaluation),
+            "best_cohorts": _evaluation_cohort_rows(examples, best_evaluation),
         }
         diagnostic_rows: list[dict[str, Any]] = []
         for candidate_idx, evaluation in sorted((diagnostic_evaluations or {}).items()):
@@ -680,6 +802,10 @@ class RunArtifactStore:
             tied_best_indices = [
                 index for index, score in enumerate(val_scores) if abs(float(score) - max_score) <= 1e-12
             ]
+        gepa_metric_calls = getattr(result, "total_metric_calls", None)
+        preflight_metric_calls = (
+            int(self._preflight_summary.get("metric_calls", 0)) if self._preflight_summary is not None else 0
+        )
         summary = {
             "result_type": type(result).__name__,
             "best_idx": selected_best_idx,
@@ -695,13 +821,19 @@ class RunArtifactStore:
             "val_aggregate_scores": val_scores,
             "parents": getattr(result, "parents", None),
             "discovery_eval_counts": getattr(result, "discovery_eval_counts", None),
-            "total_metric_calls": getattr(result, "total_metric_calls", None),
+            "total_metric_calls": gepa_metric_calls,
+            "overall_metric_calls": (
+                int(gepa_metric_calls) + preflight_metric_calls + self._final_test_metric_calls
+                if gepa_metric_calls is not None
+                else None
+            ),
             "num_full_val_evals": getattr(result, "num_full_val_evals", None),
             "num_candidates": getattr(result, "num_candidates", None),
             "run_dir": str(self.run_dir),
             "component_lengths": (
                 {name: len(text) for name, text in best_candidate.items()} if isinstance(best_candidate, dict) else None
             ),
+            "preflight_actionability": self._preflight_summary,
             "final_test": dict(final_test) if final_test is not None else None,
         }
         _write_json(self.run_dir / "result_summary.json", summary)

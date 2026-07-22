@@ -177,11 +177,16 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
         else getattr(result, "best_candidate", {})
     )
     final_test = None
+    artifact_summary: dict[str, object] = {}
     latest_run = Path(args.artifact_dir) / "latest_run.txt" if args.artifact_dir else None
     if latest_run is not None and latest_run.exists():
-        final_test_path = Path(latest_run.read_text(encoding="utf-8").strip()) / "final_test" / "summary.json"
+        artifact_run_dir = Path(latest_run.read_text(encoding="utf-8").strip())
+        final_test_path = artifact_run_dir / "final_test" / "summary.json"
         if final_test_path.exists():
             final_test = json.loads(final_test_path.read_text(encoding="utf-8"))
+        artifact_summary_path = artifact_run_dir / "result_summary.json"
+        if artifact_summary_path.exists():
+            artifact_summary = json.loads(artifact_summary_path.read_text(encoding="utf-8"))
     summary = {
         "result_type": type(result).__name__,
         "best_idx": best_idx,
@@ -198,6 +203,10 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
         "parents": getattr(result, "parents", None),
         "discovery_eval_counts": getattr(result, "discovery_eval_counts", None),
         "total_metric_calls": getattr(result, "total_metric_calls", None),
+        "overall_metric_calls": artifact_summary.get(
+            "overall_metric_calls", getattr(result, "total_metric_calls", None)
+        ),
+        "preflight_actionability": artifact_summary.get("preflight_actionability"),
         "num_full_val_evals": getattr(result, "num_full_val_evals", None),
         "num_candidates": getattr(result, "num_candidates", None),
         "component_lengths": (
@@ -249,6 +258,11 @@ def main() -> None:
         if latest_run.exists():
             run_dir = Path(latest_run.read_text(encoding="utf-8").strip())
             print(f"Artifacts: {run_dir}")
+            artifact_summary_path = run_dir / "result_summary.json"
+            if artifact_summary_path.exists():
+                artifact_summary = json.loads(artifact_summary_path.read_text(encoding="utf-8"))
+                if artifact_summary.get("overall_metric_calls") != artifact_summary.get("total_metric_calls"):
+                    print(f"Total metric calls including preflight: {artifact_summary['overall_metric_calls']}")
             final_test_path = run_dir / "final_test" / "summary.json"
             if final_test_path.exists():
                 final_test = json.loads(final_test_path.read_text(encoding="utf-8"))

@@ -184,6 +184,8 @@ checkpoint 缺失始终会降低分数；不会因为当前缺工具或信息有
   的条件化调用触发；
 - 参数或校验错误：`IMPROVE_TOOL_INVOCATION`，优先检查 tool description 和调用指导；
 - 工具运行时或上游失败：`FIX_TOOL_RUNTIME`，保留低分但不给文本 component 投票；
+- 工具明确返回无记录/无数据：记为 `tool_data_coverage_gaps`，扩展数据源或新增工具，
+  不进入文本变异池；
 - 工具成功但结果不足：`IMPROVE_TOOL_QUERY_OR_RESULT`，检查查询意图、返回字段和真实
   工具能力；
 - 已取得相关证据但最终风险逻辑遗漏：`IMPROVE_SKILL_OR_REFERENCE`；
@@ -573,6 +575,16 @@ failures remain scored misses but do not trigger text mutation. Trace
 expectations remain diagnostics rather than a direct score gate, and only
 successful matching results count as acquired evidence.
 
+Keep checkpoints atomic: one checkpoint should represent one independently
+judgeable risk mechanism. For example, profitability volatility and profit
+quality should be separate checkpoints when the expert text gives separate
+evidence for both. The cleaner records `metadata.tool_coverage` as `complete`,
+`partial`, `none`, or `unmapped`, plus supported/total checkpoint counts. This
+makes the dataset split and post-run report distinguish learnable text defects
+from examples that primarily require new data tools. Exact numeric thresholds
+suggested by the judge are removed from reusable guidance unless the expert data
+or rubric explicitly establishes the same policy/rule threshold.
+
 Dataset splitting is deterministic and stratified by default:
 
 ```toml
@@ -581,9 +593,10 @@ split_strategy = "stratified"
 train_ratio = 0.60
 val_ratio = 0.20
 test_ratio = 0.20
-stratify_by = ["metadata.difficulty", "metadata.industry"]
+stratify_by = ["metadata.tool_coverage", "metadata.difficulty", "metadata.industry"]
 seed = 17
 evaluate_final_test = true
+preflight_actionability = true
 ```
 
 Explicit split labels take precedence. Unlabeled rows are distributed by the
@@ -594,6 +607,20 @@ does not influence optimization, acceptance, or Pareto selection. When multiple
 candidates tie for the best validation score, non-deployed tied candidates are
 also evaluated on test as `diagnostic_only`. Their scores are saved for
 regression analysis but never change candidate selection.
+
+For rubric-only expert datasets, `preflight_actionability=true` evaluates the
+seed candidate on the training split before GEPA mutation. The default policy
+builds two distinct pools:
+
+- optimization pool: text-actionable failures plus a small number of satisfied
+  regression guards;
+- diagnostic pool: tool capability gaps, runtime-evidence gaps, and other
+  non-text failures retained for tool/MCP and dataset work.
+
+Preflight calls are deducted from `max_metric_calls`. If no training example is
+text-actionable, the harness records the diagnosis and limits GEPA to baseline
+validation instead of repeatedly proposing text changes against tool-blocked
+examples.
 
 Langfuse import supports two dataset styles:
 
@@ -623,6 +650,10 @@ vary by domain:
 - `ComponentSelector`: which component should be mutated next. Use this when
   feedback should prefer a specific family, such as `reference/*.md` for expert
   methodology extraction.
+- `ActionabilityPolicy`: how baseline train trajectories are divided into the
+  mutation pool, regression guards, and diagnostic-only cohorts. The default
+  implementation uses evaluator attribution and excludes tool-blocked samples
+  from reflection batches.
 - `ProposalReviewer`: how a generated proposal is checked before candidate
   rollout. The default reviewer can accept, compact/revise, or reject a
   proposal while preserving both the original and reviewed text as artifacts.
@@ -646,6 +677,7 @@ run_configured_skill_optimization(
     evaluator=...,
     template_registry=...,
     component_selector=...,
+    actionability_policy=...,
     proposal_reviewer=...,
     constraint_policy=...,
 )
@@ -965,7 +997,9 @@ config/
   <original-config>.toml
   resolved_config.json
 datasets/
+  rubric.md
   train.jsonl
+  optimization_train.jsonl
   val.jsonl
   test.jsonl
 project/
@@ -996,6 +1030,7 @@ agent_logs/
   rollouts.jsonl
   rollouts/*.json
 diagnostics/
+  actionability_preflight.json
   remediation_actions.jsonl
 proposals/
   index.jsonl
@@ -1079,6 +1114,14 @@ all rollouts. Each row links back to the detailed rollout and records the
 remediation type, owner, targets, and reason. This is the quickest source for a
 tool/MCP backlog, failed-tool repair queue, skipped-tool routing work, and
 skill/reference improvements after a long run.
+
+`diagnostics/actionability_preflight.json` records the baseline classification,
+score, recommended component, and tool gaps for every audited training example.
+`datasets/optimization_train.jsonl` is the exact subset passed to GEPA after
+that audit. A shared dataset rubric is stored once in `datasets/rubric.md`
+instead of being duplicated in every persisted row. `result_summary.json`
+keeps GEPA's own `total_metric_calls` and also records
+`overall_metric_calls`, which includes preflight and final-test calls.
 
 Candidates that cannot load at runtime, including `SKILL.md` files with missing
 or invalid YAML frontmatter or missing `name`/`description`, receive a zero

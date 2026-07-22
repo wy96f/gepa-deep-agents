@@ -8,7 +8,7 @@ component selection, constraints, materialization, and runner behavior.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isclose
 from pathlib import Path
@@ -30,6 +30,7 @@ class DatasetProvider(Protocol):
 
     def load(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """Return train, validation, and test splits."""
+        ...
 
 
 @dataclass
@@ -49,6 +50,7 @@ class Evaluator(Protocol):
 
     def evaluate(self, example: Mapping[str, Any], state: Mapping[str, Any]) -> tuple[float, str]:
         """Return a GEPA-compatible score and feedback string."""
+        ...
 
 
 @dataclass
@@ -58,8 +60,86 @@ class DefaultEvaluator:
     evaluate_fn: Callable[[dict[str, Any], dict[str, Any]], tuple[float, str]]
 
     def evaluate(self, example: Mapping[str, Any], state: Mapping[str, Any]) -> tuple[float, str]:
-        mutable_state = state if isinstance(state, MutableMapping) else dict(state)
+        mutable_state = state if isinstance(state, dict) else dict(state)
         return self.evaluate_fn(dict(example), mutable_state)
+
+
+@dataclass(frozen=True)
+class ActionabilityPartition:
+    """Baseline-audited training cohorts for text optimization and diagnostics."""
+
+    actionable_indices: tuple[int, ...]
+    regression_guard_indices: tuple[int, ...]
+    tool_blocked_indices: tuple[int, ...]
+    satisfied_indices: tuple[int, ...]
+    other_indices: tuple[int, ...]
+    optimization_indices: tuple[int, ...]
+    fallback_to_unfiltered: bool = False
+
+
+class ActionabilityPolicy(Protocol):
+    """Partition baseline train rollouts by whether a text mutation can help."""
+
+    def partition(
+        self,
+        examples: Sequence[Mapping[str, Any]],
+        evaluation: Any,
+        *,
+        regression_guard_limit: int,
+    ) -> ActionabilityPartition:
+        """Return optimization and diagnostic cohorts using evaluator state."""
+        ...
+
+
+class DefaultActionabilityPolicy:
+    """Use deterministic evaluator attribution to keep tool gaps out of mutation batches."""
+
+    def partition(
+        self,
+        examples: Sequence[Mapping[str, Any]],
+        evaluation: Any,
+        *,
+        regression_guard_limit: int,
+    ) -> ActionabilityPartition:
+        outputs = list(getattr(evaluation, "outputs", []) or [])
+        scores = [float(score) for score in list(getattr(evaluation, "scores", []) or [])]
+        actionable: list[int] = []
+        tool_blocked: list[int] = []
+        satisfied: list[int] = []
+        other: list[int] = []
+        for index, _example in enumerate(examples):
+            output = outputs[index] if index < len(outputs) else None
+            state = output.get("state", {}) if isinstance(output, Mapping) else {}
+            fitness = state.get("fitness", {}) if isinstance(state, Mapping) else {}
+            classification = str(fitness.get("failure_classification") or "")
+            mutation_eligible = bool(fitness.get("mutation_eligible", False))
+            if mutation_eligible:
+                actionable.append(index)
+            elif classification in {"TOOL_CAPABILITY_GAP", "INSUFFICIENT_RUNTIME_EVIDENCE"}:
+                tool_blocked.append(index)
+            elif classification == "NO_FAILURE":
+                satisfied.append(index)
+            else:
+                other.append(index)
+
+        guard_limit = max(0, int(regression_guard_limit))
+        ranked_guards = sorted(
+            satisfied,
+            key=lambda index: (scores[index] if index < len(scores) else 0.0, -index),
+            reverse=True,
+        )
+        regression_guards = ranked_guards[:guard_limit]
+        fallback = not actionable
+        optimization_indices = list(range(len(examples))) if fallback else [*actionable, *regression_guards]
+        return ActionabilityPartition(
+            actionable_indices=tuple(actionable),
+            regression_guard_indices=tuple(regression_guards),
+            tool_blocked_indices=tuple(tool_blocked),
+            satisfied_indices=tuple(satisfied),
+            other_indices=tuple(other),
+            optimization_indices=tuple(optimization_indices),
+            fallback_to_unfiltered=fallback,
+        )
 
 
 class ComponentSelector(Protocol):
@@ -74,6 +154,7 @@ class ComponentSelector(Protocol):
         candidate: dict[str, str],
     ) -> list[str]:
         """Return one or more candidate keys to mutate."""
+        ...
 
 
 class DefaultFeedbackComponentSelector:
@@ -213,6 +294,7 @@ class ReflectionTemplateRegistry(Protocol):
 
     def templates_for(self, candidate: Mapping[str, str]) -> dict[str, str]:
         """Return a reflection template per candidate key."""
+        ...
 
 
 class DefaultReflectionTemplateRegistry:
@@ -246,8 +328,9 @@ class DefaultReflectionTemplateRegistry:
             "- A company name or keyword is only a weak discovery clue. Do not use it alone to activate a risk "
             "conclusion; require business-model, transaction, financial, asset, or financing evidence.\n"
             "- Do not persist evaluator-only company names, dates, amounts, or invented numeric thresholds. A threshold "
-            "must cite an applicable policy or evidence basis; otherwise express an entity-relative comparison or a "
-            "clearly labeled adjustable stress scenario.\n"
+            "must be explicitly stated by an applicable policy/expert rule or independently repeated across examples. "
+            "Numbers observed or calculated from one company are case evidence, never reusable cutoffs. Otherwise express "
+            "an entity-relative historical/peer comparison or a clearly labeled adjustable stress scenario.\n"
             "- Do not force every lesson into a full trigger/evidence/analysis/consequence template. Include only the "
             "non-obvious condition, evidence distinction, comparison, or transmission logic that changes behavior. "
             "Adapt it to the current business model and mark unsupported acquisition as TOOL_CAPABILITY_GAP. Follow the "
@@ -423,6 +506,7 @@ class ProposalReviewer(Protocol):
         review_lm: Callable[[str], str],
     ) -> ProposalReview:
         """Return ACCEPT, REVISE, or REJECT with optional corrected response."""
+        ...
 
 
 class DefaultProposalReviewer:
@@ -456,7 +540,9 @@ class DefaultProposalReviewer:
             "domain cues in reference files, and invocation semantics in tool descriptions.\n"
             "4. Generalization: reject company-specific answers, entity-name-only triggers, closed industry lists, and "
             "rules extrapolated from one case without observable conditions.\n"
-            "5. Evidence integrity: reject unsupported fixed thresholds, dates, amounts, facts, or tool capabilities.\n"
+            "5. Evidence integrity: reject unsupported fixed thresholds, dates, amounts, facts, or tool capabilities. "
+            "A value calculated from one case is not an expert threshold; replace it with a relative historical, peer, "
+            "contractual, or policy-backed comparison.\n"
             "6. Output contract: preserve what the runtime agent is asked to produce. Reject or revise additions such "
             "as recommendations, decisions, approval opinions, or long missing-data lists when the current prompt/skill "
             "explicitly excludes them.\n"
@@ -545,6 +631,7 @@ class Constraint(Protocol):
 
     def check(self, candidate: Mapping[str, str], context: Mapping[str, Any]) -> Sequence[Any]:
         """Return constraint results for the candidate."""
+        ...
 
 
 @dataclass

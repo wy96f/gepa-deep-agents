@@ -493,6 +493,51 @@ def test_default_evaluator_writes_fitness_back_to_original_state():
     assert state["fitness"] == {"composite": 0.75}
 
 
+def test_default_actionability_policy_builds_mutation_and_diagnostic_cohorts():
+    example = _load_example_module()
+    evaluation = SimpleNamespace(
+        scores=[0.2, 0.1, 1.0, 0.8],
+        outputs=[
+            {"state": {"fitness": {"mutation_eligible": True, "failure_classification": "SKILL_DEFECT"}}},
+            {"state": {"fitness": {"mutation_eligible": False, "failure_classification": "TOOL_CAPABILITY_GAP"}}},
+            {"state": {"fitness": {"mutation_eligible": False, "failure_classification": "NO_FAILURE"}}},
+            {"state": {"fitness": {"mutation_eligible": False, "failure_classification": "NO_FAILURE"}}},
+        ],
+    )
+
+    partition = example.DefaultActionabilityPolicy().partition(
+        [{"input": str(index)} for index in range(4)],
+        evaluation,
+        regression_guard_limit=1,
+    )
+
+    assert partition.actionable_indices == (0,)
+    assert partition.tool_blocked_indices == (1,)
+    assert partition.regression_guard_indices == (2,)
+    assert partition.optimization_indices == (0, 2)
+    assert partition.fallback_to_unfiltered is False
+
+
+def test_default_actionability_policy_falls_back_when_nothing_is_text_actionable():
+    example = _load_example_module()
+    evaluation = SimpleNamespace(
+        scores=[0.1, 0.2],
+        outputs=[
+            {"state": {"fitness": {"mutation_eligible": False, "failure_classification": "TOOL_CAPABILITY_GAP"}}},
+            {"state": {"fitness": {"mutation_eligible": False, "failure_classification": "NO_FAILURE"}}},
+        ],
+    )
+
+    partition = example.DefaultActionabilityPolicy().partition(
+        [{"input": "a"}, {"input": "b"}],
+        evaluation,
+        regression_guard_limit=1,
+    )
+
+    assert partition.optimization_indices == (0, 1)
+    assert partition.fallback_to_unfiltered is True
+
+
 def test_noop_aware_adapter_reuses_evaluation_when_selector_returns_no_components():
     example = _load_example_module()
     rollout_calls = 0
@@ -959,6 +1004,70 @@ def test_trace_expectation_rejects_ai_prose_and_failed_tool_results():
     assert diagnostics["failed_tool_expectations"] == ["司法工商信息获取"]
     assert diagnostics["failed_tool_runtime_expectations"] == ["司法工商信息获取"]
     assert diagnostics["failed_tool_invocation_expectations"] == []
+
+
+def test_no_data_tool_result_is_incomplete_even_when_message_status_is_success():
+    example = _load_example_module()
+    row = {
+        "input": "不存在企业",
+        "rubric": "覆盖司法执行风险。",
+        "metadata": {
+            "checkpoints": [
+                {
+                    "label": "司法执行风险",
+                    "keywords": ["司法执行", "被执行"],
+                    "evidence_expectations": ["司法工商信息获取"],
+                }
+            ],
+            "trace_expectations": [
+                {
+                    "label": "司法工商信息获取",
+                    "tool_names": ["lookup_judicial"],
+                    "tool_intent_keywords": ["司法", "被执行"],
+                }
+            ],
+        },
+    }
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_judicial",
+                        "args": {"company": "不存在企业"},
+                        "id": "judicial-no-data-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="ERROR: 未找到企业记录",
+                tool_call_id="judicial-no-data-1",
+                name="lookup_judicial",
+                status="success",
+            ),
+        ],
+        "capability_tools": [{"owner": "main", "name": "lookup_judicial", "description": "查询企业司法和被执行信息。"}],
+        "baseline_response": "",
+        "candidate_excerpt": {"main:tool:lookup_judicial:description": "查询企业司法和被执行信息。"},
+        "candidate_constraints": [],
+    }
+
+    diagnostics = example.data_acquisition_diagnostics(row, state)
+
+    assert diagnostics["matched_trace_expectations"] == []
+    assert diagnostics["incomplete_tool_result_expectations"] == ["司法工商信息获取"]
+    assert diagnostics["tool_data_coverage_gaps"] == ["司法工商信息获取"]
+    assert diagnostics["failed_tool_runtime_expectations"] == []
+    assert diagnostics["failed_tool_evidence"][0]["status"] == "no_data"
+
+    _score, feedback = example.evaluate_response(row, state)
+
+    assert state["fitness"]["mutation_eligible"] is False
+    assert state["fitness"]["failure_classification"] == "TOOL_CAPABILITY_GAP"
+    assert state["fitness"]["remediation_type"] == "ADD_TOOL_OR_MCP"
+    assert "- suggested_component: none" in feedback
 
 
 def test_data_acquisition_diagnostics_distinguishes_missing_tool_from_skipped_tool():
@@ -1539,6 +1648,79 @@ def test_runtime_tool_evidence_can_make_missing_expert_logic_text_actionable():
     assert "- suggested_component: skill:credit-risk-review:reference/learned_expert_patterns.md" in feedback
 
 
+def test_skill_defect_remains_primary_when_a_case_also_has_tool_gaps():
+    example = _load_example_module()
+
+    diagnostics = example.remediation_diagnostics(
+        "SKILL_DEFECT",
+        [],
+        {
+            "runtime_supported_missing_checkpoints": ["盈利质量风险"],
+            "matched_trace_expectations": ["财务盈利质量信息获取"],
+            "tool_capability_gaps": ["行业周期信息获取"],
+        },
+    )
+
+    assert diagnostics["remediation_type"] == "IMPROVE_SKILL_OR_REFERENCE"
+    assert {item["type"] for item in diagnostics["remediation_actions"]} == {
+        "IMPROVE_SKILL_OR_REFERENCE",
+        "ADD_TOOL_OR_MCP",
+    }
+
+
+def test_expected_mapping_diagnosis_distinguishes_missing_rule_from_execution_lapse():
+    example = _load_example_module()
+    candidate = {
+        "skill:support-router:reference/routing.md": (
+            "Billing covers invoices. Account covers login and passwords. "
+            "Product covers feature requests and integrations."
+        )
+    }
+    base_fitness = {"hard": 0.0, "mutation_eligible": True}
+
+    profile_class, _reason = example.classify_failure(
+        {
+            "expected": "account",
+            "rubric": "Requests about profile ownership or account identity must route to account.",
+        },
+        {"candidate_excerpt": candidate},
+        "<route>product</route>",
+        [],
+        dict(base_fitness),
+    )
+    salesforce_class, _reason = example.classify_failure(
+        {
+            "expected": "product",
+            "rubric": "Salesforce integration requests must route to product.",
+        },
+        {"candidate_excerpt": candidate},
+        "No route tag.",
+        [],
+        dict(base_fitness),
+    )
+
+    assert profile_class == "SKILL_DEFECT"
+    assert salesforce_class == "EXECUTION_LAPSE"
+
+
+def test_judge_guidance_removes_case_derived_thresholds_but_keeps_source_rules():
+    example = _load_example_module()
+    payload = {
+        "reusable_lesson": "净利率低于2%且现金流覆盖低于10%时必须预警。",
+        "operational_rule": "政策明确要求资产负债率不得超过70%。",
+    }
+
+    sanitized = example.sanitize_judge_guidance(
+        payload,
+        {"data": "该企业净利率为2%。审批政策明确要求资产负债率不得超过70%。"},
+    )
+
+    assert "2%" not in sanitized["reusable_lesson"]
+    assert "10%" not in sanitized["reusable_lesson"]
+    assert "70%" in sanitized["operational_rule"]
+    assert sanitized["guidance_sanitization"]
+
+
 def test_reflection_judge_score_is_capped_when_expected_route_is_missing(tmp_path):
     example = _load_example_module()
     seed_spec = example.create_seed_workspace(tmp_path)
@@ -1912,6 +2094,7 @@ def test_final_test_artifact_records_tied_candidate_as_diagnostic_only(tmp_path)
     )
 
     assert summary["improvement"] == 0.0
+    assert summary["metric_calls"] == 3
     assert summary["diagnostic_candidates"] == [
         {
             "candidate_idx": 1,
@@ -1922,6 +2105,70 @@ def test_final_test_artifact_records_tied_candidate_as_diagnostic_only(tmp_path)
         }
     ]
     assert (tmp_path / "run" / "final_test" / "candidate_0001.json").exists()
+
+
+def test_actionability_preflight_artifacts_separate_shared_rubric_and_optimization_pool(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+    config = SimpleNamespace(dataset=SimpleNamespace(rubric="统一评价规则"))
+    project = SimpleNamespace(candidate={"memory:AGENTS.md": "Keep behavior."}, surfaces={})
+    rows = [
+        {"input": "可优化企业", "rubric": "统一评价规则"},
+        {"input": "工具阻塞企业", "rubric": "统一评价规则"},
+    ]
+    evaluation = SimpleNamespace(
+        scores=[0.2, 0.1],
+        outputs=[
+            {"state": {"fitness": {"mutation_eligible": True, "failure_classification": "SKILL_DEFECT"}}},
+            {
+                "state": {
+                    "fitness": {
+                        "mutation_eligible": False,
+                        "failure_classification": "TOOL_CAPABILITY_GAP",
+                        "tool_capability_gaps": ["客户交易信息获取"],
+                    }
+                }
+            },
+        ],
+        trajectories=[
+            {"feedback": "- suggested_component: skill:risk:reference/learned.md"},
+            {"feedback": "- suggested_component: none"},
+        ],
+        num_metric_calls=None,
+    )
+    partition = example.DefaultActionabilityPolicy().partition(rows, evaluation, regression_guard_limit=1)
+
+    store.write_run_inputs(
+        config_path=tmp_path / "missing.toml",
+        config=config,
+        project=project,
+        train_set=rows,
+        val_set=[],
+        test_set=[],
+    )
+    summary = store.write_actionability_preflight(
+        examples=rows,
+        evaluation=evaluation,
+        partition=partition,
+        optimization_examples=[rows[0]],
+    )
+
+    persisted_train = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "datasets" / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    optimization_train = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "datasets" / "optimization_train.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert (tmp_path / "run" / "datasets" / "rubric.md").read_text(encoding="utf-8").strip() == "统一评价规则"
+    assert all("rubric" not in row for row in persisted_train)
+    assert all("rubric" not in row for row in optimization_train)
+    assert [row["input"] for row in optimization_train] == ["可优化企业"]
+    assert summary["metric_calls"] == 2
+    assert summary["tool_blocked_indices"] == [1]
 
 
 def test_artifact_callback_writes_agent_logs_and_rejected_proposals(tmp_path):
@@ -2187,6 +2434,50 @@ def test_run_analyzer_counts_missing_proposal_rationale(tmp_path):
 
     assert summary["proposal_missing_rationale_files"] == 1
     assert any("missing rationale" in note for note in summary["diagnosis"])
+
+
+def test_run_analyzer_keeps_preflight_out_of_optimization_statistics(tmp_path):
+    analyzer = _load_analyzer_module()
+    run_dir = tmp_path / "run"
+    (run_dir / "agent_logs").mkdir(parents=True)
+    (run_dir / "proposals").mkdir(parents=True)
+    (run_dir / "rejected_proposals").mkdir(parents=True)
+    (run_dir / "diagnostics").mkdir(parents=True)
+    (run_dir / "result_summary.json").write_text(
+        json.dumps({"best_val_score": 0.5, "val_aggregate_scores": [0.5], "total_metric_calls": 2}),
+        encoding="utf-8",
+    )
+    preflight = {
+        "evaluated_count": 1,
+        "metric_calls": 1,
+        "actionable_indices": [0],
+        "regression_guard_indices": [],
+        "tool_blocked_indices": [],
+        "fallback_to_unfiltered": False,
+    }
+    (run_dir / "diagnostics" / "actionability_preflight.json").write_text(
+        json.dumps(preflight),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_logs" / "rollouts.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"score": 0.1, "evaluation_phase": "preflight_train"}),
+                json.dumps({"score": 0.5, "evaluation_phase": "optimization"}),
+                json.dumps({"score": 1.0, "evaluation_phase": "final_test_seed"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = analyzer.summarize_run(run_dir)
+
+    assert summary["preflight_rollout_count"] == 1
+    assert summary["rollout_count"] == 1
+    assert summary["final_test_rollout_count"] == 1
+    assert summary["rollout_score_mean"] == 0.5
+    assert summary["preflight_actionability"] == preflight
 
 
 def test_run_analyzer_reports_judge_disagreement_and_no_actionable_proposal(tmp_path):
@@ -2687,6 +2978,8 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert len(rows) >= 8
     assert all(row["metadata"].get("checkpoints") for row in rows)
     assert all(row["metadata"].get("trace_expectations") for row in rows)
+    assert all(row["metadata"].get("tool_coverage") in {"complete", "partial", "none"} for row in rows)
+    assert all(row["metadata"].get("checkpoint_count") == len(row["metadata"]["checkpoints"]) for row in rows)
     assert all(checkpoint.get("evidence_expectations") for row in rows for checkpoint in row["metadata"]["checkpoints"])
     financial_expectations = [
         expectation
@@ -2723,6 +3016,12 @@ def test_credit_approval_demo_loads_expert_risk_section_dataset():
     assert all(constraint.passed for constraint in skill_constraints)
     assert any(row["metadata"].get("scenario") == "钢铁集团授信_项目风险点对齐" for row in rows)
     assert any(row["input"] == "华东钢铁集团有限公司" for row in rows)
+    steel = next(row for row in rows if row["input"] == "华东钢铁集团有限公司")
+    steel_labels = {checkpoint["label"] for checkpoint in steel["metadata"]["checkpoints"]}
+    assert {"盈利稳定性风险", "盈利质量风险"} <= steel_labels
+    assert "盈利稳定性与盈利质量风险" not in steel_labels
+    assert steel["metadata"]["tool_coverage"] == "partial"
+    assert any(row["input"] == "华东钢铁集团有限公司" for row in train)
 
 
 def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
@@ -2735,7 +3034,14 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
         / "deepagents_gepa_configs"
         / "credit_approval.toml"
     )
-    calls = {"dataset": 0, "evaluator": 0, "templates": 0, "selector": 0, "constraints": 0}
+    calls = {
+        "dataset": 0,
+        "evaluator": 0,
+        "templates": 0,
+        "selector": 0,
+        "actionability": 0,
+        "constraints": 0,
+    }
 
     class DatasetProvider:
         def load(self):
@@ -2743,6 +3049,7 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
             row = {
                 "input": "Borrower has negative operating cash flow and related-party receivables.",
                 "rubric": "Expert opinion: identify repayment-capacity weakness and verification conditions.",
+                "metadata": {"checkpoints": [{"label": "repayment capacity", "keywords": ["cash flow"]}]},
             }
             return [row], [row], [row]
 
@@ -2777,6 +3084,20 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
             calls["constraints"] += 1
             return []
 
+    class ActionabilityPolicy:
+        def partition(self, examples, evaluation, *, regression_guard_limit):
+            del evaluation, regression_guard_limit
+            calls["actionability"] += 1
+            return SimpleNamespace(
+                actionable_indices=(0,),
+                regression_guard_indices=(),
+                tool_blocked_indices=(),
+                satisfied_indices=(),
+                other_indices=(),
+                optimization_indices=tuple(range(len(examples))),
+                fallback_to_unfiltered=False,
+            )
+
     result = example.run_configured_skill_optimization(
         config_path,
         ToolFriendlyFakeChatModel(responses=["Credit risk review draft."] * 100),
@@ -2785,8 +3106,9 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
         evaluator=Evaluator(),
         template_registry=TemplateRegistry(),
         component_selector=Selector(),
+        actionability_policy=ActionabilityPolicy(),
         constraint_policy=ConstraintPolicy(),
-        max_metric_calls=2,
+        max_metric_calls=3,
         reflection_minibatch_size=1,
         num_threads=1,
         use_reflection_judge=False,
@@ -2796,6 +3118,11 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
 
     assert result.best_candidate
     assert all(count > 0 for count in calls.values())
+    artifact_summary = json.loads(
+        (tmp_path / "runs" / "credit-hooks" / "result_summary.json").read_text(encoding="utf-8")
+    )
+    assert artifact_summary["preflight_actionability"]["evaluated_count"] == 1
+    assert artifact_summary["overall_metric_calls"] > artifact_summary["total_metric_calls"]
 
 
 def test_golden_dataset_supports_rubric_without_expected(tmp_path):
@@ -2889,6 +3216,32 @@ def test_dataset_split_is_stratified_deterministic_and_disjoint():
     assert not ({row["input"] for row in first[0]} & {row["input"] for row in first[2]})
     assert all(row["metadata"]["dataset_split"] == "train" for row in first[0])
     assert all(row["metadata"]["dataset_stratum"] for split in first for row in split)
+
+
+def test_dataset_split_distributes_tool_coverage_strata_across_splits():
+    example = _load_example_module()
+    rows = [
+        {
+            "input": f"{coverage}-{index}",
+            "metadata": {
+                "tool_coverage": coverage,
+                **({"split": "train"} if coverage == "partial" and index == 0 else {}),
+            },
+        }
+        for coverage in ("partial", "none")
+        for index in range(4)
+    ]
+
+    train, val, test = example.split_examples(
+        rows,
+        stratify_by=("metadata.tool_coverage",),
+        seed=17,
+    )
+
+    assert [len(split) for split in (train, val, test)] == [4, 2, 2]
+    assert all(
+        {row["metadata"]["tool_coverage"] for row in split} == {"partial", "none"} for split in (train, val, test)
+    )
 
 
 def test_dataset_split_honors_explicit_assignments():
@@ -3012,6 +3365,9 @@ def test_credit_risk_cleaner_prefers_filename_and_validates_llm_tool_names(tmp_p
     assert cleaned.company_name == "南城建材实业有限公司"
     assert cleaned.metadata["trace_expectations"][0]["tool_names"] == ["lookup_customers"]
     assert cleaned.metadata["checkpoints"][0]["evidence_expectations"] == ["客户交易信息获取"]
+    assert cleaned.metadata["tool_coverage"] == "complete"
+    assert cleaned.metadata["tool_supported_checkpoint_count"] == 1
+    assert cleaned.metadata["checkpoint_count"] == 1
 
 
 def test_credit_risk_cleaner_excludes_action_only_checkpoints():

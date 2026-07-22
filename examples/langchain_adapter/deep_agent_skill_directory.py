@@ -46,9 +46,11 @@ from typing import Any
 try:
     from examples.langchain_adapter.deepagents_gepa.artifacts import RunArtifactStore
     from examples.langchain_adapter.deepagents_gepa.framework import (
+        ActionabilityPolicy,
         ComponentSelector,
         Constraint,
         DatasetProvider,
+        DefaultActionabilityPolicy,
         DefaultCandidateMaterializer,
         DefaultConstraintSet,
         DefaultDatasetProvider,
@@ -65,9 +67,11 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from examples.langchain_adapter.deepagents_gepa.artifacts import RunArtifactStore
     from examples.langchain_adapter.deepagents_gepa.framework import (
+        ActionabilityPolicy,
         ComponentSelector,
         Constraint,
         DatasetProvider,
+        DefaultActionabilityPolicy,
         DefaultCandidateMaterializer,
         DefaultConstraintSet,
         DefaultDatasetProvider,
@@ -161,6 +165,16 @@ TOOL_NO_DATA_PATTERN = re.compile(
 )
 TOOL_ACK_ONLY_PATTERN = re.compile(
     r"(?is)^\s*(?:ok|done|success|successful|query succeeded|查询成功|调用成功|执行成功)\s*[。.!\uff01]?$"
+)
+TOOL_NO_DATA_ERROR_PATTERN = re.compile(
+    r"(?is)(?:\b(?:not found|no matching record|record unavailable)\b|"
+    r"未找到(?:该|匹配的)?(?:企业)?(?:记录|数据|信息)|暂无(?:该|匹配的)?企业(?:记录|数据|信息))"
+)
+UNSUPPORTED_THRESHOLD_PATTERN = re.compile(r"(?:[<>≤≥]=?\s*)?\d+(?:\.\d+)?\s*(?:%|\uff05|亿元|万元|元|倍|天|月|年)")
+THRESHOLD_RULE_CONTEXT_PATTERN = re.compile(
+    r"政策|制度|规定|准入|红线|上限|下限|标准|要求|不得|不应|不低于|不高于|至少|至多|"
+    r"policy|rule|required|minimum|maximum|limit",
+    re.I,
 )
 LOGGER = logging.getLogger(__name__)
 
@@ -362,6 +376,7 @@ class DatasetConfig:
     stratify_by: tuple[str, ...] = ("metadata.difficulty",)
     seed: int = 0
     evaluate_final_test: bool = True
+    preflight_actionability: bool = True
 
 
 @dataclass(frozen=True)
@@ -594,6 +609,7 @@ def _parse_dataset_config(raw_dataset: dict[str, Any]) -> DatasetConfig:
         stratify_by=_as_tuple(raw_dataset.get("stratify_by"), ("metadata.difficulty",)),
         seed=int(raw_dataset.get("seed", 0)),
         evaluate_final_test=bool(raw_dataset.get("evaluate_final_test", True)),
+        preflight_actionability=bool(raw_dataset.get("preflight_actionability", True)),
     )
 
 
@@ -2245,8 +2261,10 @@ def tool_result_is_successful(message: Any) -> tuple[bool, str]:
         return False, normalized_status
     if not content:
         return False, normalized_status or "empty_result"
+    if TOOL_NO_DATA_ERROR_PATTERN.search(content) or TOOL_NO_DATA_PATTERN.fullmatch(content):
+        return False, "no_data"
     if TOOL_FAILURE_PATTERN.search(content):
-        return False, normalized_status or "error_result"
+        return False, normalized_status if normalized_status not in {"", "success", "successful"} else "error_result"
     return True, normalized_status or "success"
 
 
@@ -2428,6 +2446,7 @@ def data_acquisition_diagnostics(example: dict[str, Any], state: dict[str, Any])
             "failed_tool_invocation_expectations": [],
             "failed_tool_runtime_expectations": [],
             "incomplete_tool_result_expectations": [],
+            "tool_data_coverage_gaps": [],
             "tool_attempt_evidence": {},
         }
     matched, missing, evidence_by_expectation, tool_evidence = trace_expectation_matches(example, state)
@@ -2441,6 +2460,7 @@ def data_acquisition_diagnostics(example: dict[str, Any], state: dict[str, Any])
     failed_invocation_expectations: list[str] = []
     failed_runtime_expectations: list[str] = []
     incomplete_result_expectations: list[str] = []
+    data_coverage_gaps: list[str] = []
     attempt_evidence: dict[str, list[dict[str, Any]]] = {}
     for expectation in expectations:
         label = trace_expectation_label(expectation)
@@ -2459,13 +2479,18 @@ def data_acquisition_diagnostics(example: dict[str, Any], state: dict[str, Any])
                 }
                 for item in matching_attempts
             ]
-        failed_attempts = [item for item in matching_attempts if not item.get("success")]
+        no_data_attempts = [item for item in matching_attempts if str(item.get("status") or "") == "no_data"]
+        failed_attempts = [
+            item for item in matching_attempts if not item.get("success") and item not in no_data_attempts
+        ]
         successful_attempts = [item for item in matching_attempts if item.get("success")]
         supported = bool(matching_attempts) or expectation_supported_by_tools(expectation, inventory)
         if supported:
             tool_supported.append(label)
-            if successful_attempts:
+            if successful_attempts or no_data_attempts:
                 incomplete_result_expectations.append(label)
+                if no_data_attempts:
+                    data_coverage_gaps.append(label)
             elif failed_attempts:
                 failed_expectations.append(label)
                 if any(tool_failure_is_invocation_error(item) for item in failed_attempts):
@@ -2504,6 +2529,7 @@ def data_acquisition_diagnostics(example: dict[str, Any], state: dict[str, Any])
         "failed_tool_invocation_expectations": failed_invocation_expectations,
         "failed_tool_runtime_expectations": failed_runtime_expectations,
         "incomplete_tool_result_expectations": incomplete_result_expectations,
+        "tool_data_coverage_gaps": data_coverage_gaps,
         "tool_attempt_evidence": attempt_evidence,
     }
 
@@ -2525,9 +2551,10 @@ def checkpoint_evidence_diagnostics(
         )
         for item in acquisition.get(key) or []
     }
+    actionable -= {str(item) for item in acquisition.get("tool_data_coverage_gaps") or []}
     blocked = {
         str(item)
-        for key in ("failed_tool_runtime_expectations", "tool_capability_gaps")
+        for key in ("failed_tool_runtime_expectations", "tool_capability_gaps", "tool_data_coverage_gaps")
         for item in acquisition.get(key) or []
     }
     runtime_supported: list[str] = []
@@ -2786,6 +2813,7 @@ def evaluate_response_with_judge(
             deterministic_score,
             f"{deterministic_feedback}\n\nReflection judge returned non-JSON output:\n{raw_judge[:1200]}",
         )
+    payload = sanitize_judge_guidance(payload, example)
 
     candidate = state.get("candidate_excerpt", {})
     response = last_message_text(state)
@@ -2845,6 +2873,7 @@ def evaluate_response_with_judge(
     tool_gaps = [str(item) for item in fitness.get("tool_capability_gaps") or []]
     supported_missing = [str(item) for item in fitness.get("tool_supported_missing_expectations") or []]
     tool_actionable_checkpoints = [str(item) for item in fitness.get("tool_actionable_missing_checkpoints") or []]
+    tool_data_gaps = {str(item) for item in fitness.get("tool_data_coverage_gaps") or []}
     actionable_expectations = [
         str(item)
         for key in (
@@ -2853,6 +2882,7 @@ def evaluate_response_with_judge(
             "incomplete_tool_result_expectations",
         )
         for item in fitness.get(key) or []
+        if str(item) not in tool_data_gaps
     ]
     runtime_supported_checkpoints = [str(item) for item in fitness.get("runtime_supported_missing_checkpoints") or []]
     _matched, missing_checkpoints, _coverage = rubric_checkpoint_results(example, response)
@@ -2862,6 +2892,12 @@ def evaluate_response_with_judge(
         judged_classification = NO_FAILURE
         classification_reason = "candidate produced the authoritative expected result"
         suggested = ""
+    elif expected and candidate_encodes_expected_case(example, candidate, expected) is False:
+        judged_classification = SKILL_DEFECT
+        classification_reason = (
+            "the evaluator rubric's discriminating case-to-result mapping is absent from the current skill/reference"
+        )
+        suggested = suggest_component_to_update(state, "effect", SKILL_DEFECT, expected)
     elif missing_checkpoints and not expected:
         if tool_actionable_checkpoints or actionable_expectations:
             judged_classification = EXECUTION_LAPSE
@@ -2974,6 +3010,9 @@ def build_judge_prompt(
     tool_capability_gap_lines = (
         "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]) or "- none"
     )
+    tool_data_coverage_gap_lines = (
+        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_data_coverage_gaps"]) or "- none"
+    )
     successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
     failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
     available_tools = tool_inventory_text(state.get("available_tools") or []) or "- none"
@@ -3001,8 +3040,9 @@ def build_judge_prompt(
         "capability matches the expectation. Keywords in prompts, skills, AI prose, or final answers are not acquisition "
         "evidence. Diagnose each missing path precisely: no matching tool means TOOL_CAPABILITY_GAP; an available tool "
         "that was not called means tool-usage EXECUTION_LAPSE; argument/validation failure points to invocation guidance; "
-        "runtime/upstream failure points to the tool implementation or environment; a successful but insufficient result "
-        "points to query/result coverage; and successful relevant evidence that never reaches the final risk analysis "
+        "runtime/upstream failure points to the tool implementation or environment; an explicit no-data result is a "
+        "tool/data coverage gap and must not drive text mutation; a non-empty but insufficient result points to "
+        "query/result coverage; and successful relevant evidence that never reaches the final risk analysis "
         "points to SKILL_DEFECT. A hidden expert checkpoint is allowed to lower the task score, but it may drive a text mutation only "
         "when the trace contains relevant successful evidence or the agent skipped an available matching tool. If "
         "current tools cannot obtain the evidence, classify TOOL_CAPABILITY_GAP. If the evaluator cannot establish "
@@ -3062,6 +3102,7 @@ def build_judge_prompt(
         f"Available matching tools that were not called:\n{skipped_supported_lines}\n"
         f"Matching tool calls that failed:\n{failed_tool_expectation_lines}\n"
         f"Successful matching calls with insufficient results:\n{incomplete_tool_result_lines}\n"
+        f"Tool/data coverage gaps:\n{tool_data_coverage_gap_lines}\n"
         f"Tool capability gaps:\n{tool_capability_gap_lines}\n"
         f"Checkpoint-specific evidence attribution:\n{checkpoint_evidence_lines}\n"
         f"Deterministic mutation eligibility: {str(mutation_eligible).lower()}\n"
@@ -3115,6 +3156,53 @@ def coerce_score(value: Any, fallback: float) -> float:
     return max(0.0, min(1.0, score))
 
 
+def sanitize_judge_guidance(payload: Mapping[str, Any], example: Mapping[str, Any]) -> dict[str, Any]:
+    """Prevent case-derived exact cutoffs from becoming optimizer guidance."""
+    sanitized = dict(payload)
+    source_text = unicodedata.normalize(
+        "NFKC",
+        "\n".join([str(example.get("data") or ""), str(example.get("rubric") or "")]),
+    )
+    warnings: list[str] = []
+    for field_name in ("reusable_lesson", "operational_rule", "applicability_scope", "cross_case_regression_risk"):
+        value = str(sanitized.get(field_name) or "").strip()
+        if not value:
+            continue
+        unsupported = [
+            token
+            for token in UNSUPPORTED_THRESHOLD_PATTERN.findall(unicodedata.normalize("NFKC", value))
+            if not source_establishes_threshold_rule(source_text, token)
+        ]
+        if not unsupported:
+            continue
+        sentences = re.split(r"(?<=[。.!?\uff1b;])\s*", value)
+        retained = [
+            sentence
+            for sentence in sentences
+            if sentence.strip()
+            and not any(
+                token.replace(" ", "") in unicodedata.normalize("NFKC", sentence).replace(" ", "")
+                for token in unsupported
+            )
+        ]
+        sanitized[field_name] = " ".join(retained).strip() or (
+            "Use a relative historical, peer, contractual, or policy-backed comparison; no reusable exact cutoff was "
+            "established by the evaluation evidence."
+        )
+        warnings.append(f"{field_name}: removed unsupported exact thresholds {unsupported}")
+    if warnings:
+        sanitized["guidance_sanitization"] = warnings
+    return sanitized
+
+
+def source_establishes_threshold_rule(source_text: str, token: str) -> bool:
+    compact_token = token.replace(" ", "")
+    return any(
+        compact_token in sentence.replace(" ", "") and THRESHOLD_RULE_CONTEXT_PATTERN.search(sentence)
+        for sentence in re.split(r"[。.!?\uff1b;\n]+", source_text)
+    )
+
+
 def build_judge_feedback(
     *,
     example: dict[str, Any],
@@ -3146,6 +3234,7 @@ def build_judge_feedback(
     judge_remediation = str(payload.get("recommended_remediation") or "").strip()
     feedback_text = str(payload.get("feedback") or "").strip()
     boundary_assessment = str(payload.get("boundary_assessment") or "").strip()
+    sanitization_lines = "\n".join(f"- {item}" for item in payload.get("guidance_sanitization") or []) or "- none"
     fitness = state.get("fitness", {})
     mutation_eligible = bool(fitness.get("mutation_eligible", True))
     mutation_eligibility_reason = str(fitness.get("mutation_eligibility_reason") or "not provided")
@@ -3165,6 +3254,9 @@ def build_judge_feedback(
     )
     tool_capability_gap_lines = (
         "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]) or "- none"
+    )
+    tool_data_coverage_gap_lines = (
+        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_data_coverage_gaps"]) or "- none"
     )
     successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
     failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
@@ -3201,6 +3293,8 @@ def build_judge_feedback(
         f"- applicability_scope: {applicability_scope}\n"
         f"- cross_case_regression_risk: {regression_risk}\n"
         f"- operational_rule: {operational_rule}\n\n"
+        "Judge guidance sanitization:\n"
+        f"{sanitization_lines}\n\n"
         f"- judge_trajectory_diagnosis: {trajectory_diagnosis or 'not provided'}\n"
         f"- judge_recommended_remediation: {judge_remediation or 'not provided'}\n\n"
         "Remediation actions:\n"
@@ -3219,6 +3313,8 @@ def build_judge_feedback(
         f"{tool_supported_missing_lines}\n\n"
         "Tool capability gaps:\n"
         f"{tool_capability_gap_lines}\n\n"
+        "Tool/data coverage gaps:\n"
+        f"{tool_data_coverage_gap_lines}\n\n"
         "Checkpoint-specific evidence attribution:\n"
         f"{checkpoint_evidence_lines}\n\n"
         "Successful tool evidence:\n"
@@ -3272,7 +3368,10 @@ def mutation_eligibility_diagnostics(
 
     skipped_supported = list(fitness.get("skipped_supported_expectations") or [])
     failed_invocation = list(fitness.get("failed_tool_invocation_expectations") or [])
-    incomplete_results = list(fitness.get("incomplete_tool_result_expectations") or [])
+    data_coverage_gaps = {str(item) for item in fitness.get("tool_data_coverage_gaps") or []}
+    incomplete_results = [
+        item for item in fitness.get("incomplete_tool_result_expectations") or [] if str(item) not in data_coverage_gaps
+    ]
     text_actionable_tool_paths = [*skipped_supported, *failed_invocation, *incomplete_results]
     if text_actionable_tool_paths:
         return {
@@ -3303,11 +3402,12 @@ def mutation_eligibility_diagnostics(
 
     blocked_checkpoints = list(fitness.get("tool_blocked_missing_checkpoints") or [])
     tool_gaps = list(fitness.get("tool_capability_gaps") or [])
-    if blocked_checkpoints or tool_gaps:
+    tool_data_gaps = list(fitness.get("tool_data_coverage_gaps") or [])
+    if blocked_checkpoints or tool_gaps or tool_data_gaps:
         return {
             "mutation_eligible": False,
             "mutation_eligibility_reason": "missing expert checkpoints depend on evidence unavailable from current tools: "
-            + ", ".join(str(item) for item in (blocked_checkpoints or tool_gaps)[:3]),
+            + ", ".join(str(item) for item in (blocked_checkpoints or tool_gaps or tool_data_gaps)[:3]),
             "mutation_block_classification": TOOL_CAPABILITY_GAP,
         }
 
@@ -3349,6 +3449,7 @@ def classify_failure(
     supported_missing = list(fitness.get("tool_supported_missing_expectations") or [])
     runtime_supported = list(fitness.get("runtime_supported_missing_checkpoints") or [])
     tool_actionable = list(fitness.get("tool_actionable_missing_checkpoints") or [])
+    tool_data_gaps = {str(item) for item in fitness.get("tool_data_coverage_gaps") or []}
     actionable_expectations = [
         str(item)
         for key in (
@@ -3357,6 +3458,7 @@ def classify_failure(
             "incomplete_tool_result_expectations",
         )
         for item in fitness.get(key) or []
+        if str(item) not in tool_data_gaps
     ]
 
     expected = example.get("answer") or example.get("expected") or ""
@@ -3397,10 +3499,16 @@ def classify_failure(
         )
     if float(fitness.get("hard", 0.0)) >= 1.0:
         return NO_FAILURE, "candidate produced the expected route"
+    mapping_present = candidate_encodes_expected_case(example, state.get("candidate_excerpt", {}), expected)
+    if mapping_present is False:
+        return (
+            SKILL_DEFECT,
+            "the expected case-to-result mapping is not explicitly encoded in the current skill/reference",
+        )
     predicted = extract_route(response)
     if predicted is None:
         return EXECUTION_LAPSE, "agent did not follow the required <route> output contract"
-    if candidate_mentions_expected_route(state, expected):
+    if mapping_present or candidate_mentions_expected_route(state, expected):
         return EXECUTION_LAPSE, "existing skill/reference text appears to cover this route, but execution missed it"
     return SKILL_DEFECT, "routing guidance appears missing, wrong, or underspecified for this case"
 
@@ -3453,7 +3561,10 @@ def remediation_diagnostics(
     else:
         failed_runtime = list(fitness.get("failed_tool_runtime_expectations") or [])
         failed_invocation = list(fitness.get("failed_tool_invocation_expectations") or [])
-        incomplete_results = list(fitness.get("incomplete_tool_result_expectations") or [])
+        data_coverage_gaps = list(fitness.get("tool_data_coverage_gaps") or [])
+        incomplete_results = [
+            item for item in fitness.get("incomplete_tool_result_expectations") or [] if item not in data_coverage_gaps
+        ]
         skipped_supported = list(fitness.get("skipped_supported_expectations") or [])
         capability_gaps = list(fitness.get("tool_capability_gaps") or [])
         matched_expectations = list(fitness.get("matched_trace_expectations") or [])
@@ -3483,6 +3594,14 @@ def remediation_diagnostics(
                 "a matching tool returned successfully but did not provide evidence satisfying the acquisition "
                 "expectation; inspect query construction, result coverage, and tool capability",
                 "tool_description_skill_or_implementation",
+            )
+        if data_coverage_gaps:
+            add_action(
+                ADD_TOOL_OR_MCP,
+                data_coverage_gaps,
+                "a matching tool returned an explicit no-data result; expand the connected data source or add another "
+                "tool/MCP capability instead of changing candidate text",
+                "tool_or_mcp",
             )
         if skipped_supported:
             add_action(
@@ -3530,7 +3649,21 @@ def remediation_diagnostics(
                 "tool_or_mcp",
             )
 
-    primary = (
+    preferred_types = {
+        SKILL_DEFECT: (FIX_TEXT_CONSTRAINT, IMPROVE_SKILL_OR_REFERENCE),
+        EXECUTION_LAPSE: (
+            IMPROVE_TOOL_INVOCATION,
+            IMPROVE_TOOL_USAGE,
+            IMPROVE_TOOL_QUERY_OR_RESULT,
+            IMPROVE_AGENT_EXECUTION,
+            FIX_TOOL_RUNTIME,
+        ),
+        TOOL_CAPABILITY_GAP: (ADD_TOOL_OR_MCP,),
+        INSUFFICIENT_RUNTIME_EVIDENCE: (IMPROVE_EVAL_MAPPING,),
+        NO_FAILURE: (NO_ACTION,),
+    }.get(failure_classification, ())
+    primary = next(
+        (action for action_type in preferred_types for action in actions if action["type"] == action_type),
         actions[0]
         if actions
         else {
@@ -3538,7 +3671,7 @@ def remediation_diagnostics(
             "targets": [],
             "reason": "no concrete remediation was derived",
             "owner": "none",
-        }
+        },
     )
     return {
         "remediation_type": primary["type"],
@@ -3574,6 +3707,50 @@ def candidate_mentions_expected_route(state: dict, expected_route: str) -> bool:
     return False
 
 
+EXPECTED_MAPPING_STOPWORDS = frozenset(
+    {
+        "about",
+        "change",
+        "changes",
+        "expected",
+        "label",
+        "must",
+        "request",
+        "requests",
+        "route",
+        "routes",
+        "routing",
+        "support",
+        "should",
+        "team",
+        "then",
+        "unless",
+        "user",
+        "when",
+    }
+)
+
+
+def candidate_encodes_expected_case(
+    example: Mapping[str, Any],
+    candidate: Mapping[str, str],
+    expected: str,
+) -> bool | None:
+    """Check whether an authoritative rubric's discriminating terms exist in candidate knowledge."""
+    rubric = str(example.get("rubric") or "").strip()
+    if not rubric:
+        return None
+    terms = {
+        term
+        for term in re.findall(r"[a-z][a-z0-9_-]{3,}", rubric.casefold())
+        if term not in EXPECTED_MAPPING_STOPWORDS and term != expected.casefold()
+    }
+    if not terms:
+        return None
+    candidate_text = "\n".join(str(text) for text in candidate.values()).casefold()
+    return any(term in candidate_text for term in terms)
+
+
 def build_feedback(
     example: dict[str, Any],
     state: dict,
@@ -3607,6 +3784,9 @@ def build_feedback(
         "\n".join(f"- {item}" for item in fitness.get("tool_supported_missing_expectations", [])) or "- none"
     )
     tool_capability_gap_lines = "\n".join(f"- {item}" for item in fitness.get("tool_capability_gaps", [])) or "- none"
+    tool_data_coverage_gap_lines = (
+        "\n".join(f"- {item}" for item in fitness.get("tool_data_coverage_gaps", [])) or "- none"
+    )
     successful_tool_evidence_lines = tool_evidence_text(fitness.get("successful_tool_evidence", []))
     failed_tool_evidence_lines = tool_evidence_text(fitness.get("failed_tool_evidence", []))
     remediation_lines = remediation_actions_text(fitness)
@@ -3661,6 +3841,8 @@ def build_feedback(
         f"{tool_supported_missing_lines}\n\n"
         "Tool capability gaps:\n"
         f"{tool_capability_gap_lines}\n\n"
+        "Tool/data coverage gaps:\n"
+        f"{tool_data_coverage_gap_lines}\n\n"
         "Checkpoint-specific evidence attribution:\n"
         f"{checkpoint_evidence_lines}\n\n"
         "Successful tool evidence:\n"
@@ -4422,16 +4604,29 @@ def split_examples(
         grouped.setdefault(dataset_stratum(example, stratify_by), []).append(example)
     ordered_groups = sorted(grouped.items(), key=lambda item: stable_split_key(item[0], seed))
     for stratum, rows in ordered_groups:
+        existing_by_split = {
+            name: sum(
+                1 for example in buckets[name] if str((example.get("metadata") or {}).get("dataset_stratum")) == stratum
+            )
+            for name in split_names
+        }
+        stratum_targets = dataset_split_targets(
+            sum(existing_by_split.values()) + len(rows), train_ratio, val_ratio, test_ratio
+        )
         for example in sorted(rows, key=lambda row: stable_split_key(str(row.get("input", "")), seed)):
+            destinations_with_capacity = [name for name in split_names if len(buckets[name]) < targets[name]]
+            destinations = destinations_with_capacity or list(split_names)
             destination = max(
-                split_names,
+                destinations,
                 key=lambda name: (
+                    stratum_targets[name] - existing_by_split[name],
                     targets[name] - len(buckets[name]),
                     targets[name],
                     -split_names.index(name),
                 ),
             )
             buckets[destination].append(tag_dataset_split(example, destination, stratum=stratum))
+            existing_by_split[destination] += 1
 
     if not buckets["train"]:
         buckets["train"].append(buckets["val"].pop() if buckets["val"] else buckets["test"].pop())
@@ -4532,6 +4727,22 @@ def final_test_summary(seed_evaluation: Any, best_evaluation: Any) -> dict[str, 
     }
 
 
+def is_rubric_only_expert_dataset(examples: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether baseline attribution is useful before text optimization."""
+    if not examples or any(example.get("answer") or example.get("expected") for example in examples):
+        return False
+    return any(
+        isinstance(example.get("metadata"), Mapping)
+        and bool(example["metadata"].get("checkpoints") or example["metadata"].get("trace_expectations"))
+        for example in examples
+    )
+
+
+def evaluation_metric_calls(evaluation: Any, default: int) -> int:
+    calls = getattr(evaluation, "num_metric_calls", None)
+    return default if calls is None else int(calls)
+
+
 def run_configured_skill_optimization(
     config_path: str | Path,
     task_llm: BaseChatModel,
@@ -4543,6 +4754,7 @@ def run_configured_skill_optimization(
     evaluator: Evaluator | Callable[[Mapping[str, Any], Mapping[str, Any]], tuple[float, str]] | None = None,
     template_registry: ReflectionTemplateRegistry | None = None,
     component_selector: ComponentSelector | None = None,
+    actionability_policy: ActionabilityPolicy | None = None,
     proposal_reviewer: ProposalReviewer | None = None,
     constraint_policy: Constraint | None = None,
     mcp_loader: Callable[[Sequence[MCPServerConfig], dict[str, str]], Sequence[BaseTool | Callable | dict[str, Any]]]
@@ -4624,14 +4836,64 @@ def run_configured_skill_optimization(
         reflective_record_fn=reflective_record,
         num_threads=num_threads,
     )
+    optimization_train_set = train_set
+    optimization_metric_budget = max_metric_calls
+    should_preflight = config.dataset.preflight_actionability and is_rubric_only_expert_dataset(train_set)
+    minimum_gepa_budget = max(1, len(val_set))
+    if should_preflight and len(train_set) + minimum_gepa_budget <= max_metric_calls:
+        preflight_evaluation = adapter.evaluate(
+            examples_for_evaluation_phase(train_set, "preflight_train"),
+            seed_candidate,
+            capture_traces=True,
+        )
+        partition = (actionability_policy or DefaultActionabilityPolicy()).partition(
+            train_set,
+            preflight_evaluation,
+            regression_guard_limit=max(1, reflection_minibatch_size - 1),
+        )
+        optimization_train_set = [train_set[index] for index in partition.optimization_indices]
+        preflight_calls = evaluation_metric_calls(preflight_evaluation, len(train_set))
+        optimization_metric_budget = max(minimum_gepa_budget, max_metric_calls - preflight_calls)
+        if partition.fallback_to_unfiltered:
+            optimization_metric_budget = minimum_gepa_budget
+            LOGGER.warning(
+                "actionability preflight found no text-actionable training examples; "
+                "keeping the full train set for diagnostics and limiting GEPA to baseline validation"
+            )
+        LOGGER.info(
+            "actionability preflight evaluated=%d actionable=%d guards=%d tool_blocked=%d other=%d "
+            "optimization_train=%d preflight_calls=%d gepa_budget=%d",
+            len(train_set),
+            len(partition.actionable_indices),
+            len(partition.regression_guard_indices),
+            len(partition.tool_blocked_indices),
+            len(partition.other_indices),
+            len(optimization_train_set),
+            preflight_calls,
+            optimization_metric_budget,
+        )
+        if artifact_store is not None:
+            artifact_store.write_actionability_preflight(
+                examples=train_set,
+                evaluation=preflight_evaluation,
+                partition=partition,
+                optimization_examples=optimization_train_set,
+            )
+    elif should_preflight:
+        LOGGER.warning(
+            "actionability preflight skipped: max_metric_calls=%d cannot cover train=%d plus baseline val=%d",
+            max_metric_calls,
+            len(train_set),
+            minimum_gepa_budget,
+        )
     result = optimize(
         seed_candidate=seed_candidate,
-        trainset=train_set,
+        trainset=optimization_train_set,
         valset=val_set,
         adapter=adapter,
         reflection_lm=reflection_callable,
         reflection_prompt_template=templates,
-        max_metric_calls=max_metric_calls,
+        max_metric_calls=optimization_metric_budget,
         reflection_minibatch_size=reflection_minibatch_size,
         module_selector=component_selector or DefaultFeedbackComponentSelector(),
         candidate_selection_strategy="pareto",

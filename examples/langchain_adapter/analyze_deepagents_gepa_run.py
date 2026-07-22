@@ -54,8 +54,18 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     proposal_reviews = read_jsonl(run_dir / "proposal_reviews" / "index.jsonl")
     proposals = latest_proposal_events(proposal_events)
     rejected_proposals = latest_proposal_events(rejected_proposal_events)
+    preflight_actionability = read_json(
+        run_dir / "diagnostics" / "actionability_preflight.json",
+        summary.get("preflight_actionability"),
+    )
+    preflight_rollouts = [
+        row for row in rollouts if str(row.get("evaluation_phase", "optimization")).startswith("preflight")
+    ]
     optimization_rollouts = [
-        row for row in rollouts if not str(row.get("evaluation_phase", "optimization")).startswith("final_test")
+        row for row in rollouts if str(row.get("evaluation_phase", "optimization")) == "optimization"
+    ]
+    final_test_rollouts = [
+        row for row in rollouts if str(row.get("evaluation_phase", "optimization")).startswith("final_test")
     ]
     rollout_details = read_rollout_details(run_dir, optimization_rollouts)
 
@@ -93,6 +103,13 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     tool_capability_gap_unique_inputs = unique_input_counts(
         rollout_details,
         lambda detail: detail.get("fitness", {}).get("tool_capability_gaps", []),
+    )
+    tool_data_coverage_gaps = Counter(
+        gap for detail in rollout_details for gap in detail.get("fitness", {}).get("tool_data_coverage_gaps", [])
+    )
+    tool_data_coverage_gap_unique_inputs = unique_input_counts(
+        rollout_details,
+        lambda detail: detail.get("fitness", {}).get("tool_data_coverage_gaps", []),
     )
     missed_supported_expectations = Counter(
         gap
@@ -193,9 +210,12 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "tied_best_indices": summary.get("tied_best_indices", []),
         "num_candidates": summary.get("num_candidates"),
         "total_metric_calls": summary.get("total_metric_calls"),
+        "overall_metric_calls": summary.get("overall_metric_calls", summary.get("total_metric_calls")),
         "num_full_val_evals": summary.get("num_full_val_evals"),
+        "preflight_rollout_count": len(preflight_rollouts),
+        "preflight_actionability": preflight_actionability,
         "rollout_count": len(optimization_rollouts),
-        "final_test_rollout_count": len(rollouts) - len(optimization_rollouts),
+        "final_test_rollout_count": len(final_test_rollouts),
         "rollout_score_mean": sum(scores) / len(scores) if scores else None,
         "rollout_score_min": min(scores) if scores else None,
         "rollout_score_max": max(scores) if scores else None,
@@ -206,6 +226,8 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "candidate_runtime_skipped_count": runtime_skipped_count,
         "tool_capability_gaps": dict(tool_capability_gaps.most_common()),
         "tool_capability_gap_unique_inputs": dict(tool_capability_gap_unique_inputs.most_common()),
+        "tool_data_coverage_gaps": dict(tool_data_coverage_gaps.most_common()),
+        "tool_data_coverage_gap_unique_inputs": dict(tool_data_coverage_gap_unique_inputs.most_common()),
         "missed_supported_expectations": dict(missed_supported_expectations.most_common()),
         "missed_supported_expectation_unique_inputs": dict(missed_supported_expectation_unique_inputs.most_common()),
         "missing_trace_expectations": dict(missing_trace_expectations.most_common()),
@@ -539,7 +561,19 @@ def print_report(summary: dict[str, Any]) -> None:
         f"tie_break={summary['tie_break_applied']} policy={summary['selection_policy']}"
     )
     print(f"Metric calls: {summary['total_metric_calls']}")
+    if summary.get("overall_metric_calls") != summary.get("total_metric_calls"):
+        print(f"Metric calls including preflight: {summary['overall_metric_calls']}")
     print(f"Candidates: {summary['num_candidates']}")
+    print(f"Preflight rollouts: {summary['preflight_rollout_count']}")
+    if summary.get("preflight_actionability"):
+        preflight = summary["preflight_actionability"]
+        print(
+            "Preflight cohorts: "
+            f"actionable={len(preflight.get('actionable_indices', []))} "
+            f"guards={len(preflight.get('regression_guard_indices', []))} "
+            f"tool_blocked={len(preflight.get('tool_blocked_indices', []))} "
+            f"fallback={preflight.get('fallback_to_unfiltered', False)}"
+        )
     print(f"Rollouts: {summary['rollout_count']}")
     print(f"Final test rollouts: {summary['final_test_rollout_count']}")
     print(f"Runtime errors: {summary['runtime_errors']}")
@@ -549,6 +583,8 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Runtime-skipped candidates: {summary['candidate_runtime_skipped_count']}")
     print(f"Tool capability gaps: {summary['tool_capability_gaps']}")
     print(f"Tool capability gaps by unique input: {summary['tool_capability_gap_unique_inputs']}")
+    print(f"Tool/data coverage gaps: {summary['tool_data_coverage_gaps']}")
+    print(f"Tool/data coverage gaps by unique input: {summary['tool_data_coverage_gap_unique_inputs']}")
     print(f"Missed supported expectations: {summary['missed_supported_expectations']}")
     print(f"Missed supported expectations by unique input: {summary['missed_supported_expectation_unique_inputs']}")
     print(f"Missing trace expectations: {summary['missing_trace_expectations']}")

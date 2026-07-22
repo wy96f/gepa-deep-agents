@@ -2,11 +2,14 @@
 
 from examples.langchain_adapter.deepagents_gepa.artifacts import RunArtifactCallback, RunArtifactStore
 from examples.langchain_adapter.deepagents_gepa.framework import (
+    ActionabilityPartition,
+    ActionabilityPolicy,
     CandidateMaterializer,
     ComponentSelector,
     Constraint,
     DatasetProvider,
     DefaultCandidateMaterializer,
+    DefaultActionabilityPolicy,
     DefaultConstraintSet,
     DefaultDatasetProvider,
     DefaultEvaluator,
@@ -18,11 +21,14 @@ from examples.langchain_adapter.deepagents_gepa.framework import (
 )
 
 __all__ = [
+    "ActionabilityPartition",
+    "ActionabilityPolicy",
     "CandidateMaterializer",
     "ComponentSelector",
     "Constraint",
     "DatasetProvider",
     "DefaultCandidateMaterializer",
+    "DefaultActionabilityPolicy",
     "DefaultConstraintSet",
     "DefaultDatasetProvider",
     "DefaultEvaluator",

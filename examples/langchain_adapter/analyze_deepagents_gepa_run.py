@@ -211,6 +211,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "num_candidates": summary.get("num_candidates"),
         "total_metric_calls": summary.get("total_metric_calls"),
         "overall_metric_calls": summary.get("overall_metric_calls", summary.get("total_metric_calls")),
+        "metric_calls_by_phase": summary.get("metric_calls_by_phase", {}),
         "num_full_val_evals": summary.get("num_full_val_evals"),
         "preflight_rollout_count": len(preflight_rollouts),
         "preflight_actionability": preflight_actionability,
@@ -562,7 +563,9 @@ def print_report(summary: dict[str, Any]) -> None:
     )
     print(f"Metric calls: {summary['total_metric_calls']}")
     if summary.get("overall_metric_calls") != summary.get("total_metric_calls"):
-        print(f"Metric calls including preflight: {summary['overall_metric_calls']}")
+        print(f"Metric calls across all phases: {summary['overall_metric_calls']}")
+    if summary.get("metric_calls_by_phase"):
+        print(f"Metric calls by phase: {summary['metric_calls_by_phase']}")
     print(f"Candidates: {summary['num_candidates']}")
     print(f"Preflight rollouts: {summary['preflight_rollout_count']}")
     if summary.get("preflight_actionability"):

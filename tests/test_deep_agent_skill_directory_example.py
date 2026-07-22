@@ -466,6 +466,90 @@ def test_component_selector_only_mutates_owning_skill_when_reference_route_is_mi
     assert ordinary_selected == [ordinary_reference_key]
 
 
+def test_component_selector_makes_unread_reference_reachable_from_execution_policy():
+    example = _load_example_module()
+    reference_key = "skill:credit-risk-review:reference/financial_statement_analysis.md"
+    skill_key = "skill:credit-risk-review:SKILL.md"
+    candidate = {
+        "memory:AGENTS.md": "Use the credit risk skill.",
+        skill_key: "Read the relevant reference when needed.",
+        reference_key: "# Financial analysis",
+    }
+    feedback = f"Scores:\n- failure_classification: SKILL_DEFECT\n- suggested_component: {reference_key}"
+    selector = example.DarwinFeedbackComponentSelector()
+
+    selected = selector(
+        None,
+        [{"score": 0.4, "feedback": feedback, "state": {"messages": []}}],
+        [0.4],
+        0,
+        candidate,
+    )
+
+    assert selected == ["memory:AGENTS.md", reference_key]
+
+
+def test_component_selector_routes_from_consumed_skill_to_unread_reference():
+    example = _load_example_module()
+    reference_key = "skill:credit-risk-review:reference/financial_statement_analysis.md"
+    skill_key = "skill:credit-risk-review:SKILL.md"
+    candidate = {
+        "memory:AGENTS.md": "Use the credit risk skill.",
+        skill_key: "Read the relevant reference when needed.",
+        reference_key: "# Financial analysis",
+    }
+    feedback = f"Scores:\n- failure_classification: SKILL_DEFECT\n- suggested_component: {reference_key}"
+    skill_read = {
+        "tool_calls": [
+            {
+                "name": "read_file",
+                "args": {"file_path": "/skills/credit-risk-review/SKILL.md"},
+            }
+        ]
+    }
+    selector = example.DarwinFeedbackComponentSelector()
+
+    selected = selector(
+        None,
+        [{"score": 0.4, "feedback": feedback, "state": {"messages": [skill_read]}}],
+        [0.4],
+        0,
+        candidate,
+    )
+
+    assert selected == [reference_key, skill_key]
+
+
+def test_component_selector_keeps_consumed_reference_as_single_target():
+    example = _load_example_module()
+    reference_key = "skill:credit-risk-review:reference/financial_statement_analysis.md"
+    candidate = {
+        "memory:AGENTS.md": "Use the credit risk skill.",
+        "skill:credit-risk-review:SKILL.md": "Read the relevant reference when needed.",
+        reference_key: "# Financial analysis",
+    }
+    feedback = f"Scores:\n- failure_classification: SKILL_DEFECT\n- suggested_component: {reference_key}"
+    reference_read = {
+        "tool_calls": [
+            {
+                "name": "read_file",
+                "args": {"path": "/skills/credit-risk-review/reference/financial_statement_analysis.md"},
+            }
+        ]
+    }
+    selector = example.DarwinFeedbackComponentSelector()
+
+    selected = selector(
+        None,
+        [{"score": 0.4, "feedback": feedback, "state": {"messages": [reference_read]}}],
+        [0.4],
+        0,
+        candidate,
+    )
+
+    assert selected == [reference_key]
+
+
 def test_deployment_candidate_selection_preserves_incumbent_on_validation_tie():
     example = _load_example_module()
     result = SimpleNamespace(
@@ -568,6 +652,62 @@ def test_noop_aware_adapter_reuses_evaluation_when_selector_returns_no_component
 
     adapter.evaluate(batch, candidate, capture_traces=True)
     assert rollout_calls == 2
+
+
+def test_reflective_dataset_deduplicates_repeated_records_and_shared_component_map():
+    example = _load_example_module()
+
+    def record(row, _state, score, feedback):
+        return {
+            "Runtime input": row["input"],
+            "Score": score,
+            "Feedback": feedback,
+            "Project component map": {"memory:AGENTS.md": "shared"},
+        }
+
+    adapter = example.NoOpAwareLangChainAdapter(
+        rollout_fn=lambda _candidate, _row: {"messages": []},
+        eval_fn=lambda _row, _state: (0.5, "feedback"),
+        reflective_record_fn=record,
+        num_threads=1,
+        show_progress=False,
+    )
+    repeated = {
+        "data": {"input": "same"},
+        "state": {"messages": []},
+        "score": 0.5,
+        "feedback": "feedback",
+    }
+    distinct = {
+        "data": {"input": "different"},
+        "state": {"messages": []},
+        "score": 0.4,
+        "feedback": "other feedback",
+    }
+    evaluation = example.EvaluationBatch(
+        outputs=[],
+        scores=[0.5, 0.5, 0.4],
+        trajectories=[repeated, repeated, distinct],
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        {"memory:AGENTS.md": "shared"},
+        evaluation,
+        ["memory:AGENTS.md", "main:system_prompt"],
+    )["memory:AGENTS.md"]
+
+    assert len(dataset) == 2
+    assert dataset[0]["Selected component bundle"] == ["memory:AGENTS.md", "main:system_prompt"]
+    assert "Project component map" in dataset[0]
+    assert "Project component map" not in dataset[1]
+
+
+def test_effective_reflection_minibatch_is_limited_by_unique_optimization_pool():
+    example = _load_example_module()
+    rows = example.deduplicate_examples([{"input": "steel"}, {"input": "steel"}])
+
+    assert rows == [{"input": "steel"}]
+    assert example.effective_reflection_minibatch_size(3, rows) == 1
 
 
 def test_noop_aware_adapter_reuses_trailing_whitespace_only_proposal():
@@ -762,6 +902,8 @@ def test_judge_prompt_includes_expert_data_and_trace_expectations(tmp_path):
     assert "Trace expectations:" in prompt
     assert "行业周期信息获取" in prompt
     assert "Do not grow SKILL.md into an industry catalog" in prompt
+    assert "an unread reference edit cannot change behavior" in prompt
+    assert "Partial evidence may support a correspondingly narrow risk finding" in prompt
     assert "cross_case_regression_risk" in prompt
     assert "those fields are hidden during rollout" in prompt
 
@@ -1975,6 +2117,8 @@ def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
     assert "Do not repeat generic finance" in template
     assert "company name or keyword is only a weak discovery clue" in template
     assert "Do not invent fixed cutoffs" in template
+    assert "unread reference needs a reachable routing instruction" in template
+    assert "evidence lists as possible sources" in template
 
 
 def test_proposal_reviewer_revises_and_persists_original_and_review(tmp_path):
@@ -2044,6 +2188,24 @@ def test_proposal_reviewer_rejects_to_exact_no_change():
 
     assert "# Existing memory\n\nKeep this exact text." in result
     assert "Memorize hidden facts." not in result
+
+
+def test_proposal_reviewer_parses_json_and_caps_issue_chatter():
+    example = _load_example_module()
+    issues = [f"issue {index} " + ("x" * 600) for index in range(8)]
+    review = example.DefaultProposalReviewer._parse_output(
+        json.dumps(
+            {
+                "decision": "REJECT",
+                "issues": issues,
+                "reviewed_response": "same",
+            }
+        )
+    )
+
+    assert review.decision == "REJECT"
+    assert len(review.issues) == 5
+    assert all(len(issue) <= 500 for issue in review.issues)
 
 
 def test_proposal_reviewer_exhausted_revision_returns_no_change(tmp_path):
@@ -2371,6 +2533,12 @@ def test_artifacts_materialize_explicitly_selected_candidate(tmp_path):
     assert summary["tie_break_applied"] is True
     assert summary["selection_policy"] == "incumbent_on_validation_tie"
     assert summary["tied_best_indices"] == [0, 1]
+    assert summary["metric_calls_by_phase"] == {
+        "gepa": 5,
+        "preflight": 0,
+        "final_test": 0,
+        "all_phases": 5,
+    }
     assert best_candidate == accepted_candidate
     assert (run_dir / "materialized_best_candidate" / "selected.txt").read_text(
         encoding="utf-8"

@@ -840,20 +840,33 @@ selection. `TOOL_CAPABILITY_GAP` trajectories are excluded from this vote.
 `INSUFFICIENT_RUNTIME_EVIDENCE`, `NO_FAILURE`, and any feedback explicitly
 marked `mutation_eligible: false` are excluded as well.
 
-When the selected component is an explicitly managed learned/expert/experience
-reference, the selector first checks whether its owning `SKILL.md` already
-routes to that reference. If it does, only the reference is mutated. Otherwise,
-the selector also mutates the owning `SKILL.md` so the workflow can add the
-missing applicability trigger and lookup step. Ordinary reference files remain
-single-component mutations. This avoids both unread learned knowledge and the
-failure mode where a model copies the reference body into an already-correct
-`SKILL.md`.
+When a selected component is a reference, the selector checks actual
+`read_file` calls in the failed trajectories. If the reference was consumed, it
+can be optimized directly. If `SKILL.md` was read but the reference was not,
+the proposal also updates that owning skill's resource routing. If neither was
+read, the proposal includes the relevant prompt/memory execution surface plus
+the reference. The reflective record names this component bundle so the
+proposal reviewer can require one edit to make the resource reachable while
+the other carries the compact domain lesson. For trajectories that do not
+expose file reads, managed learned/expert/experience references retain the
+static owning-skill dependency check.
 
-The default reflection minibatch size is `3`, so a proposal normally sees more
-than one trajectory and must explain evidence across examples. For small,
-heterogeneous datasets, keep validation coverage across multiple industries;
-scope a rule by observable entity signals when it helps one segment but could
-reduce quality in another.
+The configured reflection minibatch size defaults to `3`, but the harness caps
+it at the number of unique optimization examples. Structurally identical
+reflection records are removed before proposal generation, and the shared
+component map is included only once. A one-example actionable pool therefore
+uses a minibatch of one instead of repeating the same trajectory three times.
+For small, heterogeneous datasets, keep validation coverage across multiple
+industries; scope a rule by observable entity signals when it helps one segment
+but could reduce quality in another.
+
+Evidence lists in skills and references are possible sources unless an item is
+explicitly marked mandatory. The agent may analyze the supported subset, but
+the scope and uncertainty of its conclusion must match the evidence actually
+obtained. Missing sources are attributed separately to absent tools, skipped
+tools, failed calls, insufficient results, or available evidence omitted from
+analysis; they are not converted into a mechanical requirement to collect every
+listed item.
 
 GEPA's own acceptance and Pareto frontier act as the in-memory ratchet. This
 example does not implement SkillOpt's patch schema, hierarchical merge,

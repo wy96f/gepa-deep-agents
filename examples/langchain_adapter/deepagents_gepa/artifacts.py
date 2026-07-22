@@ -600,7 +600,7 @@ class RunArtifactStore:
                 self.run_dir / "proposal_reviews" / "index.jsonl",
                 {
                     **record,
-                    "detail_dir": str(review_dir.relative_to(self.run_dir)),
+                    "detail_dir": review_dir.relative_to(self.run_dir).as_posix(),
                 },
             )
 
@@ -676,7 +676,7 @@ class RunArtifactStore:
                     component: rationale[:300] for component, rationale in rationales.items()
                 },
                 "missing_proposal_rationale": missing_rationales,
-                "proposal_dir": str(proposal_dir.relative_to(self.run_dir)),
+                "proposal_dir": proposal_dir.relative_to(self.run_dir).as_posix(),
             },
         )
 
@@ -717,7 +717,7 @@ class RunArtifactStore:
                     component: rationale[:300] for component, rationale in rationales.items()
                 },
                 "missing_proposal_rationale": missing_rationales,
-                "proposal_dir": str(rejected_dir.relative_to(self.run_dir)),
+                "proposal_dir": rejected_dir.relative_to(self.run_dir).as_posix(),
             },
         )
 
@@ -806,6 +806,11 @@ class RunArtifactStore:
         preflight_metric_calls = (
             int(self._preflight_summary.get("metric_calls", 0)) if self._preflight_summary is not None else 0
         )
+        all_phase_metric_calls = (
+            int(gepa_metric_calls) + preflight_metric_calls + self._final_test_metric_calls
+            if gepa_metric_calls is not None
+            else None
+        )
         summary = {
             "result_type": type(result).__name__,
             "best_idx": selected_best_idx,
@@ -822,11 +827,13 @@ class RunArtifactStore:
             "parents": getattr(result, "parents", None),
             "discovery_eval_counts": getattr(result, "discovery_eval_counts", None),
             "total_metric_calls": gepa_metric_calls,
-            "overall_metric_calls": (
-                int(gepa_metric_calls) + preflight_metric_calls + self._final_test_metric_calls
-                if gepa_metric_calls is not None
-                else None
-            ),
+            "overall_metric_calls": all_phase_metric_calls,
+            "metric_calls_by_phase": {
+                "gepa": gepa_metric_calls,
+                "preflight": preflight_metric_calls,
+                "final_test": self._final_test_metric_calls,
+                "all_phases": all_phase_metric_calls,
+            },
             "num_full_val_evals": getattr(result, "num_full_val_evals", None),
             "num_candidates": getattr(result, "num_candidates", None),
             "run_dir": str(self.run_dir),

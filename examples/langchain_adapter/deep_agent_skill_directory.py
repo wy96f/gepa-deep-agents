@@ -227,15 +227,35 @@ class NoOpAwareLangChainAdapter(LangChainAdapter):
         eval_batch: EvaluationBatch,
         components_to_update: list[str],
     ) -> Mapping[str, Sequence[Mapping[str, Any]]]:
-        if components_to_update:
-            return super().make_reflective_dataset(candidate, eval_batch, components_to_update)
+        if not components_to_update:
+            self._reuse_evaluation = eval_batch
+            self._reuse_candidate = dict(candidate)
+            self._reuse_batch = [
+                dict(item) if isinstance(item, Mapping) else item for item in getattr(self, "_last_evaluated_batch", [])
+            ]
+            return {}
 
-        self._reuse_evaluation = eval_batch
-        self._reuse_candidate = dict(candidate)
-        self._reuse_batch = [
-            dict(item) if isinstance(item, Mapping) else item for item in getattr(self, "_last_evaluated_batch", [])
-        ]
-        return {}
+        reflective_dataset = super().make_reflective_dataset(candidate, eval_batch, components_to_update)
+        compact: dict[str, list[Mapping[str, Any]]] = {}
+        for component, raw_records in reflective_dataset.items():
+            records = deduplicate_mappings(raw_records)
+            compact_records: list[Mapping[str, Any]] = []
+            for index, record in enumerate(records):
+                current = dict(record)
+                if index == 0 and len(components_to_update) > 1:
+                    current["Selected component bundle"] = list(components_to_update)
+                if index > 0:
+                    current.pop("Project component map", None)
+                compact_records.append(current)
+            compact[component] = compact_records
+            if len(records) != len(raw_records):
+                LOGGER.info(
+                    "reflective_dataset_deduplicated component=%s before=%d after=%d",
+                    component,
+                    len(raw_records),
+                    len(records),
+                )
+        return compact
 
     def remember_evaluated_batch(
         self,
@@ -280,6 +300,34 @@ def candidates_equal_ignoring_trailing_whitespace(
     right: Mapping[str, str],
 ) -> bool:
     return set(left) == set(right) and all(str(left[key]).rstrip() == str(right[key]).rstrip() for key in left)
+
+
+def deduplicate_mappings(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Preserve order while removing structurally identical optimizer records."""
+    unique: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        try:
+            identity = json.dumps(row, ensure_ascii=False, sort_keys=True, default=repr)
+        except TypeError:  # pragma: no cover - defensive fallback for provider objects.
+            identity = repr(row)
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        unique.append(row)
+    return unique
+
+
+def deduplicate_examples(examples: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(row) for row in deduplicate_mappings(examples)]
+
+
+def effective_reflection_minibatch_size(
+    configured_size: int,
+    optimization_examples: Sequence[Mapping[str, Any]],
+) -> int:
+    return max(1, min(int(configured_size), len(optimization_examples)))
 
 
 @dataclass
@@ -3029,13 +3077,19 @@ def build_judge_prompt(
         "invariant workflow, resource routing, failure modes, and guardrails; reference/*.md holds scoped domain "
         "methodology, industry patterns, calculations, and expert knowledge; tool descriptions hold invocation semantics "
         "and capability boundaries. Prefer the most specific existing reference component for domain knowledge. Do not "
-        "grow SKILL.md into an industry catalog.\n"
+        "grow SKILL.md into an industry catalog. Before recommending a skill/reference edit, verify that the trace read "
+        "that component. If it was not consumed, diagnose the reachability/execution lapse and recommend the owning "
+        "SKILL.md routing instruction or prompt/memory policy; an unread reference edit cannot change behavior.\n"
         "Treat a single example as evidence for a candidate rule, not proof of a universal rule. Recommend explicit "
         "applicability signals and exclusions whenever a change could help one industry or business model but harm "
         "another. A useful rule must be concrete enough to change behavior, but do not force every reminder into a fixed "
         "trigger/evidence/analysis/consequence template. Include only the non-obvious condition, evidence distinction, "
         "comparison, or transmission logic needed for that lesson. Keep unsupported or uncollected evidence as a "
         "hypothesis, and reject broad advice that does not alter investigation or reasoning.\n"
+        "Treat evidence lists in runtime skills/references as possible sources unless they explicitly declare an item "
+        "mandatory. Partial evidence may support a correspondingly narrow risk finding; do not require every listed "
+        "source, and do not infer a complete conclusion from only one partial signal. Score whether the output's scope "
+        "and uncertainty match the evidence actually acquired.\n"
         "Data-acquisition expectations are satisfied only by paired, successful tool-call results whose declared seed "
         "capability matches the expectation. Keywords in prompts, skills, AI prose, or final answers are not acquisition "
         "evidence. Diagnose each missing path precisely: no matching tool means TOOL_CAPABILITY_GAP; an available tool "
@@ -4836,7 +4890,7 @@ def run_configured_skill_optimization(
         reflective_record_fn=reflective_record,
         num_threads=num_threads,
     )
-    optimization_train_set = train_set
+    optimization_train_set = deduplicate_examples(train_set)
     optimization_metric_budget = max_metric_calls
     should_preflight = config.dataset.preflight_actionability and is_rubric_only_expert_dataset(train_set)
     minimum_gepa_budget = max(1, len(val_set))
@@ -4851,7 +4905,7 @@ def run_configured_skill_optimization(
             preflight_evaluation,
             regression_guard_limit=max(1, reflection_minibatch_size - 1),
         )
-        optimization_train_set = [train_set[index] for index in partition.optimization_indices]
+        optimization_train_set = deduplicate_examples([train_set[index] for index in partition.optimization_indices])
         preflight_calls = evaluation_metric_calls(preflight_evaluation, len(train_set))
         optimization_metric_budget = max(minimum_gepa_budget, max_metric_calls - preflight_calls)
         if partition.fallback_to_unfiltered:
@@ -4886,6 +4940,17 @@ def run_configured_skill_optimization(
             len(train_set),
             minimum_gepa_budget,
         )
+    effective_minibatch_size = effective_reflection_minibatch_size(
+        reflection_minibatch_size,
+        optimization_train_set,
+    )
+    if effective_minibatch_size != reflection_minibatch_size:
+        LOGGER.info(
+            "reflection_minibatch_adjusted configured=%d effective=%d unique_optimization_examples=%d",
+            reflection_minibatch_size,
+            effective_minibatch_size,
+            len(optimization_train_set),
+        )
     result = optimize(
         seed_candidate=seed_candidate,
         trainset=optimization_train_set,
@@ -4894,7 +4959,7 @@ def run_configured_skill_optimization(
         reflection_lm=reflection_callable,
         reflection_prompt_template=templates,
         max_metric_calls=optimization_metric_budget,
-        reflection_minibatch_size=reflection_minibatch_size,
+        reflection_minibatch_size=effective_minibatch_size,
         module_selector=component_selector or DefaultFeedbackComponentSelector(),
         candidate_selection_strategy="pareto",
         use_merge=True,

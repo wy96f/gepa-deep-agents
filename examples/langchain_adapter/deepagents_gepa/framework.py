@@ -7,6 +7,7 @@ component selection, constraints, materialization, and runner behavior.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -175,7 +176,7 @@ class DefaultFeedbackComponentSelector:
         candidate: dict[str, str],
     ) -> list[str]:
         del state, subsample_scores
-        suggested: dict[str, dict[str, float]] = {}
+        suggested: dict[str, dict[str, Any]] = {}
         actionable_trajectories = 0
         non_actionable_trajectories = 0
         sorted_trajectories = sorted(
@@ -194,10 +195,14 @@ class DefaultFeedbackComponentSelector:
             actionable_trajectories += 1
             component = self._component_from_feedback(feedback, candidate)
             if component is not None:
-                vote = suggested.setdefault(component, {"count": 0.0, "weight": 0.0, "min_score": 1.0})
+                vote = suggested.setdefault(
+                    component,
+                    {"count": 0.0, "weight": 0.0, "min_score": 1.0, "trajectories": []},
+                )
                 vote["count"] += 1
                 vote["weight"] += 1.0 + max(0.0, 1.0 - score)
                 vote["min_score"] = min(vote["min_score"], score)
+                vote["trajectories"].append(trajectory)
         if suggested:
             ranked_components = sorted(
                 suggested,
@@ -211,7 +216,11 @@ class DefaultFeedbackComponentSelector:
             for component in ranked_components:
                 if not self._is_cooled_down(candidate_idx, component):
                     selected = self._record_selection(candidate_idx, component)
-                    return self._with_component_dependencies(selected, candidate)
+                    return self._with_component_dependencies(
+                        selected,
+                        candidate,
+                        suggested[component]["trajectories"],
+                    )
             return [
                 self._record_selection(
                     candidate_idx,
@@ -223,15 +232,29 @@ class DefaultFeedbackComponentSelector:
         return [self._record_selection(candidate_idx, self._round_robin_fallback(candidate_idx, candidate))]
 
     @staticmethod
-    def _with_component_dependencies(component: str, candidate: Mapping[str, str]) -> list[str]:
-        """Add the owning workflow only when it does not yet route to the learned reference."""
+    def _with_component_dependencies(
+        component: str,
+        candidate: Mapping[str, str],
+        trajectories: Sequence[Mapping[str, Any]] = (),
+    ) -> list[str]:
+        """Make a selected reference reachable before asking it to change behavior."""
         selected = [component]
         if ":reference/" not in component:
             return selected
+        consumption = _component_consumption(component, trajectories)
+        skill_component = component.split(":reference/", maxsplit=1)[0] + ":SKILL.md"
+        if consumption is False:
+            skill_consumption = _component_consumption(skill_component, trajectories)
+            if skill_consumption:
+                return [component, skill_component] if skill_component in candidate else selected
+            execution_component = _prompt_or_memory_component(candidate)
+            return [execution_component, component] if execution_component != component else selected
+
+        # Preserve the existing learned-reference dependency for synthetic or
+        # externally supplied trajectories that do not expose file reads.
         reference_name = component.rsplit(":reference/", maxsplit=1)[-1].lower()
         if not any(marker in reference_name for marker in ("learned", "expert", "experience")):
             return selected
-        skill_component = component.split(":reference/", maxsplit=1)[0] + ":SKILL.md"
         skill_text = str(candidate.get(skill_component, "")).lower()
         if skill_component in candidate and reference_name not in skill_text:
             selected.append(skill_component)
@@ -289,6 +312,70 @@ class DefaultFeedbackComponentSelector:
         return keys[offset % len(keys)]
 
 
+def _prompt_or_memory_component(candidate: Mapping[str, str]) -> str:
+    for key in candidate:
+        if key.startswith("memory:"):
+            return key
+    if "main:system_prompt" in candidate:
+        return "main:system_prompt"
+    for key in candidate:
+        if key.startswith("subagent:") and key.endswith(":system_prompt"):
+            return key
+    return next(iter(candidate), "main:system_prompt")
+
+
+def _component_consumption(
+    component: str,
+    trajectories: Sequence[Mapping[str, Any]],
+) -> bool | None:
+    """Return whether a skill/reference component was read in any supplied trajectory."""
+    suffixes = _component_path_suffixes(component)
+    if not suffixes:
+        return None
+    states = [trajectory.get("state") for trajectory in trajectories if isinstance(trajectory, Mapping)]
+    observable_states = [state for state in states if isinstance(state, Mapping)]
+    if not observable_states:
+        return None
+    read_paths = {path for state in observable_states for path in _runtime_read_paths(state)}
+    return any(any(path.endswith(suffix) for suffix in suffixes) for path in read_paths)
+
+
+def _component_path_suffixes(component: str) -> tuple[str, ...]:
+    match = re.search(r"(?:^|:)skill:([^:]+):(SKILL\.md|reference/.+)$", component, re.I)
+    if match is None:
+        return ()
+    skill_name = match.group(1).strip("/\\").casefold()
+    relative_path = match.group(2).replace("\\", "/").strip("/").casefold()
+    return (
+        f"/{skill_name}/{relative_path}",
+        f"/skills/{skill_name}/{relative_path}",
+    )
+
+
+def _runtime_read_paths(state: Mapping[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for message in state.get("messages") or []:
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls is None and isinstance(message, Mapping):
+            tool_calls = message.get("tool_calls")
+        for call in tool_calls or []:
+            if not isinstance(call, Mapping):
+                continue
+            tool_name = str(call.get("name") or "").rsplit(".", maxsplit=1)[-1].casefold()
+            if tool_name not in {"read_file", "read_text_file"}:
+                continue
+            args = call.get("args")
+            if not isinstance(args, Mapping):
+                continue
+            raw_path = next(
+                (args.get(key) for key in ("file_path", "path", "file", "filename") if args.get(key)),
+                None,
+            )
+            if raw_path:
+                paths.add("/" + str(raw_path).replace("\\", "/").strip("/").casefold())
+    return paths
+
+
 class ReflectionTemplateRegistry(Protocol):
     """Provide reflection prompts for candidate surfaces."""
 
@@ -320,6 +407,9 @@ class DefaultReflectionTemplateRegistry:
             "runtime/upstream tool failure needs tool or environment repair; a successful but insufficient result needs "
             "query/result review; and relevant successful evidence omitted from the answer may justify a skill/reference "
             "change. Do not collapse these cases into one generic skill defect.\n"
+            "- Before editing a skill or reference, verify from read_file calls that the runtime agent consumed it. An "
+            "unread reference needs a reachable routing instruction in its owning SKILL.md, prompt, or memory; changing "
+            "the unread file alone cannot change behavior.\n"
             "- Tool gaps can coexist with text-actionable failures. Improve missing reusable methodology or supported "
             "tool usage when feedback selects this component, while preserving each unavailable source as an explicit "
             "tool backlog item rather than pretending the replacement can retrieve it.\n"
@@ -336,6 +426,9 @@ class DefaultReflectionTemplateRegistry:
             "Adapt it to the current business model and mark unsupported acquisition as TOOL_CAPABILITY_GAP. Follow the "
             "current output contract when deciding whether uncertainty should be omitted or briefly labeled; never "
             "present it as fact.\n"
+            "- Treat evidence lists as possible sources unless the component explicitly marks an item mandatory. If "
+            "only some evidence is available, produce only the analysis supported by that subset, preserve material "
+            "uncertainty, and do not require every listed source or infer the complete risk conclusion.\n"
             "- Check cross-example regression risk. If a rule helps one scope but may hurt another, make the condition "
             "explicit instead of applying the rule globally.\n"
             "- Add only the knowledge increment the runtime model is unlikely to recover reliably on its own. Prefer a "
@@ -536,6 +629,10 @@ class DefaultProposalReviewer:
             "2. Trajectory attribution: distinguish a missing tool, a skipped tool, bad call arguments, runtime/upstream "
             "failure, insufficient tool results, and successful evidence omitted from analysis. REJECT a text mutation "
             "when the remediation belongs only to tool implementation, credentials, dependencies, or dataset mapping.\n"
+            "A skill/reference edit can affect behavior only if the trace consumed that component. If the selected "
+            "reference was not read, require the selected component bundle to include its owning SKILL.md or the "
+            "appropriate prompt/memory execution policy. A compact reference edit may then carry the missing knowledge "
+            "while its companion edit makes the file reachable; otherwise reject the isolated unread-file mutation.\n"
             "3. Component ownership: keep global behavior in prompts/memory, invariant workflow in SKILL.md, compact "
             "domain cues in reference files, and invocation semantics in tool descriptions.\n"
             "4. Generalization: reject company-specific answers, entity-name-only triggers, closed industry lists, and "
@@ -559,13 +656,13 @@ class DefaultProposalReviewer:
             "the agent which skill to use instead of copying its workflow or linking to a skill-relative file.\n"
             "9. Regression risk: contain a scoped lesson with observable applicability signals; do not improve one "
             "sample by imposing a universal checklist on unrelated samples.\n\n"
-            "Return exactly this format:\n"
-            "Decision: ACCEPT | REVISE | REJECT\n"
-            "Issues:\n"
-            "- concise issue, or `none`\n"
-            "Reviewed response:\n"
-            "<for REVISE, a complete replacement response with `Proposal rationale:` and `Final replacement:`; "
-            "otherwise write `same`>\n\n"
+            "Evidence lists in a reference are possible sources, not an implicit requirement to obtain every item. "
+            "When only part of the evidence is available, preserve a conclusion whose scope matches that evidence and "
+            "its uncertainty. Reject proposals that require all listed evidence mechanically or infer a complete risk "
+            "conclusion from a partial signal.\n\n"
+            "Return JSON only using this schema:\n"
+            '{"decision":"ACCEPT|REVISE|REJECT","issues":["at most five concise issues"],'
+            '"reviewed_response":"for REVISE, a complete Proposal rationale + Final replacement; otherwise same"}\n\n'
             "REJECT means the evidence does not justify any text mutation. REVISE means return a complete corrected "
             "proposal, not commentary or a patch. Before returning REVISE, re-read every issue you listed and verify "
             "that the reviewed replacement resolves it rather than merely describing the intended fix.\n\n"
@@ -577,19 +674,28 @@ class DefaultProposalReviewer:
 
     @staticmethod
     def _parse_output(raw_output: str) -> ProposalReview:
-        decision_match = re.search(r"(?mi)^Decision:\s*(ACCEPT|REVISE|REJECT)\s*$", raw_output)
-        decision = decision_match.group(1).upper() if decision_match else "ACCEPT"
-        issues_match = re.search(
-            r"(?ms)^Issues:\s*(.*?)\nReviewed response:\s*(.*)\Z",
-            raw_output,
-        )
-        issues_text = issues_match.group(1).strip() if issues_match else ""
-        reviewed_text = issues_match.group(2).strip() if issues_match else ""
-        issues = tuple(
-            line.removeprefix("-").strip()
-            for line in issues_text.splitlines()
-            if line.removeprefix("-").strip().lower() not in {"", "none", "`none`"}
-        )
+        payload = DefaultProposalReviewer._parse_json_payload(raw_output)
+        if payload is not None:
+            decision = str(payload.get("decision") or "ACCEPT").strip().upper()
+            raw_issues = payload.get("issues") or []
+            if isinstance(raw_issues, str):
+                raw_issues = [raw_issues]
+            issues = DefaultProposalReviewer._sanitize_issues(raw_issues)
+            reviewed_text = str(payload.get("reviewed_response") or "same").strip()
+        else:
+            decision_match = re.search(r"(?mi)^Decision:\s*(ACCEPT|REVISE|REJECT)\s*$", raw_output)
+            decision = decision_match.group(1).upper() if decision_match else "ACCEPT"
+            issues_match = re.search(
+                r"(?ms)^Issues:\s*(.*?)\nReviewed response:\s*(.*)\Z",
+                raw_output,
+            )
+            issues_text = issues_match.group(1).strip() if issues_match else ""
+            reviewed_text = issues_match.group(2).strip() if issues_match else ""
+            issues = DefaultProposalReviewer._sanitize_issues(
+                line.removeprefix("-").strip() for line in issues_text.splitlines()
+            )
+        if decision not in {"ACCEPT", "REVISE", "REJECT"}:
+            decision = "ACCEPT"
         reviewed_response = None
         if decision == "REVISE" and reviewed_text.lower() != "same":
             if "Proposal rationale:" in reviewed_text and "Final replacement:" in reviewed_text:
@@ -603,6 +709,38 @@ class DefaultProposalReviewer:
             reviewed_response=reviewed_response,
             raw_output=raw_output,
         )
+
+    @staticmethod
+    def _parse_json_payload(raw_output: str) -> dict[str, Any] | None:
+        text = raw_output.strip()
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+        if fenced:
+            text = fenced.group(1)
+        else:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end <= start:
+                return None
+            text = text[start : end + 1]
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _sanitize_issues(raw_issues: Sequence[Any]) -> tuple[str, ...]:
+        issues: list[str] = []
+        for raw_issue in raw_issues:
+            issue = re.sub(r"\s+", " ", str(raw_issue).removeprefix("-").strip())
+            if issue.casefold() in {"", "none", "`none`"}:
+                continue
+            if len(issue) > 500:
+                issue = issue[:497].rstrip() + "..."
+            issues.append(issue)
+            if len(issues) >= 5:
+                break
+        return tuple(issues)
 
 
 def select_deployment_candidate_index(result: Any, *, score_tolerance: float = 1e-12) -> int | None:

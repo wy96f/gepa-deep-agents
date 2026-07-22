@@ -163,6 +163,9 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     )
     proposal_statuses = Counter(str(row.get("status", "unknown")) for row in proposals)
     proposed_components = Counter(component for row in proposals for component in row.get("components", []))
+    changed_but_unconsumed = Counter(
+        component for row in proposals for component in row.get("changed_but_unconsumed", [])
+    )
     rejected_components = Counter(component for row in rejected_proposals for component in row.get("components", []))
     failure_classes = Counter(
         failure_class
@@ -212,6 +215,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "total_metric_calls": summary.get("total_metric_calls"),
         "overall_metric_calls": summary.get("overall_metric_calls", summary.get("total_metric_calls")),
         "metric_calls_by_phase": summary.get("metric_calls_by_phase", {}),
+        "metric_budget_plan": summary.get("metric_budget_plan"),
         "num_full_val_evals": summary.get("num_full_val_evals"),
         "preflight_rollout_count": len(preflight_rollouts),
         "preflight_actionability": preflight_actionability,
@@ -244,6 +248,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "proposal_count": len(proposals),
         "proposal_event_count": len(proposal_events),
         "proposed_components": dict(proposed_components.most_common()),
+        "changed_but_unconsumed": dict(changed_but_unconsumed.most_common()),
         "rejected_components": dict(rejected_components.most_common()),
         "rejected_failure_classes": dict(failure_classes.most_common()),
         "rollout_failure_classes": dict(rollout_failure_classes.most_common()),
@@ -267,6 +272,7 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             proposal_review_decisions=proposal_review_decisions,
             proposal_statuses=proposal_statuses,
             proposed_components=proposed_components,
+            changed_but_unconsumed=changed_but_unconsumed,
             failure_classes=failure_classes,
             rollout_failure_classes=rollout_failure_classes,
             boundary_failures=boundary_failures,
@@ -323,6 +329,7 @@ def diagnose(
     proposal_review_decisions: Counter[str],
     proposal_statuses: Counter[str],
     proposed_components: Counter[str],
+    changed_but_unconsumed: Counter[str],
     failure_classes: Counter[str],
     rollout_failure_classes: Counter[str],
     boundary_failures: Counter[str],
@@ -447,6 +454,12 @@ def diagnose(
     if proposed_components:
         dominant_component, count = proposed_components.most_common(1)[0]
         notes.append(f"Most frequently selected component: {dominant_component} ({count}).")
+    if changed_but_unconsumed:
+        dominant_component, count = changed_but_unconsumed.most_common(1)[0]
+        notes.append(
+            f"Changed file-backed component was not consumed by the candidate trace: {dominant_component} ({count}). "
+            "Treat its score attribution as unproven and make the owning skill/prompt route to it before editing it."
+        )
     if proposal_artifacts.get("proposal_rationale_files", 0):
         notes.append(f"Proposal rationale files: {proposal_artifacts['proposal_rationale_files']}.")
     if proposal_artifacts.get("proposal_missing_rationale_files", 0):
@@ -566,6 +579,8 @@ def print_report(summary: dict[str, Any]) -> None:
         print(f"Metric calls across all phases: {summary['overall_metric_calls']}")
     if summary.get("metric_calls_by_phase"):
         print(f"Metric calls by phase: {summary['metric_calls_by_phase']}")
+    if summary.get("metric_budget_plan"):
+        print(f"Metric budget plan: {summary['metric_budget_plan']}")
     print(f"Candidates: {summary['num_candidates']}")
     print(f"Preflight rollouts: {summary['preflight_rollout_count']}")
     if summary.get("preflight_actionability"):
@@ -599,6 +614,7 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"Deterministic/judge disagreements: {summary['deterministic_judge_disagreement_count']}")
     print(f"No-actionable proposals: {summary['no_actionable_proposal_count']}")
     print(f"Proposal statuses: {summary['proposal_statuses']}")
+    print(f"Changed but unconsumed: {summary['changed_but_unconsumed']}")
     print(f"Proposals: {summary['proposal_count']} ({summary['proposal_event_count']} lifecycle events)")
     print(f"Rejected proposals: {summary['rejected_proposal_count']}")
     print(f"Reflection errors: {summary['reflection_error_count']}")

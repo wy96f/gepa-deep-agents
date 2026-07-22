@@ -237,18 +237,18 @@ class DefaultFeedbackComponentSelector:
         candidate: Mapping[str, str],
         trajectories: Sequence[Mapping[str, Any]] = (),
     ) -> list[str]:
-        """Make a selected reference reachable before asking it to change behavior."""
+        """Stage reference optimization behind an observed runtime read."""
         selected = [component]
         if ":reference/" not in component:
             return selected
-        consumption = _component_consumption(component, trajectories)
+        consumption = component_consumption(component, trajectories)
         skill_component = component.split(":reference/", maxsplit=1)[0] + ":SKILL.md"
         if consumption is False:
-            skill_consumption = _component_consumption(skill_component, trajectories)
+            skill_consumption = component_consumption(skill_component, trajectories)
             if skill_consumption:
-                return [component, skill_component] if skill_component in candidate else selected
+                return [skill_component] if skill_component in candidate else selected
             execution_component = _prompt_or_memory_component(candidate)
-            return [execution_component, component] if execution_component != component else selected
+            return [execution_component] if execution_component != component else selected
 
         # Preserve the existing learned-reference dependency for synthetic or
         # externally supplied trajectories that do not expose file reads.
@@ -324,23 +324,23 @@ def _prompt_or_memory_component(candidate: Mapping[str, str]) -> str:
     return next(iter(candidate), "main:system_prompt")
 
 
-def _component_consumption(
+def component_consumption(
     component: str,
     trajectories: Sequence[Mapping[str, Any]],
 ) -> bool | None:
     """Return whether a skill/reference component was read in any supplied trajectory."""
-    suffixes = _component_path_suffixes(component)
+    suffixes = component_path_suffixes(component)
     if not suffixes:
         return None
     states = [trajectory.get("state") for trajectory in trajectories if isinstance(trajectory, Mapping)]
     observable_states = [state for state in states if isinstance(state, Mapping)]
     if not observable_states:
         return None
-    read_paths = {path for state in observable_states for path in _runtime_read_paths(state)}
+    read_paths = {path for state in observable_states for path in runtime_read_paths(state)}
     return any(any(path.endswith(suffix) for suffix in suffixes) for path in read_paths)
 
 
-def _component_path_suffixes(component: str) -> tuple[str, ...]:
+def component_path_suffixes(component: str) -> tuple[str, ...]:
     match = re.search(r"(?:^|:)skill:([^:]+):(SKILL\.md|reference/.+)$", component, re.I)
     if match is None:
         return ()
@@ -352,7 +352,7 @@ def _component_path_suffixes(component: str) -> tuple[str, ...]:
     )
 
 
-def _runtime_read_paths(state: Mapping[str, Any]) -> set[str]:
+def runtime_read_paths(state: Mapping[str, Any]) -> set[str]:
     paths: set[str] = set()
     for message in state.get("messages") or []:
         tool_calls = getattr(message, "tool_calls", None)
@@ -428,7 +428,9 @@ class DefaultReflectionTemplateRegistry:
             "present it as fact.\n"
             "- Treat evidence lists as possible sources unless the component explicitly marks an item mandatory. If "
             "only some evidence is available, produce only the analysis supported by that subset, preserve material "
-            "uncertainty, and do not require every listed source or infer the complete risk conclusion.\n"
+            "uncertainty, and keep the conclusion narrow. Missing, unknown, unverified, or merely not-excluded evidence "
+            "is not an affirmative signal and must not become a risk point or reusable expert pattern. Do not require "
+            "every listed source or infer the complete risk conclusion.\n"
             "- Check cross-example regression risk. If a rule helps one scope but may hurt another, make the condition "
             "explicit instead of applying the rule globally.\n"
             "- Add only the knowledge increment the runtime model is unlikely to recover reliably on its own. Prefer a "
@@ -658,8 +660,11 @@ class DefaultProposalReviewer:
             "sample by imposing a universal checklist on unrelated samples.\n\n"
             "Evidence lists in a reference are possible sources, not an implicit requirement to obtain every item. "
             "When only part of the evidence is available, preserve a conclusion whose scope matches that evidence and "
-            "its uncertainty. Reject proposals that require all listed evidence mechanically or infer a complete risk "
-            "conclusion from a partial signal.\n\n"
+            "its uncertainty. Missing, unknown, unverified, or merely not-excluded evidence is not an affirmative risk "
+            "signal and must not be turned into a risk point. Reject proposals that require all listed evidence "
+            "mechanically, infer a complete risk conclusion from a partial signal, or encourage splitting one data gap "
+            "into several unsupported findings.\n\n"
+            f"{DefaultProposalReviewer._deterministic_advisory(reflection_prompt, proposal_response)}"
             "Return JSON only using this schema:\n"
             '{"decision":"ACCEPT|REVISE|REJECT","issues":["at most five concise issues"],'
             '"reviewed_response":"for REVISE, a complete Proposal rationale + Final replacement; otherwise same"}\n\n'
@@ -670,6 +675,48 @@ class DefaultProposalReviewer:
             f"{reflection_prompt}\n\n"
             "Original proposal:\n"
             f"{proposal_response}"
+        )
+
+    @staticmethod
+    def _deterministic_advisory(reflection_prompt: str, proposal_response: str) -> str:
+        """Give the LLM reviewer concrete, high-confidence proposal diagnostics."""
+        current_match = re.search(
+            r"(?s)Current target component \(this is the only text you may replace\):\n```\n(.*?)\n```\n\n"
+            r"Before answering,",
+            reflection_prompt,
+        )
+        replacement_match = re.search(
+            r"(?s)Final replacement:\s*```[^\n]*\n(.*?)\n```\s*$",
+            proposal_response.strip(),
+        )
+        component_match = re.search(r"Component boundary rules for `([^`]+)`", reflection_prompt)
+        if current_match is None or replacement_match is None:
+            return ""
+
+        current = current_match.group(1)
+        replacement = replacement_match.group(1)
+        component = component_match.group(1) if component_match else "unknown"
+        issues: list[str] = []
+        growth = (len(replacement) - len(current)) / max(1, len(current))
+        global_surface = component.startswith("memory:") or component.endswith(":system_prompt")
+        if global_surface and growth > 1.0 and len(replacement) - len(current) > 300:
+            issues.append(
+                f"global surface grows from {len(current)} to {len(replacement)} chars ({growth:+.0%}); revise to the "
+                "smallest durable instruction unless every added block is indispensable"
+            )
+        if global_surface and re.search(r"(?mi)^\s*(?:#+\s*)?(?:example|示例)|^\s*[-*]\s*(?:input|输入)\s*:", replacement):
+            issues.append("global surface embeds examples; replace them with one reusable rule to reduce sample overfitting")
+        if global_surface and re.search(r"(?<![/\w])reference/[^\s`]+", replacement):
+            issues.append(
+                "global surface uses a skill-relative reference path; route through the owning skill instead of an "
+                "unresolvable reference/ path"
+            )
+        if not issues:
+            return ""
+        lines = "\n".join(f"- {issue}" for issue in issues)
+        return (
+            "Deterministic pre-review advisories (high-confidence diagnostics; explicitly resolve them before ACCEPT):\n"
+            f"{lines}\n\n"
         )
 
     @staticmethod

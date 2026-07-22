@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from examples.langchain_adapter.deepagents_gepa.framework import component_consumption
+
 
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
@@ -330,6 +332,7 @@ class RunArtifactStore:
         self._proposal_review_counter = 0
         self._seed_candidate: dict[str, str] = {}
         self._preflight_summary: dict[str, Any] | None = None
+        self._budget_plan: dict[str, Any] | None = None
         self._final_test_metric_calls = 0
         self._shared_rubric: str | None = None
 
@@ -370,6 +373,10 @@ class RunArtifactStore:
         _write_jsonl(self.run_dir / "datasets" / "train.jsonl", _without_shared_rubric(train_set, shared_rubric))
         _write_jsonl(self.run_dir / "datasets" / "val.jsonl", _without_shared_rubric(val_set, shared_rubric))
         _write_jsonl(self.run_dir / "datasets" / "test.jsonl", _without_shared_rubric(test_set, shared_rubric))
+
+    def write_budget_plan(self, plan: Mapping[str, Any]) -> None:
+        self._budget_plan = dict(plan)
+        _write_json(self.run_dir / "diagnostics" / "metric_budget_plan.json", self._budget_plan)
 
     def write_actionability_preflight(
         self,
@@ -652,6 +659,8 @@ class RunArtifactStore:
         metadata["acceptance_scope"] = "candidate_pool_not_deployment" if status == "accepted" else None
         metadata["candidate_components"] = list(candidate)
         metadata["changed_components"] = sorted(dict(pending.get("new_instructions") or {}))
+        metadata["component_consumption"] = dict(pending.get("component_consumption") or {})
+        metadata["changed_but_unconsumed"] = list(pending.get("changed_but_unconsumed") or [])
         metadata["proposal_rationale"] = rationales
         metadata["missing_proposal_rationale"] = missing_rationales
         _write_json(proposal_dir / "metadata.json", metadata)
@@ -672,6 +681,8 @@ class RunArtifactStore:
                 "new_score": pending.get("new_score"),
                 "reason": pending.get("reason"),
                 "failure_classifications": pending.get("failure_classifications", []),
+                "component_consumption": pending.get("component_consumption", {}),
+                "changed_but_unconsumed": pending.get("changed_but_unconsumed", []),
                 "proposal_rationale_preview": {
                     component: rationale[:300] for component, rationale in rationales.items()
                 },
@@ -841,6 +852,7 @@ class RunArtifactStore:
                 {name: len(text) for name, text in best_candidate.items()} if isinstance(best_candidate, dict) else None
             ),
             "preflight_actionability": self._preflight_summary,
+            "metric_budget_plan": self._budget_plan,
             "final_test": dict(final_test) if final_test is not None else None,
         }
         _write_json(self.run_dir / "result_summary.json", summary)
@@ -951,6 +963,15 @@ class RunArtifactCallback:
             pending["proposed_outputs"] = payload["outputs"]
             pending["proposed_trajectories"] = payload["trajectories"]
             pending["failure_classifications"] = _failure_classes_from_trajectories(payload["trajectories"])
+            changed_components = sorted(dict(pending.get("new_instructions") or {}))
+            consumption = {
+                component: component_consumption(component, payload["trajectories"])
+                for component in changed_components
+            }
+            pending["component_consumption"] = consumption
+            pending["changed_but_unconsumed"] = [
+                component for component, consumed in consumption.items() if consumed is False
+            ]
             if pending.get("candidate"):
                 self.store.write_proposal_snapshot(iteration, pending, status=str(pending.get("status", "evaluated")))
             return

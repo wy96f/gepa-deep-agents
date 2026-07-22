@@ -207,6 +207,7 @@ def write_summary(args: argparse.Namespace, result: object) -> None:
             "overall_metric_calls", getattr(result, "total_metric_calls", None)
         ),
         "preflight_actionability": artifact_summary.get("preflight_actionability"),
+        "metric_budget_plan": artifact_summary.get("metric_budget_plan"),
         "num_full_val_evals": getattr(result, "num_full_val_evals", None),
         "num_candidates": getattr(result, "num_candidates", None),
         "component_lengths": (

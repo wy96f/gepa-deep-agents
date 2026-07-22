@@ -742,7 +742,13 @@ this case. Open-ended rubric-only examples remain LLM-judged.
 
 For expert-data rows with `metadata.checkpoints`, the judge is also capped by
 checkpoint coverage. The cap remains strict even when the current agent lacks
-data or tools. Scoring and mutation eligibility are separate: a missing expert
+data or tools. A keyword mention earns coverage only when it is affirmative and
+its declared evidence expectations were satisfied by successful runtime tool
+evidence. Explicit epistemic phrases such as `未取得…记录`, `缺少…资料`,
+`…情况未知`, `无法判断`, or `无法排除` remain data limitations and do not
+satisfy the checkpoint. Negative enterprise facts such as `无强担保` or
+`未按期还款` remain valid evidence. Scoring and mutation
+eligibility are separate: a missing expert
 point becomes `SKILL_DEFECT` only when a successful runtime evidence path
 exists; skipping or miscalling a supported path is `EXECUTION_LAPSE`; an
 unavailable path is `TOOL_CAPABILITY_GAP`; and an expert opinion with no
@@ -843,19 +849,24 @@ marked `mutation_eligible: false` are excluded as well.
 When a selected component is a reference, the selector checks actual
 `read_file` calls in the failed trajectories. If the reference was consumed, it
 can be optimized directly. If `SKILL.md` was read but the reference was not,
-the proposal also updates that owning skill's resource routing. If neither was
-read, the proposal includes the relevant prompt/memory execution surface plus
-the reference. The reflective record names this component bundle so the
-proposal reviewer can require one edit to make the resource reachable while
-the other carries the compact domain lesson. For trajectories that do not
-expose file reads, managed learned/expert/experience references retain the
-static owning-skill dependency check.
+the current proposal updates only the owning skill's resource routing. If
+neither was read, it updates only the relevant prompt/memory execution surface.
+The reference becomes eligible in a later iteration after the trace proves it
+was consumed. This staged policy avoids attributing an improvement to file text
+that never entered the model context. For trajectories that do not expose file
+reads, managed learned/expert/experience references retain the static
+owning-skill dependency check.
 
 The configured reflection minibatch size defaults to `3`, but the harness caps
 it at the number of unique optimization examples. Structurally identical
 reflection records are removed before proposal generation, and the shared
 component map is included only once. A one-example actionable pool therefore
 uses a minibatch of one instead of repeating the same trajectory three times.
+The harness also shrinks that minibatch to reserve the complete worst-case cost
+of parent evaluation, candidate evaluation, and accepted-candidate full
+validation. A state-aware stopper does not begin an atomic proposal unless it
+fits inside `max_metric_calls`; when it cannot fit, GEPA performs baseline
+validation only.
 For small, heterogeneous datasets, keep validation coverage across multiple
 industries; scope a rule by observable entity signals when it helps one segment
 but could reduce quality in another.
@@ -1135,6 +1146,8 @@ that audit. A shared dataset rubric is stored once in `datasets/rubric.md`
 instead of being duplicated in every persisted row. `result_summary.json`
 keeps GEPA's own `total_metric_calls` and also records
 `overall_metric_calls`, which includes preflight and final-test calls.
+`diagnostics/metric_budget_plan.json` records the validation size, effective
+minibatch, GEPA budget, and whether a complete proposal can run.
 
 Candidates that cannot load at runtime, including `SKILL.md` files with missing
 or invalid YAML frontmatter or missing `name`/`description`, receive a zero
@@ -1154,6 +1167,10 @@ external process log.
 `proposals/` records every reflective proposal, including the rendered
 reflection prompt, raw LLM output, explicit proposal rationale, and diffs
 against both the parent candidate and the seed candidate.
+Proposal metadata also records `component_consumption` and
+`changed_but_unconsumed`. A changed file-backed component is marked unconsumed
+when candidate trajectories expose file reads but never read that skill or
+reference; its score attribution should be treated as unproven.
 If the reflection model starts directly with the final fenced block and omits
 the review rationale, the proposal is marked with
 `proposal_rationale_missing.json` and `missing_proposal_rationale` metadata.

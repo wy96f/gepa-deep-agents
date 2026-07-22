@@ -486,7 +486,7 @@ def test_component_selector_makes_unread_reference_reachable_from_execution_poli
         candidate,
     )
 
-    assert selected == ["memory:AGENTS.md", reference_key]
+    assert selected == ["memory:AGENTS.md"]
 
 
 def test_component_selector_routes_from_consumed_skill_to_unread_reference():
@@ -517,7 +517,7 @@ def test_component_selector_routes_from_consumed_skill_to_unread_reference():
         candidate,
     )
 
-    assert selected == [reference_key, skill_key]
+    assert selected == [skill_key]
 
 
 def test_component_selector_keeps_consumed_reference_as_single_target():
@@ -2040,6 +2040,106 @@ def test_rubric_checkpoint_matching_supports_chinese_keywords():
     assert coverage == 1.0
 
 
+def test_rubric_checkpoint_matching_rejects_negated_or_unknown_mentions():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "checkpoints": [
+                {"label": "食品安全处罚", "keywords": ["食品安全处罚"]},
+                {"label": "仓单重复质押", "keywords": ["重复质押"]},
+            ]
+        }
+    }
+    response = "未取得食品安全处罚记录, 没有发现食品安全处罚记录, 无法排除历史食品安全处罚。重复质押情况未知。"
+
+    matched, missing, coverage = example.rubric_checkpoint_results(row, response)
+    unsupported = example.unsupported_checkpoint_mentions(row, response)
+
+    assert matched == []
+    assert missing == ["食品安全处罚", "仓单重复质押"]
+    assert coverage == 0.0
+    assert unsupported == [
+        {"label": "食品安全处罚", "reason": "negated_or_unknown_mention"},
+        {"label": "仓单重复质押", "reason": "negated_or_unknown_mention"},
+    ]
+
+
+def test_rubric_checkpoint_matching_keeps_negative_enterprise_facts_as_evidence():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "checkpoints": [
+                {"label": "担保覆盖不足", "keywords": ["担保"]},
+                {"label": "还款逾期", "keywords": ["按期还款"]},
+            ]
+        }
+    }
+    response = "企业缺少强担保覆盖, 且未按期还款。"
+
+    matched, missing, coverage = example.rubric_checkpoint_results(row, response)
+
+    assert matched == ["担保覆盖不足", "还款逾期"]
+    assert missing == []
+    assert coverage == 1.0
+
+
+def test_rubric_checkpoint_requires_declared_runtime_evidence_when_available():
+    example = _load_example_module()
+    row = {
+        "metadata": {
+            "checkpoints": [
+                {
+                    "label": "食品安全处罚",
+                    "keywords": ["食品安全处罚"],
+                    "evidence_expectations": ["行政处罚"],
+                }
+            ]
+        }
+    }
+    response = "企业近两年存在食品安全处罚, 可能影响经营连续性。"
+
+    unmatched = example.rubric_checkpoint_results(
+        row,
+        response,
+        {"matched_trace_expectations": []},
+    )
+    matched = example.rubric_checkpoint_results(
+        row,
+        response,
+        {"matched_trace_expectations": ["行政处罚"]},
+    )
+
+    assert unmatched == ([], ["食品安全处罚"], 0.0)
+    assert matched == (["食品安全处罚"], [], 1.0)
+
+
+def test_strict_metric_budget_shrinks_minibatch_and_stops_before_overshoot():
+    example = _load_example_module()
+    rows = [{"input": f"case-{index}"} for index in range(4)]
+
+    minibatch = example.strict_budgeted_reflection_minibatch_size(
+        3,
+        rows,
+        valset_size=4,
+        metric_budget=10,
+    )
+    stopper = example.StrictProposalMetricBudgetStopper(
+        max_metric_calls=10,
+        valset_size=4,
+        reflection_minibatch_size=minibatch,
+    )
+
+    assert minibatch == 1
+    assert stopper(SimpleNamespace(total_num_evals=4, program_candidates=[{}])) is False
+    assert stopper(SimpleNamespace(total_num_evals=10, program_candidates=[{}, {}])) is True
+    assert example.strict_budgeted_reflection_minibatch_size(
+        3,
+        rows,
+        valset_size=4,
+        metric_budget=9,
+    ) == 0
+
+
 def test_growth_limit_is_advisory_not_hard_gate(tmp_path):
     example = _load_example_module()
     seed_spec = example.create_seed_workspace(tmp_path)
@@ -2206,6 +2306,29 @@ def test_proposal_reviewer_parses_json_and_caps_issue_chatter():
     assert review.decision == "REJECT"
     assert len(review.issues) == 5
     assert all(len(issue) <= 500 for issue in review.issues)
+
+
+def test_proposal_reviewer_receives_concrete_growth_and_overfit_advisories():
+    example = _load_example_module()
+    current = "# Agent\n\nRoute requests."
+    replacement = (
+        "# Agent\n\n## Operating Instructions\nAlways read `reference/routing.md`.\n\n"
+        "## Example\n- Input: Change the owner email.\n" + ("Repeat routing policy. " * 30)
+    )
+    prompt = (
+        "Component boundary rules for `memory:AGENTS.md`:\n"
+        "Current target component (this is the only text you may replace):\n"
+        f"```\n{current}\n```\n\n"
+        "Before answering, verify the replacement."
+    )
+    proposal = f"Proposal rationale:\n- expand policy\n\nFinal replacement:\n```markdown\n{replacement}\n```"
+
+    review_prompt = example.DefaultProposalReviewer._build_prompt(prompt, proposal)
+
+    assert "Deterministic pre-review advisories" in review_prompt
+    assert "global surface grows" in review_prompt
+    assert "embeds examples" in review_prompt
+    assert "skill-relative reference path" in review_prompt
 
 
 def test_proposal_reviewer_exhausted_revision_returns_no_change(tmp_path):
@@ -2464,6 +2587,55 @@ def test_artifact_callback_marks_missing_proposal_rationale(tmp_path):
     assert metadata["missing_proposal_rationale"] == ["main:system_prompt"]
     assert (tmp_path / "run" / "proposals" / "0002" / "proposal_rationale_missing.json").exists()
     assert not (tmp_path / "run" / "proposals" / "0002" / "proposal_rationale.json").exists()
+
+
+def test_artifact_callback_marks_changed_reference_that_trace_did_not_read(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+    callback = store.create_callback()
+    reference_key = "skill:credit-risk-review:reference/financial_statement_analysis.md"
+    parent = {reference_key: "# Existing"}
+
+    callback.on_evaluation_end(
+        {
+            "iteration": 1,
+            "candidate_idx": 0,
+            "scores": [0.4],
+            "outputs": [],
+            "trajectories": [],
+            "is_seed_candidate": True,
+        }
+    )
+    callback.on_proposal_start(
+        {
+            "iteration": 1,
+            "parent_candidate": parent,
+            "components": [reference_key],
+            "reflective_dataset": {reference_key: []},
+        }
+    )
+    callback.on_proposal_end(
+        {
+            "iteration": 1,
+            "new_instructions": {reference_key: "# Revised"},
+            "prompts": {reference_key: "prompt"},
+            "raw_lm_outputs": {reference_key: "Final replacement:\n```markdown\n# Revised\n```"},
+        }
+    )
+    callback.on_evaluation_end(
+        {
+            "iteration": 1,
+            "candidate_idx": None,
+            "scores": [0.5],
+            "outputs": [],
+            "trajectories": [{"state": {"messages": []}, "feedback": "ok"}],
+            "is_seed_candidate": False,
+        }
+    )
+
+    metadata = json.loads((tmp_path / "run" / "proposals" / "0001" / "metadata.json").read_text())
+    assert metadata["component_consumption"] == {reference_key: False}
+    assert metadata["changed_but_unconsumed"] == [reference_key]
 
 
 def test_reflection_provider_errors_are_written_to_artifacts(tmp_path):
@@ -3276,7 +3448,7 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
         component_selector=Selector(),
         actionability_policy=ActionabilityPolicy(),
         constraint_policy=ConstraintPolicy(),
-        max_metric_calls=3,
+        max_metric_calls=5,
         reflection_minibatch_size=1,
         num_threads=1,
         use_reflection_judge=False,
@@ -3291,6 +3463,12 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
     )
     assert artifact_summary["preflight_actionability"]["evaluated_count"] == 1
     assert artifact_summary["overall_metric_calls"] > artifact_summary["total_metric_calls"]
+    assert (
+        artifact_summary["metric_calls_by_phase"]["gepa"]
+        + artifact_summary["metric_calls_by_phase"]["preflight"]
+        <= 5
+    )
+    assert artifact_summary["metric_budget_plan"]["proposal_budget_available"] is True
 
 
 def test_golden_dataset_supports_rubric_without_expected(tmp_path):

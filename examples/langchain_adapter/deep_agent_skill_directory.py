@@ -170,6 +170,29 @@ TOOL_NO_DATA_ERROR_PATTERN = re.compile(
     r"(?is)(?:\b(?:not found|no matching record|record unavailable)\b|"
     r"未找到(?:该|匹配的)?(?:企业)?(?:记录|数据|信息)|暂无(?:该|匹配的)?企业(?:记录|数据|信息))"
 )
+CHECKPOINT_ABSENCE_PREFIX_PATTERN = re.compile(
+    r"(?:未知|不详|待核实|待验证|无法(?:判断|确认|核实|验证|排除|证明))[^,;.!?\u3002]{0,16}$|"
+    r"(?:unknown|unverified|unableto(?:determine|confirm|verify|exclude))[a-z0-9_]{0,24}$",
+    re.I,
+)
+CHECKPOINT_EVIDENCE_GAP_PREFIX_PATTERN = re.compile(
+    r"(?:未|尚未|没有|并未)(?:能|曾)?(?:取得|获取|获得|提供|发现|查到|查询到|掌握|核实|验证|确认|披露)"
+    r"(?:相关|有效|充分|可用|明确|对应|任何)?$|"
+    r"(?:缺少|缺乏|没有|并无|无)(?:相关|有效|充分|可用|明确|对应|任何)?$|"
+    r"(?:missing|lacking|no|without)(?:relevant|available|sufficient)?$",
+    re.I,
+)
+CHECKPOINT_EVIDENCE_NOUN_SUFFIX_PATTERN = re.compile(
+    r"^(?:的)?(?:信息|数据|资料|证据|记录|结果|明细|文件|报告)|"
+    r"^(?:data|information|evidence|record|records|details|document|report)",
+    re.I,
+)
+CHECKPOINT_ABSENCE_SUFFIX_PATTERN = re.compile(
+    r"^(?:的)?(?:信息|数据|资料|证据|记录|结果)?(?:未|尚未)(?:取得|获取|获得|提供|发现|查到|查询到|掌握|核实|验证|确认|披露)|"
+    r"^(?:的)?(?:信息|数据|资料|证据|记录|结果|情况|状态|风险)?(?:缺失|不足|未知|不详|待核实|待验证|无法判断|无法确认)|"
+    r"^(?:data|information|evidence|record)?(?:ismissing|isunknown|isunverified|notavailable|notobtained)",
+    re.I,
+)
 UNSUPPORTED_THRESHOLD_PATTERN = re.compile(r"(?:[<>≤≥]=?\s*)?\d+(?:\.\d+)?\s*(?:%|\uff05|亿元|万元|元|倍|天|月|年)")
 THRESHOLD_RULE_CONTEXT_PATTERN = re.compile(
     r"政策|制度|规定|准入|红线|上限|下限|标准|要求|不得|不应|不低于|不高于|至少|至多|"
@@ -328,6 +351,39 @@ def effective_reflection_minibatch_size(
     optimization_examples: Sequence[Mapping[str, Any]],
 ) -> int:
     return max(1, min(int(configured_size), len(optimization_examples)))
+
+
+def strict_budgeted_reflection_minibatch_size(
+    configured_size: int,
+    optimization_examples: Sequence[Mapping[str, Any]],
+    *,
+    valset_size: int,
+    metric_budget: int,
+) -> int:
+    """Fit one complete proposal and a possible full validation inside the budget."""
+    available_for_two_minibatches = int(metric_budget) - (2 * int(valset_size))
+    if available_for_two_minibatches < 2:
+        return 0
+    budget_limit = available_for_two_minibatches // 2
+    return min(
+        effective_reflection_minibatch_size(configured_size, optimization_examples),
+        budget_limit,
+    )
+
+
+@dataclass(frozen=True)
+class StrictProposalMetricBudgetStopper:
+    """Stop before an atomic proposal could exceed the configured GEPA budget."""
+
+    max_metric_calls: int
+    valset_size: int
+    reflection_minibatch_size: int
+
+    def __call__(self, state: Any) -> bool:
+        reflective_cost = 2 * self.reflection_minibatch_size + self.valset_size
+        merge_cost = min(5, self.valset_size) + self.valset_size
+        iteration_cost = max(reflective_cost, merge_cost) if len(state.program_candidates) >= 3 else reflective_cost
+        return int(state.total_num_evals) + iteration_cost > self.max_metric_calls
 
 
 @dataclass
@@ -2244,11 +2300,49 @@ def checkpoint_evidence_mode(checkpoint: Any) -> str:
     return mode if mode in {"all", "any"} else "all"
 
 
+def checkpoint_keyword_is_affirmed(response_text: str, keyword: str) -> bool:
+    """Accept a checkpoint mention only when at least one local clause is affirmative."""
+    compact_keyword = compact_for_keyword_match(keyword)
+    if not compact_keyword:
+        return False
+    clauses = re.split(r"[\n,;:!?\u3002]+", unicodedata.normalize("NFKC", str(response_text)))
+    for clause in clauses:
+        compact_clause = compact_for_keyword_match(clause)
+        start = compact_clause.find(compact_keyword)
+        while start >= 0:
+            prefix = compact_clause[max(0, start - 32) : start]
+            suffix = compact_clause[start + len(compact_keyword) : start + len(compact_keyword) + 24]
+            explicit_absence = CHECKPOINT_ABSENCE_PREFIX_PATTERN.search(
+                prefix
+            ) or CHECKPOINT_ABSENCE_SUFFIX_PATTERN.search(suffix)
+            evidence_gap = CHECKPOINT_EVIDENCE_GAP_PREFIX_PATTERN.search(
+                prefix
+            ) and CHECKPOINT_EVIDENCE_NOUN_SUFFIX_PATTERN.search(suffix)
+            if not explicit_absence and not evidence_gap:
+                return True
+            start = compact_clause.find(compact_keyword, start + len(compact_keyword))
+    return False
+
+
 def checkpoint_matches(response_text: str, checkpoint: Any) -> bool:
-    return any(keyword_matches_text(response_text, keyword) for keyword in checkpoint_keywords(checkpoint))
+    return any(checkpoint_keyword_is_affirmed(response_text, keyword) for keyword in checkpoint_keywords(checkpoint))
 
 
-def rubric_checkpoint_results(example: dict[str, Any], response: str) -> tuple[list[str], list[str], float]:
+def checkpoint_runtime_evidence_ready(checkpoint: Any, acquisition: Mapping[str, Any] | None) -> bool:
+    required = checkpoint_evidence_expectations(checkpoint)
+    if not required or acquisition is None:
+        return True
+    matched = {str(item) for item in acquisition.get("matched_trace_expectations") or []}
+    if checkpoint_evidence_mode(checkpoint) == "any":
+        return any(item in matched for item in required)
+    return all(item in matched for item in required)
+
+
+def rubric_checkpoint_results(
+    example: dict[str, Any],
+    response: str,
+    acquisition: Mapping[str, Any] | None = None,
+) -> tuple[list[str], list[str], float]:
     checkpoints = rubric_checkpoints(example)
     if not checkpoints:
         return [], [], 1.0
@@ -2256,11 +2350,29 @@ def rubric_checkpoint_results(example: dict[str, Any], response: str) -> tuple[l
     missing: list[str] = []
     for checkpoint in checkpoints:
         label = checkpoint_label(checkpoint)
-        if checkpoint_matches(response, checkpoint):
+        if checkpoint_matches(response, checkpoint) and checkpoint_runtime_evidence_ready(checkpoint, acquisition):
             matched.append(label)
         else:
             missing.append(label)
     return matched, missing, len(matched) / max(1, len(checkpoints))
+
+
+def unsupported_checkpoint_mentions(
+    example: dict[str, Any],
+    response: str,
+    acquisition: Mapping[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    diagnostics: list[dict[str, str]] = []
+    for checkpoint in rubric_checkpoints(example):
+        label = checkpoint_label(checkpoint)
+        keyword_mentioned = any(keyword_matches_text(response, keyword) for keyword in checkpoint_keywords(checkpoint))
+        if not keyword_mentioned:
+            continue
+        if not checkpoint_matches(response, checkpoint):
+            diagnostics.append({"label": label, "reason": "negated_or_unknown_mention"})
+        elif not checkpoint_runtime_evidence_ready(checkpoint, acquisition):
+            diagnostics.append({"label": label, "reason": "required_runtime_evidence_not_acquired"})
+    return diagnostics
 
 
 def trace_expectations(example: dict[str, Any]) -> list[Any]:
@@ -2689,13 +2801,17 @@ def checkpoint_evidence_status_text(fitness: Mapping[str, Any]) -> str:
     return "\n".join(lines) or "- none"
 
 
-def rubric_coverage_cap(example: dict[str, Any], response: str) -> float:
+def rubric_coverage_cap(
+    example: dict[str, Any],
+    response: str,
+    acquisition: Mapping[str, Any] | None = None,
+) -> float:
     checkpoints = rubric_checkpoints(example)
     if example.get("answer") or example.get("expected") or not checkpoints:
         return 1.0
     if not response.strip():
         return 0.25
-    _matched, _missing, coverage = rubric_checkpoint_results(example, response)
+    _matched, _missing, coverage = rubric_checkpoint_results(example, response, acquisition)
     if coverage >= 1.0:
         return 1.0
     if coverage >= 0.80:
@@ -2789,9 +2905,14 @@ def evaluate_response(example: dict[str, Any], state: dict) -> tuple[float, str]
     gate_penalty = constraint_gate_penalty(failures)
     raw_composite = max(0.0, 0.45 * effect + 0.35 * struct + 0.20 * specificity - gate_penalty)
     answer_cap = correctness_cap(response, expected)
-    rubric_cap = rubric_coverage_cap(example, response)
-    matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(example, response)
     acquisition_diagnostics = data_acquisition_diagnostics(example, state)
+    rubric_cap = rubric_coverage_cap(example, response, acquisition_diagnostics)
+    matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(
+        example,
+        response,
+        acquisition_diagnostics,
+    )
+    unsupported_mentions = unsupported_checkpoint_mentions(example, response, acquisition_diagnostics)
     checkpoint_diagnostics = checkpoint_evidence_diagnostics(example, missing_checkpoints, acquisition_diagnostics)
     gate_cap = constraint_cap(failures)
     composite = min(raw_composite, answer_cap, rubric_cap, gate_cap)
@@ -2811,6 +2932,7 @@ def evaluate_response(example: dict[str, Any], state: dict) -> tuple[float, str]
         "rubric_coverage": rubric_coverage,
         "matched_rubric_checkpoints": matched_checkpoints,
         "missing_rubric_checkpoints": missing_checkpoints,
+        "unsupported_rubric_mentions": unsupported_mentions,
         **acquisition_diagnostics,
         **checkpoint_diagnostics,
         "constraint_cap": gate_cap,
@@ -2883,7 +3005,8 @@ def evaluate_response_with_judge(
 
     raw_score = coerce_score(payload.get("score"), deterministic_score)
     correctness = correctness_cap(response, expected)
-    rubric_cap_value = rubric_coverage_cap(example, response)
+    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
+    rubric_cap_value = rubric_coverage_cap(example, response, acquisition_diagnostics)
     gate_cap = constraint_cap(failures)
     cap = min(correctness, rubric_cap_value, gate_cap)
     fitness = dict(state.get("fitness", {}))
@@ -2933,7 +3056,7 @@ def evaluate_response_with_judge(
         if str(item) not in tool_data_gaps
     ]
     runtime_supported_checkpoints = [str(item) for item in fitness.get("runtime_supported_missing_checkpoints") or []]
-    _matched, missing_checkpoints, _coverage = rubric_checkpoint_results(example, response)
+    missing_checkpoints = [str(item) for item in fitness.get("missing_rubric_checkpoints") or []]
     if failures:
         judged_classification = SKILL_DEFECT
     elif expected and deterministic_hard >= 1.0:
@@ -3028,13 +3151,22 @@ def build_judge_prompt(
         if not c.get("passed") and str(c.get("severity", "hard")) == "advisory"
     ]
     advisory_lines = "\n".join(f"- {c['name']}: {c['message']}" for c in advisory[:20]) or "- none"
+    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
     matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(
         example,
         last_message_text(state),
+        acquisition_diagnostics,
     )
     checkpoint_lines = "\n".join(f"- {checkpoint_label(item)}" for item in rubric_checkpoints(example)) or "- none"
     missing_checkpoint_lines = "\n".join(f"- {item}" for item in missing_checkpoints) or "- none"
-    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
+    unsupported_mentions = unsupported_checkpoint_mentions(
+        example,
+        last_message_text(state),
+        acquisition_diagnostics,
+    )
+    unsupported_mention_lines = (
+        "\n".join(f"- {item['label']}: {item['reason']}" for item in unsupported_mentions) or "- none"
+    )
     matched_trace_expectations = acquisition_diagnostics["matched_trace_expectations"]
     missing_trace_expectations = acquisition_diagnostics["missing_trace_expectations"]
     trace_coverage = acquisition_diagnostics["trace_expectation_coverage"]
@@ -3088,8 +3220,10 @@ def build_judge_prompt(
         "hypothesis, and reject broad advice that does not alter investigation or reasoning.\n"
         "Treat evidence lists in runtime skills/references as possible sources unless they explicitly declare an item "
         "mandatory. Partial evidence may support a correspondingly narrow risk finding; do not require every listed "
-        "source, and do not infer a complete conclusion from only one partial signal. Score whether the output's scope "
-        "and uncertainty match the evidence actually acquired.\n"
+        "source, and do not infer a complete conclusion from only one partial signal. Missing, unknown, unverified, or "
+        "merely not-excluded evidence is not an affirmative risk signal. Such mentions receive no checkpoint credit and "
+        "must not be expanded into speculative risk points. Score whether the output's scope and uncertainty match the "
+        "evidence actually acquired.\n"
         "Data-acquisition expectations are satisfied only by paired, successful tool-call results whose declared seed "
         "capability matches the expectation. Keywords in prompts, skills, AI prose, or final answers are not acquisition "
         "evidence. Diagnose each missing path precisely: no matching tool means TOOL_CAPABILITY_GAP; an available tool "
@@ -3148,6 +3282,7 @@ def build_judge_prompt(
         f"Rubric checkpoints:\n{checkpoint_lines}\n"
         f"Rubric coverage by candidate output: {rubric_coverage:.2f}\n"
         f"Missing rubric checkpoints:\n{missing_checkpoint_lines}\n\n"
+        f"Unsupported checkpoint mentions (deterministically unscored):\n{unsupported_mention_lines}\n\n"
         f"Trace expectations:\n{trace_expectation_lines}\n"
         f"Trace expectation coverage by candidate trace: {trace_coverage:.2f}\n"
         f"Matched trace expectations:\n{matched_trace_expectation_lines}\n"
@@ -3294,10 +3429,21 @@ def build_judge_feedback(
     mutation_eligibility_reason = str(fitness.get("mutation_eligibility_reason") or "not provided")
     if not mutation_eligible:
         suggested_reason = mutation_eligibility_reason
-    matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(example, response)
+    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
+    matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(
+        example,
+        response,
+        acquisition_diagnostics,
+    )
     matched_checkpoint_lines = "\n".join(f"- {item}" for item in matched_checkpoints) or "- none"
     missing_checkpoint_lines = "\n".join(f"- {item}" for item in missing_checkpoints) or "- none"
-    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
+    unsupported_mention_lines = (
+        "\n".join(
+            f"- {item.get('label', 'checkpoint')}: {item.get('reason', 'unsupported')}"
+            for item in fitness.get("unsupported_rubric_mentions") or []
+        )
+        or "- none"
+    )
     matched_trace_expectations = acquisition_diagnostics["matched_trace_expectations"]
     missing_trace_expectations = acquisition_diagnostics["missing_trace_expectations"]
     trace_coverage = acquisition_diagnostics["trace_expectation_coverage"]
@@ -3359,6 +3505,8 @@ def build_judge_feedback(
         f"{matched_checkpoint_lines}\n\n"
         "Missing rubric checkpoints:\n"
         f"{missing_checkpoint_lines}\n\n"
+        "Unsupported checkpoint mentions:\n"
+        f"{unsupported_mention_lines}\n\n"
         "Matched trace expectations:\n"
         f"{matched_trace_expectation_lines}\n\n"
         "Missing trace expectations:\n"
@@ -3517,7 +3665,7 @@ def classify_failure(
 
     expected = example.get("answer") or example.get("expected") or ""
     if not expected:
-        _matched, missing, _coverage = rubric_checkpoint_results(example, response)
+        missing = [str(item) for item in fitness.get("missing_rubric_checkpoints") or []]
         if missing:
             if tool_actionable or actionable_expectations:
                 return EXECUTION_LAPSE, execution_lapse_reason(fitness)
@@ -3830,6 +3978,13 @@ def build_feedback(
     missing_checkpoints = fitness.get("missing_rubric_checkpoints", [])
     matched_checkpoint_lines = "\n".join(f"- {item}" for item in matched_checkpoints) or "- none"
     missing_checkpoint_lines = "\n".join(f"- {item}" for item in missing_checkpoints) or "- none"
+    unsupported_mention_lines = (
+        "\n".join(
+            f"- {item.get('label', 'checkpoint')}: {item.get('reason', 'unsupported')}"
+            for item in fitness.get("unsupported_rubric_mentions") or []
+        )
+        or "- none"
+    )
     matched_trace_expectations = fitness.get("matched_trace_expectations", [])
     missing_trace_expectations = fitness.get("missing_trace_expectations", [])
     matched_trace_expectation_lines = "\n".join(f"- {item}" for item in matched_trace_expectations) or "- none"
@@ -3887,6 +4042,8 @@ def build_feedback(
         f"{matched_checkpoint_lines}\n\n"
         "Missing rubric checkpoints:\n"
         f"{missing_checkpoint_lines}\n\n"
+        "Unsupported checkpoint mentions:\n"
+        f"{unsupported_mention_lines}\n\n"
         "Matched trace expectations:\n"
         f"{matched_trace_expectation_lines}\n\n"
         "Missing trace expectations:\n"
@@ -4892,8 +5049,13 @@ def run_configured_skill_optimization(
     )
     optimization_train_set = deduplicate_examples(train_set)
     optimization_metric_budget = max_metric_calls
+    preflight_calls_used = 0
     should_preflight = config.dataset.preflight_actionability and is_rubric_only_expert_dataset(train_set)
     minimum_gepa_budget = max(1, len(val_set))
+    if max_metric_calls < minimum_gepa_budget:
+        raise ValueError(
+            f"max_metric_calls={max_metric_calls} cannot cover baseline validation of {minimum_gepa_budget} examples"
+        )
     if should_preflight and len(train_set) + minimum_gepa_budget <= max_metric_calls:
         preflight_evaluation = adapter.evaluate(
             examples_for_evaluation_phase(train_set, "preflight_train"),
@@ -4907,6 +5069,7 @@ def run_configured_skill_optimization(
         )
         optimization_train_set = deduplicate_examples([train_set[index] for index in partition.optimization_indices])
         preflight_calls = evaluation_metric_calls(preflight_evaluation, len(train_set))
+        preflight_calls_used = preflight_calls
         optimization_metric_budget = max(minimum_gepa_budget, max_metric_calls - preflight_calls)
         if partition.fallback_to_unfiltered:
             optimization_metric_budget = minimum_gepa_budget
@@ -4940,17 +5103,53 @@ def run_configured_skill_optimization(
             len(train_set),
             minimum_gepa_budget,
         )
-    effective_minibatch_size = effective_reflection_minibatch_size(
+    unconstrained_minibatch_size = effective_reflection_minibatch_size(
         reflection_minibatch_size,
         optimization_train_set,
     )
+    budgeted_minibatch_size = strict_budgeted_reflection_minibatch_size(
+        unconstrained_minibatch_size,
+        optimization_train_set,
+        valset_size=len(val_set),
+        metric_budget=optimization_metric_budget,
+    )
+    proposal_budget_available = budgeted_minibatch_size > 0
+    effective_minibatch_size = max(1, budgeted_minibatch_size)
     if effective_minibatch_size != reflection_minibatch_size:
         LOGGER.info(
-            "reflection_minibatch_adjusted configured=%d effective=%d unique_optimization_examples=%d",
+            "reflection_minibatch_adjusted configured=%d effective=%d unique_optimization_examples=%d "
+            "valset=%d gepa_budget=%d",
             reflection_minibatch_size,
             effective_minibatch_size,
             len(optimization_train_set),
+            len(val_set),
+            optimization_metric_budget,
         )
+    if not proposal_budget_available:
+        LOGGER.warning(
+            "strict metric budget allows baseline validation only: gepa_budget=%d valset=%d; a complete proposal "
+            "requires baseline val + parent minibatch + candidate minibatch + possible full val",
+            optimization_metric_budget,
+            len(val_set),
+        )
+    budget_plan = {
+        "requested_total_metric_calls": max_metric_calls,
+        "preflight_metric_calls": preflight_calls_used,
+        "gepa_metric_budget": optimization_metric_budget,
+        "valset_size": len(val_set),
+        "configured_reflection_minibatch_size": reflection_minibatch_size,
+        "effective_reflection_minibatch_size": effective_minibatch_size,
+        "proposal_budget_available": proposal_budget_available,
+        "worst_case_reflective_iteration_calls": 2 * effective_minibatch_size + len(val_set),
+        "policy": "stop_before_atomic_proposal_exceeds_gepa_budget",
+    }
+    if artifact_store is not None:
+        artifact_store.write_budget_plan(budget_plan)
+    strict_budget_stopper = StrictProposalMetricBudgetStopper(
+        max_metric_calls=optimization_metric_budget,
+        valset_size=len(val_set),
+        reflection_minibatch_size=effective_minibatch_size,
+    )
     result = optimize(
         seed_candidate=seed_candidate,
         trainset=optimization_train_set,
@@ -4958,7 +5157,7 @@ def run_configured_skill_optimization(
         adapter=adapter,
         reflection_lm=reflection_callable,
         reflection_prompt_template=templates,
-        max_metric_calls=optimization_metric_budget,
+        stop_callbacks=strict_budget_stopper,
         reflection_minibatch_size=effective_minibatch_size,
         module_selector=component_selector or DefaultFeedbackComponentSelector(),
         candidate_selection_strategy="pareto",

@@ -79,6 +79,7 @@ def _state_summary(state: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_constraints": state.get("candidate_constraints", []),
         "candidate_metrics": state.get("candidate_metrics", {}),
         "fitness": state.get("fitness", {}),
+        "judge_diagnostics": state.get("judge_diagnostics", {}),
         "available_tools": state.get("available_tools", []),
         "capability_tools": state.get("capability_tools", []),
         "trace_context_window_tokens": state.get("trace_context_window_tokens"),
@@ -135,6 +136,18 @@ def _candidate_diff(
         )
         chunks.append("")
     return "\n".join(chunks).rstrip() + ("\n" if chunks else "")
+
+
+def _material_new_instructions(
+    parent_candidate: Mapping[str, str],
+    new_instructions: Mapping[str, Any],
+) -> dict[str, str]:
+    """Keep only proposal values that materially change their parent text."""
+    return {
+        str(component): str(replacement)
+        for component, replacement in new_instructions.items()
+        if str(parent_candidate.get(str(component), "")).rstrip() != str(replacement).rstrip()
+    }
 
 
 def _write_candidate_diffs(
@@ -407,6 +420,11 @@ class RunArtifactStore:
                     "tool_capability_gaps": fitness.get("tool_capability_gaps", []),
                     "tool_data_coverage_gaps": fitness.get("tool_data_coverage_gaps", []),
                     "runtime_supported_missing_checkpoints": fitness.get("runtime_supported_missing_checkpoints", []),
+                    "runtime_read_paths": fitness.get("runtime_read_paths", []),
+                    "consumed_skill_components": fitness.get("consumed_skill_components", []),
+                    "consumed_reference_components": fitness.get("consumed_reference_components", []),
+                    "configured_skill_unread": bool(fitness.get("configured_skill_unread", False)),
+                    "configured_resources_unread": bool(fitness.get("configured_resources_unread", False)),
                 }
             )
         summary = {
@@ -649,6 +667,7 @@ class RunArtifactStore:
                 "candidate",
                 "prompts",
                 "raw_lm_outputs",
+                "raw_new_instructions",
                 "reflective_dataset",
                 "parent_outputs",
                 "proposed_outputs",
@@ -667,6 +686,7 @@ class RunArtifactStore:
         _write_json(proposal_dir / "metadata.json", metadata)
         _write_json(proposal_dir / "reflective_dataset.json", pending.get("reflective_dataset", {}))
         _write_json(proposal_dir / "new_instructions.json", pending.get("new_instructions", {}))
+        _write_json(proposal_dir / "raw_new_instructions.json", pending.get("raw_new_instructions", {}))
 
         _append_jsonl(
             self.run_dir / "proposals" / "index.jsonl",
@@ -676,6 +696,7 @@ class RunArtifactStore:
                 "acceptance_scope": "candidate_pool_not_deployment" if status == "accepted" else None,
                 "components": pending.get("components", []),
                 "changed_components": sorted(dict(pending.get("new_instructions") or {})),
+                "semantic_noop_components": list(pending.get("semantic_noop_components") or []),
                 "parent_scores": pending.get("parent_scores", []),
                 "proposed_scores": pending.get("proposed_scores", []),
                 "old_score": pending.get("old_score"),
@@ -966,8 +987,7 @@ class RunArtifactCallback:
             pending["failure_classifications"] = _failure_classes_from_trajectories(payload["trajectories"])
             changed_components = sorted(dict(pending.get("new_instructions") or {}))
             consumption = {
-                component: component_consumption(component, payload["trajectories"])
-                for component in changed_components
+                component: component_consumption(component, payload["trajectories"]) for component in changed_components
             }
             pending["component_consumption"] = consumption
             pending["changed_but_unconsumed"] = [
@@ -1002,13 +1022,17 @@ class RunArtifactCallback:
         iteration = int(event["iteration"])
         pending = self._pending.setdefault(iteration, {"iteration": iteration})
         parent_candidate = dict(pending.get("parent_candidate") or {})
-        new_instructions = dict(event.get("new_instructions") or {})
+        raw_new_instructions = dict(event.get("new_instructions") or {})
+        new_instructions = _material_new_instructions(parent_candidate, raw_new_instructions)
+        semantic_noop_components = sorted(set(raw_new_instructions) - set(new_instructions))
         candidate = dict(parent_candidate)
         candidate.update(new_instructions)
         pending.update(
             {
                 "status": "proposed",
                 "new_instructions": new_instructions,
+                "raw_new_instructions": raw_new_instructions,
+                "semantic_noop_components": semantic_noop_components,
                 "candidate": candidate,
                 "prompts": dict(event.get("prompts") or {}),
                 "raw_lm_outputs": dict(event.get("raw_lm_outputs") or {}),
@@ -1075,10 +1099,7 @@ class RunArtifactCallback:
             for key in sorted(set(parent_candidate) | set(candidate))
             if parent_candidate.get(key) != candidate.get(key)
         ]
-        semantic_noop = bool(changed_components) and all(
-            str(parent_candidate.get(key, "")).rstrip() == str(candidate.get(key, "")).rstrip()
-            for key in changed_components
-        )
+        semantic_noop = bool(pending.get("semantic_noop_components")) and not changed_components
         proposal_lessons = []
         for component, raw_output in (pending.get("raw_lm_outputs") or {}).items():
             rationale = _extract_proposal_rationale(str(raw_output))

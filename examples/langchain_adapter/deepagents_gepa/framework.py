@@ -163,8 +163,7 @@ class DefaultFeedbackComponentSelector:
 
     def __init__(self, cooldown_after: int = 2) -> None:
         self._fallback_offsets: dict[int, int] = {}
-        self._last_selected: dict[int, str] = {}
-        self._repeat_counts: dict[int, int] = {}
+        self._selection_counts: dict[tuple[int, str], int] = {}
         self._cooldown_after = max(1, cooldown_after)
 
     def __call__(
@@ -214,19 +213,18 @@ class DefaultFeedbackComponentSelector:
                 reverse=True,
             )
             for component in ranked_components:
-                if not self._is_cooled_down(candidate_idx, component):
-                    selected = self._record_selection(candidate_idx, component)
-                    return self._with_component_dependencies(
-                        selected,
-                        candidate,
-                        suggested[component]["trajectories"],
-                    )
-            return [
-                self._record_selection(
-                    candidate_idx,
-                    self._round_robin_fallback(candidate_idx, candidate, excluded=set(ranked_components)),
+                resolved = self._with_component_dependencies(
+                    component,
+                    candidate,
+                    suggested[component]["trajectories"],
                 )
-            ]
+                if resolved and not any(self._is_cooled_down(candidate_idx, item) for item in resolved):
+                    for item in resolved:
+                        self._record_selection(candidate_idx, item)
+                    return resolved
+            # A valid evaluator recommendation has already exhausted its useful
+            # targets for this parent. Do not mutate an unrelated component.
+            return []
         if non_actionable_trajectories and not actionable_trajectories:
             return []
         return [self._record_selection(candidate_idx, self._round_robin_fallback(candidate_idx, candidate))]
@@ -283,16 +281,11 @@ class DefaultFeedbackComponentSelector:
         return None
 
     def _is_cooled_down(self, candidate_idx: int, component: str) -> bool:
-        return self._last_selected.get(candidate_idx) == component and (
-            self._repeat_counts.get(candidate_idx, 0) >= self._cooldown_after
-        )
+        return self._selection_counts.get((candidate_idx, component), 0) >= self._cooldown_after
 
     def _record_selection(self, candidate_idx: int, component: str) -> str:
-        if self._last_selected.get(candidate_idx) == component:
-            self._repeat_counts[candidate_idx] = self._repeat_counts.get(candidate_idx, 0) + 1
-        else:
-            self._last_selected[candidate_idx] = component
-            self._repeat_counts[candidate_idx] = 1
+        key = (candidate_idx, component)
+        self._selection_counts[key] = self._selection_counts.get(key, 0) + 1
         return component
 
     def _round_robin_fallback(
@@ -390,87 +383,36 @@ class DefaultReflectionTemplateRegistry:
     def templates_for(self, candidate: Mapping[str, str]) -> dict[str, str]:
         templates: dict[str, str] = {}
         common_rules = (
-            "General optimization rules:\n"
-            "- Optimize only the selected component as a drop-in replacement.\n"
-            "- Make the smallest change that plausibly fixes the observed failures.\n"
-            "- Preserve the component's scope; do not paste unrelated skills, references, tool descriptions, or prompts.\n"
-            "- Treat rejected proposal lessons, when present, as negative evidence: fix the failure pattern without copying rejected text.\n"
-            "- Prefer reusable instructions, decision criteria, and guardrails over test-specific answers.\n"
-            "- Expert data, rubrics, checkpoints, and evaluator feedback are hidden from the runtime agent. Distill "
-            "reusable lessons from them, but never tell the runtime agent to read or respond to those hidden fields.\n"
-            "- Evaluation data under <side_info> is optimizer-only evidence. It was not part of the runtime conversation. "
-            "Do not claim the agent saw it, failed to read it, or should request it as a named runtime field.\n"
-            "- A TOOL_CAPABILITY_GAP means no current text component can obtain the missing evidence. Do not invent a "
-            "tool, imply that a prompt adds the capability, or encode unavailable facts as instructions.\n"
-            "- Use the trajectory diagnosis before proposing text: an available tool that was never called needs a "
-            "scoped call trigger; an argument/validation error may need tool-description or call-guidance changes; a "
-            "runtime/upstream tool failure needs tool or environment repair; a successful but insufficient result needs "
-            "query/result review; and relevant successful evidence omitted from the answer may justify a skill/reference "
-            "change. Do not collapse these cases into one generic skill defect.\n"
-            "- Before editing a skill or reference, verify from read_file calls that the runtime agent consumed it. An "
-            "unread reference needs a reachable routing instruction in its owning SKILL.md, prompt, or memory; changing "
-            "the unread file alone cannot change behavior.\n"
-            "- Tool gaps can coexist with text-actionable failures. Improve missing reusable methodology or supported "
-            "tool usage when feedback selects this component, while preserving each unavailable source as an explicit "
-            "tool backlog item rather than pretending the replacement can retrieve it.\n"
-            "- Do not universalize a rule from one example. Scope it with the smallest observable condition that matters "
-            "when it could regress other cases. Use industries as examples of a mechanism, not a closed hardcoded list.\n"
-            "- A company name or keyword is only a weak discovery clue. Do not use it alone to activate a risk "
-            "conclusion; require business-model, transaction, financial, asset, or financing evidence.\n"
-            "- Do not persist evaluator-only company names, dates, amounts, or invented numeric thresholds. A threshold "
-            "must be explicitly stated by an applicable policy/expert rule or independently repeated across examples. "
-            "Numbers observed or calculated from one company are case evidence, never reusable cutoffs. Otherwise express "
-            "an entity-relative historical/peer comparison or a clearly labeled adjustable stress scenario.\n"
-            "- Do not force every lesson into a full trigger/evidence/analysis/consequence template. Include only the "
-            "non-obvious condition, evidence distinction, comparison, or transmission logic that changes behavior. "
-            "Adapt it to the current business model and mark unsupported acquisition as TOOL_CAPABILITY_GAP. Follow the "
-            "current output contract when deciding whether uncertainty should be omitted or briefly labeled; never "
-            "present it as fact.\n"
-            "- Treat evidence lists as possible sources unless the component explicitly marks an item mandatory. If "
-            "only some evidence is available, produce only the analysis supported by that subset, preserve material "
-            "uncertainty, and keep the conclusion narrow. Missing, unknown, unverified, or merely not-excluded evidence "
-            "is not an affirmative signal and must not become a risk point or reusable expert pattern. Do not require "
-            "every listed source or infer the complete risk conclusion.\n"
-            "- Check cross-example regression risk. If a rule helps one scope but may hurt another, make the condition "
-            "explicit instead of applying the rule globally.\n"
-            "- Add only the knowledge increment the runtime model is unlikely to recover reliably on its own. Prefer a "
-            "short signal -> concern -> consequence reminder over a full textbook explanation.\n"
-            "- Keep operational detail proportional to what is non-obvious. Include evidence, comparison, consequence, "
-            "or a task-required decision criterion "
-            "only when it changes how the agent should investigate or decide; do not expand every reminder into a "
-            "fixed multi-section template.\n"
-            "- Avoid empty guidance such as 'analyze comprehensively', 'strengthen attention', or 'verify as needed'. A "
-            "new reminder must name at least one concrete distinction or relationship that changes investigation or reasoning.\n"
-            "- Keep names, paths, tool names, and output contracts consistent with the current component and feedback.\n"
-            "- Preserve the natural language used by the current component unless the feedback explicitly requires a "
-            "language change.\n"
-            "- Respect size and growth constraints; remove duplication before adding new material."
+            "Optimization rules:\n"
+            "- The authoritative target and Component selection context determine what to fix. Change only that component.\n"
+            "- Use deterministic trace facts as ground truth. If a skill/reference was unread, repair reachability in the "
+            "selected execution surface; do not copy its domain lesson there.\n"
+            "- Keep hidden expert data, rubrics, checkpoints, and evaluator feedback out of runtime text. Never invent a "
+            "tool capability or turn missing external evidence into memorized facts.\n"
+            "- Make the smallest reusable change supported by runtime evidence. Scope a domain lesson by observable "
+            "conditions and exclusions; a company name, one sample value, or a closed industry list is not a rule.\n"
+            "- Preserve partial-evidence semantics: analyze only what the acquired evidence supports. Unknown or missing "
+            "evidence is not an affirmative risk signal.\n"
+            "- Prefer a compact non-obvious distinction or signal -> concern -> consequence cue. Avoid generic advice, "
+            "fixed textbook templates, unsupported thresholds, and repeated rejected edits.\n"
+            "- Preserve valid names, paths, frontmatter, output contracts, language, and component size limits."
         )
         for key in candidate:
             instruction = self._component_instruction(key)
             boundary_rules = self._component_boundary_rules(key)
             templates[key] = (
                 f"{instruction}\n\n"
-                "Use the full evaluation data as a global map of the Deep Agents project. It may include other "
-                "component excerpts so you can diagnose where the failure belongs. Do not treat those excerpts as "
-                "text to paste into the selected component.\n\n"
+                "Use side_info only as optimizer evidence. The selected component context is authoritative when it "
+                "redirects an evaluator suggestion to a reachability or execution surface.\n\n"
                 f"{common_rules}\n\n"
                 f"Component boundary rules for `{key}`:\n"
                 f"{boundary_rules}\n\n"
                 "Your response must have exactly two sections, in this order. Do not start with a fenced code block.\n\n"
                 "Proposal rationale:\n"
-                "- Failure pattern:\n"
-                "- Runtime trajectory diagnosis:\n"
-                "- Recommended remediation category:\n"
-                "- Evidence across examples:\n"
-                "- Selected component:\n"
-                "- Why this component:\n"
-                "- Why not other components:\n"
-                "- Applicability scope and exclusions:\n"
-                "- Cross-case regression risk:\n"
-                "- Operational rule shape:\n"
-                "- Boundary checks:\n"
-                "- Hidden-data boundary check:\n"
+                "- Observed failure and runtime evidence:\n"
+                "- Why this target owns the fix:\n"
+                "- Reusable change and applicability:\n"
+                "- Regression, evidence, and boundary checks:\n"
                 "- Intended behavior change:\n\n"
                 "Final replacement:\n"
                 "Use exactly one fenced code block after `Final replacement:`. Do not use triple backticks anywhere "
@@ -495,7 +437,8 @@ class DefaultReflectionTemplateRegistry:
                 "instead. AGENTS.md does not own domain methodology, industry risk patterns, case mappings, or "
                 "expert knowledge. When a domain reference is unread or unreachable, make only the smallest "
                 "execution-layer change needed to activate the owning skill/reference; do not move the domain lesson "
-                "into memory. Avoid large growth unless the feedback explicitly requires it."
+                "into memory. It may name the existing skill or its canonical SKILL.md path when deterministic trace "
+                "evidence shows that ordinary routing was ignored. Avoid large growth unless the feedback requires it."
             )
         if key.endswith(":SKILL.md"):
             return (
@@ -628,57 +571,27 @@ class DefaultProposalReviewer:
     @staticmethod
     def _build_prompt(reflection_prompt: str, proposal_response: str) -> str:
         return (
-            "You are the final proposal reviewer for a Deep Agents text-surface optimizer. Review the proposed "
-            "drop-in replacement before any expensive agent rollout.\n\n"
-            "Judge the proposal holistically:\n"
-            "1. Mutation eligibility: hidden evaluator facts may score behavior, but they may drive a text mutation "
-            "only when checkpoint-specific runtime evidence or an available-but-skipped matching tool supports a reusable "
-            "lesson. Repeated examples may strengthen generalization, but cannot substitute for unavailable runtime data. "
-            "Missing external data alone is a tool backlog item, not knowledge to memorize.\n"
-            "2. Trajectory attribution: distinguish a missing tool, a skipped tool, bad call arguments, runtime/upstream "
-            "failure, insufficient tool results, and successful evidence omitted from analysis. REJECT a text mutation "
-            "when the remediation belongs only to tool implementation, credentials, dependencies, or dataset mapping.\n"
-            "A skill/reference edit can affect behavior only if the trace consumed that component. If the selected "
-            "reference was not read, require the selected component bundle to include its owning SKILL.md or the "
-            "appropriate prompt/memory execution policy. A compact reference edit may then carry the missing knowledge "
-            "while its companion edit makes the file reachable; otherwise reject the isolated unread-file mutation.\n"
-            "3. Component ownership: keep global behavior in prompts/memory, invariant workflow in SKILL.md, compact "
-            "domain cues in reference files, and invocation semantics in tool descriptions.\n"
-            "4. Generalization: reject company-specific answers, entity-name-only triggers, closed industry lists, and "
-            "rules extrapolated from one case without observable conditions.\n"
-            "5. Evidence integrity: reject unsupported fixed thresholds, dates, amounts, facts, or tool capabilities. "
-            "A value calculated from one case is not an expert threshold; replace it with a relative historical, peer, "
-            "contractual, or policy-backed comparison.\n"
-            "6. Output contract: preserve what the runtime agent is asked to produce. Reject or revise additions such "
-            "as recommendations, decisions, approval opinions, or long missing-data lists when the current prompt/skill "
-            "explicitly excludes them.\n"
-            "7. Minimality: preserve existing good text and make the smallest coherent edit. For learned references, "
-            "add at most a few compact signal -> concern -> consequence reminders. Do not produce long mechanism / "
-            "evidence / analysis / status / transmission / action templates when the runtime model already knows "
-            "those standard steps. For prompts and AGENTS.md, prefer one precise instruction over repeated prose.\n"
-            "If a prompt or AGENTS.md is currently short, normally preserve it and add only one to three sentences; "
-            "a replacement more than twice as long requires a concrete, non-duplicative reason. If you choose REVISE "
-            "because the proposal is verbose or duplicates another component, your reviewed replacement must be "
-            "materially shorter and must actually remove that duplication.\n"
-            "8. Resource validity: do not invent relative reference, skill, script, or tool paths. Verify resource "
-            "locations from the component map in the optimization prompt. Global memory/prompts should normally tell "
-            "the agent which skill to use instead of copying its workflow or linking to a skill-relative file.\n"
-            "9. Regression risk: contain a scoped lesson with observable applicability signals; do not improve one "
-            "sample by imposing a universal checklist on unrelated samples.\n\n"
-            "Evidence lists in a reference are possible sources, not an implicit requirement to obtain every item. "
-            "When only part of the evidence is available, preserve a conclusion whose scope matches that evidence and "
-            "its uncertainty. Missing, unknown, unverified, or merely not-excluded evidence is not an affirmative risk "
-            "signal and must not be turned into a risk point. Reject proposals that require all listed evidence "
-            "mechanically, infer a complete risk conclusion from a partial signal, or encourage splitting one data gap "
-            "into several unsupported findings.\n\n"
+            "You are the final QA reviewer for a Deep Agents text proposal. Judge the proposed replacement, not the "
+            "agent answer, and do not redo the evaluator's full diagnosis.\n\n"
+            "Check only these rollout blockers:\n"
+            "1. Causal fit: the edit materially addresses the authoritative Component selection context. Deterministic "
+            "resource-read and tool facts override model prose. If an execution surface was selected because a known "
+            "skill was unread, a concise instruction to read that skill is valid; do not reject it merely because domain "
+            "knowledge remains owned by a reference.\n"
+            "2. Ownership: prompts/memory own execution and routing, SKILL.md owns invariant workflow, references own "
+            "scoped domain cues, and tool descriptions own invocation semantics. Do not copy another component's body.\n"
+            "3. Evidence integrity: reject hidden case facts, invented capabilities or paths, unsupported thresholds, and "
+            "conclusions broader than the acquired evidence. Missing evidence is not an affirmative signal.\n"
+            "4. Generalization and contract: reject sample-specific rules, unconditional checklists, output-contract "
+            "changes, and approval actions the runtime contract excludes.\n"
+            "5. Minimality and validity: require a material, concise change with valid frontmatter/resources. Prefer one "
+            "precise execution instruction or compact domain cue over a repeated template.\n\n"
             f"{DefaultProposalReviewer._deterministic_advisory(reflection_prompt, proposal_response)}"
             "Return JSON only using this schema:\n"
             '{"decision":"ACCEPT|REVISE|REJECT","issues":["at most five concise issues"],'
             '"reviewed_response":"for REVISE, a complete Proposal rationale + Final replacement; otherwise same"}\n\n'
-            "REJECT means the evidence does not justify any text mutation. REVISE means return a complete corrected "
-            "proposal, not commentary or a patch. Before returning REVISE, re-read every issue you listed and verify "
-            "that the reviewed replacement resolves it rather than merely describing the intended fix. A REVISE "
-            "decision without a complete reviewed_response is invalid and will be retried or rejected.\n\n"
+            "REJECT means no valid text mutation exists for this target. REVISE requires a complete corrected proposal, "
+            "not commentary or a patch. A missing or ineffective reviewed_response is invalid.\n\n"
             "Original optimization prompt:\n"
             f"{reflection_prompt}\n\n"
             "Original proposal:\n"
@@ -707,13 +620,19 @@ class DefaultProposalReviewer:
         issues: list[str] = []
         growth = (len(replacement) - len(current)) / max(1, len(current))
         global_surface = component.startswith("memory:") or component.endswith(":system_prompt")
+        if current.rstrip() == replacement.rstrip():
+            issues.append("replacement is a semantic no-op; reject it instead of spending a rollout")
         if global_surface and growth > 1.0 and len(replacement) - len(current) > 300:
             issues.append(
                 f"global surface grows from {len(current)} to {len(replacement)} chars ({growth:+.0%}); revise to the "
                 "smallest durable instruction unless every added block is indispensable"
             )
-        if global_surface and re.search(r"(?mi)^\s*(?:#+\s*)?(?:example|示例)|^\s*[-*]\s*(?:input|输入)\s*:", replacement):
-            issues.append("global surface embeds examples; replace them with one reusable rule to reduce sample overfitting")
+        if global_surface and re.search(
+            r"(?mi)^\s*(?:#+\s*)?(?:example|示例)|^\s*[-*]\s*(?:input|输入)\s*:", replacement
+        ):
+            issues.append(
+                "global surface embeds examples; replace them with one reusable rule to reduce sample overfitting"
+            )
         if global_surface and re.search(r"(?<![/\w])reference/[^\s`]+", replacement):
             issues.append(
                 "global surface uses a skill-relative reference path; route through the owning skill instead of an "

@@ -61,6 +61,8 @@ try:
         Evaluator,
         ProposalReviewer,
         ReflectionTemplateRegistry,
+        component_consumption,
+        runtime_read_paths,
         select_deployment_candidate_index,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution.
@@ -82,6 +84,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution.
         Evaluator,
         ProposalReviewer,
         ReflectionTemplateRegistry,
+        component_consumption,
+        runtime_read_paths,
         select_deployment_candidate_index,
     )
 
@@ -211,6 +215,7 @@ class NoOpAwareLangChainAdapter(LangChainAdapter):
     _last_evaluation: EvaluationBatch | None = None
     _last_batch: list[Any] | None = None
     _last_candidate: dict[str, str] | None = None
+    _semantic_noop_reuse_ready: bool = False
 
     def evaluate(
         self,
@@ -221,25 +226,29 @@ class NoOpAwareLangChainAdapter(LangChainAdapter):
         if self._reuse_evaluation is not None and batch == self._reuse_batch and candidate == self._reuse_candidate:
             evaluation = self._reuse_evaluation
             self._clear_noop_reuse()
+            self._clear_last_evaluation()
+            self._semantic_noop_reuse_ready = False
             LOGGER.info(
                 "no_actionable_mutation components=[]; reusing the current candidate evaluation without an agent rerun"
             )
             return self._clone_reused_evaluation(evaluation)
 
         if (
-            self._last_evaluation is not None
+            self._semantic_noop_reuse_ready
+            and self._last_evaluation is not None
             and batch == self._last_batch
-            and candidate != self._last_candidate
             and candidates_equal_ignoring_trailing_whitespace(candidate, self._last_candidate or {})
         ):
             evaluation = self._last_evaluation
             self._clear_last_evaluation()
+            self._semantic_noop_reuse_ready = False
             LOGGER.info(
-                "semantic_noop_proposal; reusing the parent evaluation because only trailing whitespace changed"
+                "semantic_noop_proposal; reusing the parent evaluation because the reviewed candidate did not change"
             )
             return self._clone_reused_evaluation(evaluation)
 
         self._clear_noop_reuse()
+        self._semantic_noop_reuse_ready = False
         evaluation = super().evaluate(batch, candidate, capture_traces=capture_traces)
         self.remember_evaluated_batch(batch, candidate, evaluation)
         return evaluation
@@ -251,6 +260,7 @@ class NoOpAwareLangChainAdapter(LangChainAdapter):
         components_to_update: list[str],
     ) -> Mapping[str, Sequence[Mapping[str, Any]]]:
         if not components_to_update:
+            self._semantic_noop_reuse_ready = False
             self._reuse_evaluation = eval_batch
             self._reuse_candidate = dict(candidate)
             self._reuse_batch = [
@@ -258,6 +268,7 @@ class NoOpAwareLangChainAdapter(LangChainAdapter):
             ]
             return {}
 
+        self._semantic_noop_reuse_ready = True
         reflective_dataset = super().make_reflective_dataset(candidate, eval_batch, components_to_update)
         compact: dict[str, list[Mapping[str, Any]]] = {}
         for component, raw_records in reflective_dataset.items():
@@ -265,6 +276,11 @@ class NoOpAwareLangChainAdapter(LangChainAdapter):
             compact_records: list[Mapping[str, Any]] = []
             for index, record in enumerate(records):
                 current = dict(record)
+                current["Component selection context"] = component_selection_context(
+                    component,
+                    current,
+                    candidate,
+                )
                 if index == 0 and len(components_to_update) > 1:
                     current["Selected component bundle"] = list(components_to_update)
                 if index > 0:
@@ -340,6 +356,103 @@ def deduplicate_mappings(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str,
         seen.add(digest)
         unique.append(row)
     return unique
+
+
+def candidate_resource_consumption(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Summarize candidate skill/reference reads from runtime tool calls."""
+    raw_candidate = state.get("candidate_excerpt")
+    candidate = raw_candidate if isinstance(raw_candidate, Mapping) else {}
+    skill_components = sorted(str(key) for key in candidate if str(key).endswith(":SKILL.md"))
+    reference_components = sorted(str(key) for key in candidate if ":reference/" in str(key))
+    trajectory = [{"state": state}]
+    consumed_skills = [key for key in skill_components if component_consumption(key, trajectory) is True]
+    consumed_references = [key for key in reference_components if component_consumption(key, trajectory) is True]
+    configured_resources_unread = bool(skill_components and not consumed_skills and not consumed_references)
+    return {
+        "runtime_read_paths": sorted(runtime_read_paths(state)),
+        "configured_skill_components": skill_components,
+        "configured_reference_components": reference_components,
+        "consumed_skill_components": consumed_skills,
+        "consumed_reference_components": consumed_references,
+        "unread_skill_components": [key for key in skill_components if key not in consumed_skills],
+        "unread_reference_components": [key for key in reference_components if key not in consumed_references],
+        "resource_read_observable": isinstance(state.get("messages"), Sequence),
+        "configured_skill_unread": bool(skill_components and not consumed_skills),
+        "configured_resources_unread": configured_resources_unread,
+    }
+
+
+def resource_execution_gap(fitness: Mapping[str, Any]) -> bool:
+    return bool(fitness.get("resource_read_observable") and fitness.get("configured_resources_unread"))
+
+
+def primary_unread_skill_component(fitness: Mapping[str, Any]) -> str | None:
+    unread = [str(item) for item in fitness.get("unread_skill_components") or []]
+    return unread[0] if unread else None
+
+
+def component_runtime_path(component: str) -> str | None:
+    match = re.search(r"(?:^|:)skill:([^:]+):(SKILL\.md|reference/.+)$", component, re.I)
+    if match is None:
+        return None
+    return f"/skills/{match.group(1)}/{match.group(2)}"
+
+
+def component_selection_context(
+    selected_component: str,
+    record: Mapping[str, Any],
+    candidate: Mapping[str, str],
+) -> dict[str, Any]:
+    """Tell reflection why the selector chose this target after dependency routing."""
+    feedback = str(record.get("Feedback") or "")
+    match = re.search(r"(?m)^-\s*suggested_component:\s*(\S+)\s*$", feedback)
+    evaluator_suggestion = match.group(1).strip().rstrip(".,;") if match else None
+    raw_fitness = record.get("Fitness")
+    fitness = raw_fitness if isinstance(raw_fitness, Mapping) else {}
+    unread_skill = primary_unread_skill_component(fitness)
+    context: dict[str, Any] = {
+        "selected_component": selected_component,
+        "evaluator_suggestion": evaluator_suggestion,
+        "selection_is_authoritative": True,
+    }
+    if resource_execution_gap(fitness) and (
+        selected_component.startswith("memory:") or selected_component.endswith(":system_prompt")
+    ):
+        runtime_path = component_runtime_path(unread_skill or "")
+        context.update(
+            {
+                "selection_reason": "configured skill was not read; repair execution-layer reachability first",
+                "resource_read_facts": {
+                    "read_paths": list(fitness.get("runtime_read_paths") or []),
+                    "consumed_skills": list(fitness.get("consumed_skill_components") or []),
+                    "consumed_references": list(fitness.get("consumed_reference_components") or []),
+                },
+                "required_change": (
+                    f"Add the smallest durable instruction that makes the runtime read and follow `{runtime_path}` "
+                    "before domain tools or final synthesis."
+                    if runtime_path
+                    else "Add the smallest durable instruction that makes the runtime read and follow the owning skill."
+                ),
+                "do_not": "Do not move the missing domain lesson, checkpoint wording, or reference body into this surface.",
+            }
+        )
+    elif evaluator_suggestion and evaluator_suggestion != selected_component:
+        context.update(
+            {
+                "selection_reason": "selector dependency routing redirected the evaluator suggestion",
+                "required_change": f"Fix only the responsibility owned by `{selected_component}`.",
+            }
+        )
+    else:
+        context.update(
+            {
+                "selection_reason": "selected component directly owns the diagnosed behavior",
+                "required_change": f"Make a material, minimal change to `{selected_component}` or preserve it if no valid edit exists.",
+            }
+        )
+    if selected_component not in candidate:
+        context["selection_warning"] = "selected component is absent from the current candidate"
+    return context
 
 
 def deduplicate_examples(examples: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -2342,15 +2455,18 @@ def rubric_checkpoint_results(
     example: dict[str, Any],
     response: str,
     acquisition: Mapping[str, Any] | None = None,
+    semantic_matches: Mapping[str, str] | Sequence[str] | None = None,
 ) -> tuple[list[str], list[str], float]:
     checkpoints = rubric_checkpoints(example)
     if not checkpoints:
         return [], [], 1.0
     matched: list[str] = []
     missing: list[str] = []
+    semantic_labels = {str(item) for item in semantic_matches} if semantic_matches is not None else set()
     for checkpoint in checkpoints:
         label = checkpoint_label(checkpoint)
-        if checkpoint_matches(response, checkpoint) and checkpoint_runtime_evidence_ready(checkpoint, acquisition):
+        text_matches = checkpoint_matches(response, checkpoint) or label in semantic_labels
+        if text_matches and checkpoint_runtime_evidence_ready(checkpoint, acquisition):
             matched.append(label)
         else:
             missing.append(label)
@@ -2801,17 +2917,38 @@ def checkpoint_evidence_status_text(fitness: Mapping[str, Any]) -> str:
     return "\n".join(lines) or "- none"
 
 
+def resource_consumption_text(fitness: Mapping[str, Any]) -> str:
+    def values(key: str) -> str:
+        items = [str(item) for item in fitness.get(key) or []]
+        return ", ".join(items) if items else "none"
+
+    return (
+        f"- runtime_read_paths: {values('runtime_read_paths')}\n"
+        f"- consumed_skills: {values('consumed_skill_components')}\n"
+        f"- consumed_references: {values('consumed_reference_components')}\n"
+        f"- unread_skills: {values('unread_skill_components')}\n"
+        f"- configured_skill_unread: {str(bool(fitness.get('configured_skill_unread'))).lower()}\n"
+        f"- configured_resources_unread: {str(bool(fitness.get('configured_resources_unread'))).lower()}"
+    )
+
+
 def rubric_coverage_cap(
     example: dict[str, Any],
     response: str,
     acquisition: Mapping[str, Any] | None = None,
+    semantic_matches: Mapping[str, str] | Sequence[str] | None = None,
 ) -> float:
     checkpoints = rubric_checkpoints(example)
     if example.get("answer") or example.get("expected") or not checkpoints:
         return 1.0
     if not response.strip():
         return 0.25
-    _matched, _missing, coverage = rubric_checkpoint_results(example, response, acquisition)
+    _matched, _missing, coverage = rubric_checkpoint_results(
+        example,
+        response,
+        acquisition,
+        semantic_matches,
+    )
     if coverage >= 1.0:
         return 1.0
     if coverage >= 0.80:
@@ -2935,6 +3072,7 @@ def evaluate_response(example: dict[str, Any], state: dict) -> tuple[float, str]
         "unsupported_rubric_mentions": unsupported_mentions,
         **acquisition_diagnostics,
         **checkpoint_diagnostics,
+        **candidate_resource_consumption(state),
         "constraint_cap": gate_cap,
         "raw_composite": raw_composite,
         "eval_mode": eval_mode,
@@ -2988,11 +3126,39 @@ def evaluate_response_with_judge(
     candidate = state.get("candidate_excerpt", {})
     response = last_message_text(state)
     expected = example.get("answer") or example.get("expected") or ""
-    failure_classification, default_reason = classify_failure(
-        example, state, response, failures, state.get("fitness", {})
+    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
+    fitness = dict(state.get("fitness", {}))
+    semantic_checkpoint_evidence = validated_semantic_checkpoint_evidence(
+        example,
+        response,
+        payload,
+        acquisition_diagnostics,
     )
+    matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(
+        example,
+        response,
+        acquisition_diagnostics,
+        semantic_checkpoint_evidence,
+    )
+    checkpoint_diagnostics = checkpoint_evidence_diagnostics(
+        example,
+        missing_checkpoints,
+        acquisition_diagnostics,
+    )
+    fitness.update(
+        {
+            "semantic_checkpoint_evidence": semantic_checkpoint_evidence,
+            "matched_rubric_checkpoints": matched_checkpoints,
+            "missing_rubric_checkpoints": missing_checkpoints,
+            "rubric_coverage": rubric_coverage,
+            **checkpoint_diagnostics,
+        }
+    )
+    fitness.update(mutation_eligibility_diagnostics(example, state, failures, fitness))
+    state["fitness"] = fitness
+    failure_classification, default_reason = classify_failure(example, state, response, failures, fitness)
     suggested = str(payload.get("suggested_component") or "").strip()
-    mutation_eligible = bool(state.get("fitness", {}).get("mutation_eligible", True))
+    mutation_eligible = bool(fitness.get("mutation_eligible", True))
     if not mutation_eligible:
         suggested = ""
     elif suggested not in candidate:
@@ -3005,11 +3171,14 @@ def evaluate_response_with_judge(
 
     raw_score = coerce_score(payload.get("score"), deterministic_score)
     correctness = correctness_cap(response, expected)
-    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
-    rubric_cap_value = rubric_coverage_cap(example, response, acquisition_diagnostics)
+    rubric_cap_value = rubric_coverage_cap(
+        example,
+        response,
+        acquisition_diagnostics,
+        semantic_checkpoint_evidence,
+    )
     gate_cap = constraint_cap(failures)
     cap = min(correctness, rubric_cap_value, gate_cap)
-    fitness = dict(state.get("fitness", {}))
     deterministic_hard = float(fitness.get("hard", 0.0))
     if expected and deterministic_hard >= 1.0:
         score = min(deterministic_hard, rubric_cap_value, gate_cap)
@@ -3022,6 +3191,7 @@ def evaluate_response_with_judge(
             "judge_score": raw_score,
             "judge_correctness_cap": correctness,
             "judge_rubric_cap": rubric_cap_value,
+            "rubric_cap": rubric_cap_value,
             "judge_constraint_cap": gate_cap,
             "judge_cap": cap,
             "score_source": score_source,
@@ -3029,6 +3199,10 @@ def evaluate_response_with_judge(
             "composite": score,
         }
     )
+    state["judge_diagnostics"] = {
+        "raw_output": raw_judge,
+        "semantic_checkpoint_evidence": semantic_checkpoint_evidence,
+    }
     state["fitness"] = fitness
 
     judged_classification = str(payload.get("failure_classification") or failure_classification).strip()
@@ -3063,6 +3237,23 @@ def evaluate_response_with_judge(
         judged_classification = NO_FAILURE
         classification_reason = "candidate produced the authoritative expected result"
         suggested = ""
+    elif mutation_eligible and resource_execution_gap(fitness) and (expected or missing_checkpoints):
+        unread_skill = primary_unread_skill_component(fitness) or "configured skill"
+        runtime_path = component_runtime_path(unread_skill) or unread_skill
+        judged_classification = EXECUTION_LAPSE
+        classification_reason = f"deterministic trace shows that `{unread_skill}` and its references were not read before the incomplete result"
+        suggested = prompt_or_memory_component(candidate)
+        payload["suggested_component_reason"] = (
+            f"{suggested} owns the minimal execution instruction needed to make `{runtime_path}` reachable"
+        )
+        payload["trajectory_diagnosis"] = (
+            f"No configured skill/reference read was observed. Read paths: {fitness.get('runtime_read_paths') or 'none'}."
+        )
+        payload["recommended_remediation"] = (
+            f"Require the runtime to read and follow `{runtime_path}` before business tools or final synthesis; keep "
+            "domain methodology in its existing skill/reference files."
+        )
+        payload["boundary_assessment"] = "Execution routing belongs in memory or the system prompt."
     elif expected and candidate_encodes_expected_case(example, candidate, expected) is False:
         judged_classification = SKILL_DEFECT
         classification_reason = (
@@ -3143,171 +3334,94 @@ def build_judge_prompt(
     deterministic_feedback: str,
     failures: list[dict[str, Any]],
 ) -> str:
+    """Ask the judge only for behavioral scoring and causal routing."""
+    del deterministic_feedback
     candidate = state.get("candidate_excerpt", {})
-    hard_lines = "\n".join(f"- {f['name']}: {f['message']}" for f in failures) or "- none"
-    advisory = [
-        c
-        for c in state.get("candidate_constraints", [])
-        if not c.get("passed") and str(c.get("severity", "hard")) == "advisory"
-    ]
-    advisory_lines = "\n".join(f"- {c['name']}: {c['message']}" for c in advisory[:20]) or "- none"
-    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
-    matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(
-        example,
-        last_message_text(state),
-        acquisition_diagnostics,
-    )
-    checkpoint_lines = "\n".join(f"- {checkpoint_label(item)}" for item in rubric_checkpoints(example)) or "- none"
-    missing_checkpoint_lines = "\n".join(f"- {item}" for item in missing_checkpoints) or "- none"
-    unsupported_mentions = unsupported_checkpoint_mentions(
-        example,
-        last_message_text(state),
-        acquisition_diagnostics,
-    )
-    unsupported_mention_lines = (
-        "\n".join(f"- {item['label']}: {item['reason']}" for item in unsupported_mentions) or "- none"
-    )
-    matched_trace_expectations = acquisition_diagnostics["matched_trace_expectations"]
-    missing_trace_expectations = acquisition_diagnostics["missing_trace_expectations"]
-    trace_coverage = acquisition_diagnostics["trace_expectation_coverage"]
-    trace_expectation_lines = (
-        "\n".join(f"- {trace_expectation_label(item)}" for item in trace_expectations(example)) or "- none"
-    )
-    missing_trace_expectation_lines = "\n".join(f"- {item}" for item in missing_trace_expectations) or "- none"
-    matched_trace_expectation_lines = "\n".join(f"- {item}" for item in matched_trace_expectations) or "- none"
-    tool_supported_missing_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_supported_missing_expectations"]) or "- none"
-    )
-    skipped_supported_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["skipped_supported_expectations"]) or "- none"
-    )
-    failed_tool_expectation_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["failed_tool_expectations"]) or "- none"
-    )
-    incomplete_tool_result_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["incomplete_tool_result_expectations"]) or "- none"
-    )
-    tool_capability_gap_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]) or "- none"
-    )
-    tool_data_coverage_gap_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_data_coverage_gaps"]) or "- none"
-    )
-    successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
-    failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
-    available_tools = tool_inventory_text(state.get("available_tools") or []) or "- none"
+    response = last_message_text(state)
+    acquisition = data_acquisition_diagnostics(example, state)
     fitness = state.get("fitness", {})
-    mutation_eligible = bool(fitness.get("mutation_eligible", True))
-    mutation_eligibility_reason = str(fitness.get("mutation_eligibility_reason") or "not evaluated")
-    checkpoint_evidence_lines = checkpoint_evidence_status_text(fitness)
+    checkpoints = rubric_checkpoints(example)
+    _matched, missing, keyword_coverage = rubric_checkpoint_results(example, response, acquisition)
+    unsupported_mentions = unsupported_checkpoint_mentions(example, response, acquisition)
+    hard_lines = "\n".join(f"- {item['name']}: {item['message']}" for item in failures) or "- none"
+    advisory = [
+        item
+        for item in state.get("candidate_constraints", [])
+        if not item.get("passed") and str(item.get("severity", "hard")) == "advisory"
+    ]
+    advisory_lines = "\n".join(f"- {item['name']}: {item['message']}" for item in advisory[:20]) or "- none"
+    deterministic_facts = {
+        "keyword_checkpoint_coverage": keyword_coverage,
+        "keyword_missing_checkpoints": missing,
+        "unsupported_checkpoint_mentions": unsupported_mentions,
+        "trace_expectations": [trace_expectation_label(item) for item in trace_expectations(example)],
+        "trace_expectation_coverage": acquisition["trace_expectation_coverage"],
+        "matched_trace_expectations": acquisition["matched_trace_expectations"],
+        "missing_trace_expectations": acquisition["missing_trace_expectations"],
+        "skipped_supported_expectations": acquisition["skipped_supported_expectations"],
+        "failed_tool_expectations": acquisition["failed_tool_expectations"],
+        "incomplete_tool_result_expectations": acquisition["incomplete_tool_result_expectations"],
+        "tool_data_coverage_gaps": acquisition["tool_data_coverage_gaps"],
+        "tool_capability_gaps": acquisition["tool_capability_gaps"],
+        "mutation_eligible": bool(fitness.get("mutation_eligible", True)),
+        "mutation_eligibility_reason": fitness.get("mutation_eligibility_reason", "not evaluated"),
+        "resource_consumption": candidate_resource_consumption(state),
+        "available_tools": tool_inventory_text(state.get("available_tools") or []) or "none",
+    }
+    checkpoint_text = json.dumps(checkpoints, ensure_ascii=False, indent=2) if checkpoints else "none"
     return (
-        "You are the evaluator for a Deep Agents GEPA text-surface optimization run.\n"
-        "Use hard constraints as non-negotiable validity rules. Treat advisory notes as hints, not automatic failures.\n"
-        "Score whether the candidate behavior and text surfaces improved for the task, then recommend the single best "
-        "component to edit next.\n"
-        "Choose the component by ownership: AGENTS.md/system prompts hold stable global execution policy; SKILL.md holds "
-        "invariant workflow, resource routing, failure modes, and guardrails; reference/*.md holds scoped domain "
-        "methodology, industry patterns, calculations, and expert knowledge; tool descriptions hold invocation semantics "
-        "and capability boundaries. Prefer the most specific existing reference component for domain knowledge. Do not "
-        "grow SKILL.md into an industry catalog. Before recommending a skill/reference edit, verify that the trace read "
-        "that component. If it was not consumed, diagnose the reachability/execution lapse and recommend the owning "
-        "SKILL.md routing instruction or prompt/memory policy; an unread reference edit cannot change behavior.\n"
-        "Treat a single example as evidence for a candidate rule, not proof of a universal rule. Recommend explicit "
-        "applicability signals and exclusions whenever a change could help one industry or business model but harm "
-        "another. A useful rule must be concrete enough to change behavior, but do not force every reminder into a fixed "
-        "trigger/evidence/analysis/consequence template. Include only the non-obvious condition, evidence distinction, "
-        "comparison, or transmission logic needed for that lesson. Keep unsupported or uncollected evidence as a "
-        "hypothesis, and reject broad advice that does not alter investigation or reasoning.\n"
-        "Treat evidence lists in runtime skills/references as possible sources unless they explicitly declare an item "
-        "mandatory. Partial evidence may support a correspondingly narrow risk finding; do not require every listed "
-        "source, and do not infer a complete conclusion from only one partial signal. Missing, unknown, unverified, or "
-        "merely not-excluded evidence is not an affirmative risk signal. Such mentions receive no checkpoint credit and "
-        "must not be expanded into speculative risk points. Score whether the output's scope and uncertainty match the "
-        "evidence actually acquired.\n"
-        "Data-acquisition expectations are satisfied only by paired, successful tool-call results whose declared seed "
-        "capability matches the expectation. Keywords in prompts, skills, AI prose, or final answers are not acquisition "
-        "evidence. Diagnose each missing path precisely: no matching tool means TOOL_CAPABILITY_GAP; an available tool "
-        "that was not called means tool-usage EXECUTION_LAPSE; argument/validation failure points to invocation guidance; "
-        "runtime/upstream failure points to the tool implementation or environment; an explicit no-data result is a "
-        "tool/data coverage gap and must not drive text mutation; a non-empty but insufficient result points to "
-        "query/result coverage; and successful relevant evidence that never reaches the final risk analysis "
-        "points to SKILL_DEFECT. A hidden expert checkpoint is allowed to lower the task score, but it may drive a text mutation only "
-        "when the trace contains relevant successful evidence or the agent skipped an available matching tool. If "
-        "current tools cannot obtain the evidence, classify TOOL_CAPABILITY_GAP. If the evaluator cannot establish "
-        "whether the lesson is observable at runtime, classify INSUFFICIENT_RUNTIME_EVIDENCE. In both cases leave "
-        "suggested_component empty. Never convert unavailable company facts into memorized skill/reference content.\n"
-        "For NO_FAILURE, leave suggested_component empty. Successful examples are regression constraints and positive "
-        "evidence; they must not vote to mutate a component.\n"
-        "If Expected is not `rubric-only`, treat it as the authoritative target label, route, answer, or structured "
-        "result. Do not reinterpret the task as solving the user's underlying real-world problem unless the rubric "
-        "explicitly asks for that. For routing or classification tasks, score the final response by whether it returns "
-        "the expected label/route and recommend text-surface changes that improve that classification behavior. "
-        "Operational troubleshooting advice instead of the expected label is a failure. A deterministic exact match "
-        "anchors the final task score and NO_FAILURE classification; your score and prose remain diagnostic and cannot "
-        "overrule that machine-verifiable result.\n"
-        "For rubric-only expert-experience examples, use rubric checkpoints as a strict behavior-scoring checklist: "
-        "missing checkpoints still cap the score. Keep scoring separate from mutation eligibility. Expert evaluation "
-        "data is evaluator-only material; do not copy its case facts, exact conclusions, thresholds, or complete "
-        "analysis into a runtime component. When runtime evidence supports a reusable lesson, recommend only the "
-        "smallest non-obvious cue. For learned references, prefer a compact condition -> concern -> consequence reminder "
-        "and rely on the runtime model's general knowledge for standard investigation and analysis. Never tell the "
-        "runtime agent to read Expert data, rubrics, checkpoints, or evaluator feedback; those fields are hidden during "
-        "rollout. Honor the runtime output contract when judging completeness. If it asks only for evidence-supported "
-        "risk points, do not require or reward approval opinions, credit decisions, limits, drawdown conditions, "
-        "monitoring plans, or a long missing-data checklist.\n\n"
-        "Return JSON only, with this schema:\n"
+        "You are the evaluator and causal router for a Deep Agents GEPA run. Evaluate the runtime result; do not draft "
+        "replacement prompt, skill, reference, or tool text. Code applies deterministic caps after your score.\n\n"
+        "Authoritative rules:\n"
+        "- Hard constraints, paired tool results, declared tool capabilities, and file-read paths are facts. Never claim "
+        "a skill or reference was used unless resource_consumption says it was consumed.\n"
+        "- When Expected is present, it is the authoritative target. An exact deterministic match cannot be overruled.\n"
+        "- For rubric-only cases, assess semantic coverage, not headings or exact wording. One passage may cover several "
+        "checkpoints. For every covered checkpoint, quote an exact excerpt from Candidate output. No valid excerpt means "
+        "no semantic credit, and runtime evidence requirements still apply. Missing checkpoints still cap the score.\n"
+        "- Hidden expert data may score behavior but may justify mutation only when relevant evidence was acquired or an "
+        "explicitly capable tool was skipped. Missing external data is not an affirmative signal.\n"
+        "- Classify the causal owner: an unread configured skill/reference or skipped capable tool is EXECUTION_LAPSE; "
+        "consumed guidance plus acquired evidence but missing reasoning is SKILL_DEFECT; unavailable capability is "
+        "TOOL_CAPABILITY_GAP; unprovable observability is INSUFFICIENT_RUNTIME_EVIDENCE; satisfied behavior is NO_FAILURE.\n"
+        "- Route to one existing component only when mutation is eligible. Memory/system prompts own stable execution "
+        "and routing; SKILL.md owns invariant workflow; references own scoped domain cues; tool descriptions own call "
+        "semantics. An unread reference cannot be fixed by editing it alone. Leave suggested_component empty for tool "
+        "gaps, insufficient evidence, and no failure.\n"
+        "- Diagnose the smallest reusable behavior gap without prescribing replacement prose. Preserve the output "
+        "contract and do not reward unsupported conclusions or excluded approval advice.\n\n"
+        "Return JSON only using this schema:\n"
         "{\n"
         '  "score": 0.0,\n'
         f'  "failure_classification": "{SKILL_DEFECT}|{EXECUTION_LAPSE}|{TOOL_CAPABILITY_GAP}|'
         f'{INSUFFICIENT_RUNTIME_EVIDENCE}|{NO_FAILURE}",\n'
         '  "classification_reason": "short reason",\n'
         '  "mutation_eligible": false,\n'
-        '  "suggested_component": "one key from allowed_components, or empty when mutation_eligible is false",\n'
-        '  "suggested_component_reason": "short reason",\n'
-        '  "reusable_lesson": "smallest non-obvious reusable lesson, or empty",\n'
-        '  "knowledge_scope": "global_policy|invariant_workflow|scoped_domain_rule|tool_semantics",\n'
-        '  "applicability_scope": "observable triggers, relevant scopes, and exclusions",\n'
-        '  "cross_case_regression_risk": "how the change could hurt other examples and how to contain it",\n'
-        '  "operational_rule": "smallest concrete rule that changes investigation or reasoning",\n'
+        '  "suggested_component": "one allowed component key, or empty",\n'
+        '  "suggested_component_reason": "short causal ownership reason",\n'
         '  "trajectory_diagnosis": "what the trace did or failed to do",\n'
-        '  "recommended_remediation": "tool, tool usage, skill/reference, prompt, or dataset action",\n'
-        '  "feedback": "concise actionable feedback",\n'
-        '  "boundary_assessment": "whether the edit respects component roles"\n'
+        '  "recommended_remediation": "behavior or capability to change, without replacement prose",\n'
+        '  "checkpoint_assessments": [{"label":"exact checkpoint label","covered":true,'
+        '"response_evidence":"exact Candidate output excerpt or empty","reason":"short semantic mapping"}],\n'
+        '  "feedback": "concise evaluator feedback",\n'
+        '  "boundary_assessment": "brief component-ownership check"\n'
         "}\n\n"
         f"Allowed components: {list(candidate)}\n\n"
         f"Task: {example.get('input', '')}\n"
         f"Expected: {example.get('answer') or example.get('expected') or 'rubric-only'}\n"
         f"Rubric: {example.get('rubric') or 'n/a'}\n\n"
         f"Expert evaluation data:\n{example_data_text(example)}\n\n"
-        f"Rubric checkpoints:\n{checkpoint_lines}\n"
-        f"Rubric coverage by candidate output: {rubric_coverage:.2f}\n"
-        f"Missing rubric checkpoints:\n{missing_checkpoint_lines}\n\n"
-        f"Unsupported checkpoint mentions (deterministically unscored):\n{unsupported_mention_lines}\n\n"
-        f"Trace expectations:\n{trace_expectation_lines}\n"
-        f"Trace expectation coverage by candidate trace: {trace_coverage:.2f}\n"
-        f"Matched trace expectations:\n{matched_trace_expectation_lines}\n"
-        f"Missing trace expectations:\n{missing_trace_expectation_lines}\n"
-        f"Missing expectations with apparent tool support:\n{tool_supported_missing_lines}\n"
-        f"Available matching tools that were not called:\n{skipped_supported_lines}\n"
-        f"Matching tool calls that failed:\n{failed_tool_expectation_lines}\n"
-        f"Successful matching calls with insufficient results:\n{incomplete_tool_result_lines}\n"
-        f"Tool/data coverage gaps:\n{tool_data_coverage_gap_lines}\n"
-        f"Tool capability gaps:\n{tool_capability_gap_lines}\n"
-        f"Checkpoint-specific evidence attribution:\n{checkpoint_evidence_lines}\n"
-        f"Deterministic mutation eligibility: {str(mutation_eligible).lower()}\n"
-        f"Mutation eligibility reason: {mutation_eligibility_reason}\n"
-        f"Successful tool evidence:\n{successful_tool_evidence_lines}\n"
-        f"Failed tool evidence:\n{failed_tool_evidence_lines}\n"
-        f"Available tools:\n{available_tools[:2500]}\n\n"
-        f"Candidate output:\n{last_message_text(state)}\n\n"
+        f"Rubric checkpoints (copy labels exactly):\n{checkpoint_text}\n\n"
+        "Deterministic runtime facts (authoritative):\n"
+        f"{json.dumps(deterministic_facts, ensure_ascii=False, indent=2)}\n\n"
+        f"Candidate output:\n{response}\n\n"
         f"Baseline output:\n{state.get('baseline_response', '')}\n\n"
         f"Adaptive trace summary:\n{summarize_messages(state)}\n\n"
         f"Hard constraint failures:\n{hard_lines}\n\n"
         f"Advisory notes:\n{advisory_lines}\n\n"
-        f"Deterministic fallback score: {deterministic_score:.3f}\n"
-        f"Deterministic fallback feedback:\n{deterministic_feedback[:2000]}\n\n"
+        f"Deterministic fallback score: {deterministic_score:.3f}\n\n"
         "Candidate component excerpts:\n"
-        f"{compact_candidate_excerpt(candidate)}"
+        f"{compact_candidate_excerpt(candidate, limit_per_component=400)}"
     )
 
 
@@ -3343,6 +3457,36 @@ def coerce_score(value: Any, fallback: float) -> float:
     except (TypeError, ValueError):
         score = fallback
     return max(0.0, min(1.0, score))
+
+
+def validated_semantic_checkpoint_evidence(
+    example: Mapping[str, Any],
+    response: str,
+    payload: Mapping[str, Any],
+    acquisition: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Accept semantic checkpoint credit only with an exact response excerpt and runtime evidence."""
+    raw_assessments = payload.get("checkpoint_assessments") or []
+    if not isinstance(raw_assessments, Sequence) or isinstance(raw_assessments, str | bytes):
+        return {}
+    checkpoints = {checkpoint_label(item): item for item in rubric_checkpoints(dict(example))}
+    response_compact = compact_for_keyword_match(response)
+    validated: dict[str, str] = {}
+    for raw in raw_assessments:
+        if not isinstance(raw, Mapping) or raw.get("covered") is not True:
+            continue
+        label = str(raw.get("label") or "").strip()
+        excerpt = str(raw.get("response_evidence") or "").strip()
+        checkpoint = checkpoints.get(label)
+        if checkpoint is None or not excerpt or len(excerpt) > 500:
+            continue
+        excerpt_compact = compact_for_keyword_match(excerpt)
+        if not excerpt_compact or excerpt_compact not in response_compact:
+            continue
+        if not checkpoint_runtime_evidence_ready(checkpoint, acquisition):
+            continue
+        validated[label] = excerpt
+    return validated
 
 
 def sanitize_judge_guidance(payload: Mapping[str, Any], example: Mapping[str, Any]) -> dict[str, Any]:
@@ -3412,131 +3556,80 @@ def build_judge_feedback(
     classification_reason: str,
     suggested: str,
 ) -> str:
-    failure_lines = "\n".join(f"- {f['name']}: {f['message']}" for f in failures[:20]) or "- none"
-    suggested_reason = str(payload.get("suggested_component_reason") or "reflection judge recommendation")
-    knowledge_scope = str(payload.get("knowledge_scope") or "not provided").strip()
-    applicability_scope = str(payload.get("applicability_scope") or "not provided").strip()
-    regression_risk = str(payload.get("cross_case_regression_risk") or "not provided").strip()
-    operational_rule = str(payload.get("operational_rule") or "not provided").strip()
-    reusable_lesson = str(payload.get("reusable_lesson") or "").strip()
-    trajectory_diagnosis = str(payload.get("trajectory_diagnosis") or "").strip()
-    judge_remediation = str(payload.get("recommended_remediation") or "").strip()
-    feedback_text = str(payload.get("feedback") or "").strip()
-    boundary_assessment = str(payload.get("boundary_assessment") or "").strip()
-    sanitization_lines = "\n".join(f"- {item}" for item in payload.get("guidance_sanitization") or []) or "- none"
+    """Return compact evaluator evidence for reflection and artifacts."""
+    del example, response, baseline_response, deterministic_feedback, raw_judge
     fitness = state.get("fitness", {})
     mutation_eligible = bool(fitness.get("mutation_eligible", True))
-    mutation_eligibility_reason = str(fitness.get("mutation_eligibility_reason") or "not provided")
-    if not mutation_eligible:
-        suggested_reason = mutation_eligibility_reason
-    acquisition_diagnostics = data_acquisition_diagnostics(example, state)
-    matched_checkpoints, missing_checkpoints, rubric_coverage = rubric_checkpoint_results(
-        example,
-        response,
-        acquisition_diagnostics,
+    suggested_reason = str(
+        payload.get("suggested_component_reason")
+        or fitness.get("mutation_eligibility_reason")
+        or "evaluator causal routing"
     )
-    matched_checkpoint_lines = "\n".join(f"- {item}" for item in matched_checkpoints) or "- none"
-    missing_checkpoint_lines = "\n".join(f"- {item}" for item in missing_checkpoints) or "- none"
-    unsupported_mention_lines = (
+
+    def item_lines(key: str) -> str:
+        values = fitness.get(key) or []
+        return "\n".join(f"- {item}" for item in values) or "- none"
+
+    failure_lines = "\n".join(f"- {item['name']}: {item['message']}" for item in failures[:20]) or "- none"
+    semantic_lines = (
+        "\n".join(
+            f"- {label}: {excerpt}" for label, excerpt in (fitness.get("semantic_checkpoint_evidence") or {}).items()
+        )
+        or "- none"
+    )
+    unsupported_lines = (
         "\n".join(
             f"- {item.get('label', 'checkpoint')}: {item.get('reason', 'unsupported')}"
             for item in fitness.get("unsupported_rubric_mentions") or []
         )
         or "- none"
     )
-    matched_trace_expectations = acquisition_diagnostics["matched_trace_expectations"]
-    missing_trace_expectations = acquisition_diagnostics["missing_trace_expectations"]
-    trace_coverage = acquisition_diagnostics["trace_expectation_coverage"]
-    matched_trace_expectation_lines = "\n".join(f"- {item}" for item in matched_trace_expectations) or "- none"
-    missing_trace_expectation_lines = "\n".join(f"- {item}" for item in missing_trace_expectations) or "- none"
-    tool_supported_missing_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_supported_missing_expectations"]) or "- none"
-    )
-    tool_capability_gap_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_capability_gaps"]) or "- none"
-    )
-    tool_data_coverage_gap_lines = (
-        "\n".join(f"- {item}" for item in acquisition_diagnostics["tool_data_coverage_gaps"]) or "- none"
-    )
-    successful_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["successful_tool_evidence"])
-    failed_tool_evidence_lines = tool_evidence_text(acquisition_diagnostics["failed_tool_evidence"])
-    remediation_lines = remediation_actions_text(fitness)
-    checkpoint_evidence_lines = checkpoint_evidence_status_text(fitness)
     return (
         "Reflection-judge Deep Agents text-surface evaluation.\n"
-        f"Task: {example.get('input', '')}\n"
-        f"Expected: {example.get('answer') or example.get('expected') or 'rubric-only'}\n"
-        f"Rubric: {example.get('rubric') or 'n/a'}\n"
-        f"Expert evaluation data:\n{example_data_text(example, limit=1800)}\n\n"
-        "Scores:\n"
+        "Scores and routing:\n"
         f"- judge_score: {raw_score:.2f}\n"
         f"- correctness_cap: {correctness_cap_value:.2f}\n"
         f"- rubric_cap: {rubric_cap_value:.2f}\n"
-        f"- rubric_coverage: {rubric_coverage:.2f}\n"
-        f"- trace_expectation_coverage: {trace_coverage:.2f}\n"
+        f"- rubric_coverage: {float(fitness.get('rubric_coverage', 1.0)):.2f}\n"
+        f"- trace_expectation_coverage: {float(fitness.get('trace_expectation_coverage', 1.0)):.2f}\n"
         f"- constraint_cap: {constraint_cap_value:.2f}\n"
         f"- final_cap: {cap:.2f}\n"
         f"- final_score: {score:.2f}\n"
         f"- score_source: {fitness.get('score_source', 'llm_judge_capped')}\n"
-        f"- eval_mode: llm_judge\n"
         f"- failure_classification: {failure_classification}\n"
         f"- classification_reason: {classification_reason}\n"
-        f"- remediation_type: {fitness.get('remediation_type', NO_ACTION)}\n"
-        f"- remediation_reason: {fitness.get('remediation_reason', 'not provided')}\n"
-        f"- remediation_owner: {fitness.get('remediation_owner', 'none')}\n"
         f"- mutation_eligible: {str(mutation_eligible).lower()}\n"
-        f"- mutation_eligibility_reason: {mutation_eligibility_reason}\n"
+        f"- mutation_eligibility_reason: {fitness.get('mutation_eligibility_reason', 'not provided')}\n"
         f"- suggested_component: {suggested or 'none'}\n"
-        f"- suggested_component_reason: {suggested_reason}\n"
-        f"- reusable_lesson: {reusable_lesson or 'none'}\n"
-        f"- knowledge_scope: {knowledge_scope}\n"
-        f"- applicability_scope: {applicability_scope}\n"
-        f"- cross_case_regression_risk: {regression_risk}\n"
-        f"- operational_rule: {operational_rule}\n\n"
-        "Judge guidance sanitization:\n"
-        f"{sanitization_lines}\n\n"
-        f"- judge_trajectory_diagnosis: {trajectory_diagnosis or 'not provided'}\n"
-        f"- judge_recommended_remediation: {judge_remediation or 'not provided'}\n\n"
+        f"- suggested_component_reason: {suggested_reason}\n\n"
+        "Runtime resource consumption (deterministic):\n"
+        f"{resource_consumption_text(fitness)}\n\n"
+        "Matched rubric checkpoints:\n"
+        f"{item_lines('matched_rubric_checkpoints')}\n\n"
+        "Missing rubric checkpoints:\n"
+        f"{item_lines('missing_rubric_checkpoints')}\n\n"
+        "Validated semantic checkpoint evidence:\n"
+        f"{semantic_lines}\n\n"
+        "Unsupported checkpoint mentions:\n"
+        f"{unsupported_lines}\n\n"
+        "Trace/tool diagnosis:\n"
+        f"- matched expectations: {fitness.get('matched_trace_expectations') or 'none'}\n"
+        f"- skipped capable tools: {fitness.get('skipped_supported_expectations') or 'none'}\n"
+        f"- failed matching calls: {fitness.get('failed_tool_expectations') or 'none'}\n"
+        f"- incomplete matching results: {fitness.get('incomplete_tool_result_expectations') or 'none'}\n"
+        f"- tool/data coverage gaps: {fitness.get('tool_data_coverage_gaps') or 'none'}\n"
+        f"- tool capability gaps: {fitness.get('tool_capability_gaps') or 'none'}\n\n"
+        "Checkpoint-specific evidence attribution:\n"
+        f"{checkpoint_evidence_status_text(fitness)}\n\n"
         "Remediation actions:\n"
-        f"{remediation_lines}\n\n"
+        f"{remediation_actions_text(fitness)}\n\n"
         "Gate failures:\n"
         f"{failure_lines}\n\n"
-        "Matched rubric checkpoints:\n"
-        f"{matched_checkpoint_lines}\n\n"
-        "Missing rubric checkpoints:\n"
-        f"{missing_checkpoint_lines}\n\n"
-        "Unsupported checkpoint mentions:\n"
-        f"{unsupported_mention_lines}\n\n"
-        "Matched trace expectations:\n"
-        f"{matched_trace_expectation_lines}\n\n"
-        "Missing trace expectations:\n"
-        f"{missing_trace_expectation_lines}\n\n"
-        "Missing expectations with apparent tool support:\n"
-        f"{tool_supported_missing_lines}\n\n"
-        "Tool capability gaps:\n"
-        f"{tool_capability_gap_lines}\n\n"
-        "Tool/data coverage gaps:\n"
-        f"{tool_data_coverage_gap_lines}\n\n"
-        "Checkpoint-specific evidence attribution:\n"
-        f"{checkpoint_evidence_lines}\n\n"
-        "Successful tool evidence:\n"
-        f"{successful_tool_evidence_lines}\n\n"
-        "Failed tool evidence:\n"
-        f"{failed_tool_evidence_lines}\n\n"
-        "Judge feedback:\n"
-        f"{feedback_text or 'n/a'}\n\n"
-        "Boundary assessment:\n"
-        f"{boundary_assessment or 'n/a'}\n\n"
-        "With candidate output:\n"
-        f"{response}\n\n"
-        "Baseline output:\n"
-        f"{baseline_response}\n\n"
-        "Adaptive trace summary:\n"
-        f"{summarize_messages(state)}\n\n"
-        "Deterministic fallback feedback:\n"
-        f"{deterministic_feedback[:2000]}\n\n"
-        "Raw judge output:\n"
-        f"{raw_judge[:2000]}"
+        "Judge diagnosis:\n"
+        f"- trajectory: {str(payload.get('trajectory_diagnosis') or 'not provided').strip()}\n"
+        f"- remediation: {str(payload.get('recommended_remediation') or 'not provided').strip()}\n"
+        f"- feedback: {str(payload.get('feedback') or 'not provided').strip()}\n"
+        f"- ownership: {str(payload.get('boundary_assessment') or 'not provided').strip()}"
     )
 
 
@@ -3667,6 +3760,12 @@ def classify_failure(
     if not expected:
         missing = [str(item) for item in fitness.get("missing_rubric_checkpoints") or []]
         if missing:
+            if resource_execution_gap(fitness) and bool(fitness.get("mutation_eligible", True)):
+                unread_skill = primary_unread_skill_component(fitness) or "configured skill"
+                return (
+                    EXECUTION_LAPSE,
+                    f"runtime did not read `{unread_skill}` before producing an incomplete answer",
+                )
             if tool_actionable or actionable_expectations:
                 return EXECUTION_LAPSE, execution_lapse_reason(fitness)
             if not bool(fitness.get("mutation_eligible", True)):
@@ -3701,6 +3800,9 @@ def classify_failure(
         )
     if float(fitness.get("hard", 0.0)) >= 1.0:
         return NO_FAILURE, "candidate produced the expected route"
+    if resource_execution_gap(fitness) and bool(fitness.get("mutation_eligible", True)):
+        unread_skill = primary_unread_skill_component(fitness) or "configured skill"
+        return EXECUTION_LAPSE, f"runtime did not read `{unread_skill}` before producing the wrong result"
     mapping_present = candidate_encodes_expected_case(example, state.get("candidate_excerpt", {}), expected)
     if mapping_present is False:
         return (
@@ -3821,6 +3923,19 @@ def remediation_diagnostics(
                 "instead of encoding unavailable facts in text",
                 "tool_or_mcp",
             )
+        if (
+            failure_classification == EXECUTION_LAPSE
+            and resource_execution_gap(fitness)
+            and bool(fitness.get("mutation_eligible", True))
+        ):
+            unread_skill = primary_unread_skill_component(fitness)
+            add_action(
+                IMPROVE_AGENT_EXECUTION,
+                [unread_skill] if unread_skill else [],
+                "the runtime did not read the configured skill; strengthen only the execution-layer instruction that "
+                "makes the skill reachable before business tools or final synthesis",
+                "memory_or_system_prompt",
+            )
         if failure_classification == SKILL_DEFECT:
             add_action(
                 IMPROVE_SKILL_OR_REFERENCE,
@@ -3854,11 +3969,11 @@ def remediation_diagnostics(
     preferred_types = {
         SKILL_DEFECT: (FIX_TEXT_CONSTRAINT, IMPROVE_SKILL_OR_REFERENCE),
         EXECUTION_LAPSE: (
+            FIX_TOOL_RUNTIME,
             IMPROVE_TOOL_INVOCATION,
             IMPROVE_TOOL_USAGE,
             IMPROVE_TOOL_QUERY_OR_RESULT,
             IMPROVE_AGENT_EXECUTION,
-            FIX_TOOL_RUNTIME,
         ),
         TOOL_CAPABILITY_GAP: (ADD_TOOL_OR_MCP,),
         INSUFFICIENT_RUNTIME_EVIDENCE: (IMPROVE_EVAL_MAPPING,),
@@ -4000,6 +4115,7 @@ def build_feedback(
     failed_tool_evidence_lines = tool_evidence_text(fitness.get("failed_tool_evidence", []))
     remediation_lines = remediation_actions_text(fitness)
     checkpoint_evidence_lines = checkpoint_evidence_status_text(fitness)
+    resource_consumption_lines = resource_consumption_text(fitness)
     return (
         "Darwin-style Deep Agents text-surface evaluation.\n"
         f"Task: {example['input']}\n"
@@ -4056,6 +4172,8 @@ def build_feedback(
         f"{tool_data_coverage_gap_lines}\n\n"
         "Checkpoint-specific evidence attribution:\n"
         f"{checkpoint_evidence_lines}\n\n"
+        "Runtime resource consumption (deterministic):\n"
+        f"{resource_consumption_lines}\n\n"
         "Successful tool evidence:\n"
         f"{successful_tool_evidence_lines}\n\n"
         "Failed tool evidence:\n"
@@ -4295,6 +4413,9 @@ def suggested_component_reason(
     if failure_classification == INSUFFICIENT_RUNTIME_EVIDENCE:
         return "evaluator-only facts are not connected to evidence observable by the runtime agent"
     if failure_classification == EXECUTION_LAPSE:
+        if resource_execution_gap(fitness):
+            unread_skill = primary_unread_skill_component(fitness) or "the configured skill"
+            return f"{suggested} owns the execution instruction needed to make `{unread_skill}` reachable"
         remediation_type = str(fitness.get("remediation_type") or "")
         if remediation_type == FIX_TOOL_RUNTIME:
             return "no text component is selected because the matching tool failed at runtime"
@@ -4385,6 +4506,10 @@ def compact_candidate_map_for_reflection(candidate: Any, limit_per_component: in
 
 def compact_feedback_for_reflection(feedback: str) -> str:
     """Drop sections already represented as structured reflection-record fields."""
+    for marker in ("\nScores:\n", "\nScores and routing:\n"):
+        if marker in feedback:
+            feedback = feedback[feedback.index(marker) + 1 :]
+            break
     duplicate_section_markers = (
         "\nWith candidate output:\n",
         "\nBaseline output:\n",

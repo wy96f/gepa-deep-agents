@@ -174,7 +174,9 @@ SKILL.md、智能体文字和最终答案中的关键词都不能作为已取得
 `evidence_mode="all"`。因此，一次成功的财务查询不会再替客户、抵押、环保等无关
 风险点解锁文本优化。`evidence_mode="any"` 只用于多种证据来源任一即可支持同一判断
 的场景。中文 checkpoint 匹配会做 Unicode、全半角、空格和标点归一化；语义同义词
-仍应由清洗器生成少量 `keywords`/aliases，而不是依赖机械分词猜测。
+可由清洗器生成少量 `keywords`/aliases 提升确定性。关键词未命中时，judge 也可按
+语义授分，但必须为该 checkpoint 引用最终 agent 输出中的精确原文，且对应运行时证据
+仍须满足；伪造引用、只有标题相似或没有证据的判断不会提高 coverage cap。
 
 checkpoint 缺失始终会降低分数；不会因为当前缺工具或信息有限就放宽覆盖 cap。低分
 和“改什么”是两个问题，框架会结合轨迹生成 `remediation_actions`：
@@ -419,6 +421,14 @@ constraints and unchanged size metrics are omitted from proposer input; their
 complete values remain in rollout artifacts. The prompt asks for an explicit
 proposal rationale before the final fenced replacement:
 
+```text
+Observed failure and runtime evidence
+Why this target owns the fix
+Reusable change and applicability
+Regression, evidence, and boundary checks
+Intended behavior change
+```
+
 Company-name keywords are treated only as weak discovery clues. Learned rules
 must require observable business or transaction evidence, and numeric
 thresholds must come from policy/evidence or be labeled as adjustable stress
@@ -434,21 +444,10 @@ unnecessary growth. It returns `ACCEPT`, `REVISE`, or `REJECT`; a rejection is
 converted to an exact no-op replacement so GEPA can reject it without running a
 memorized hidden answer.
 
-```text
-Failure pattern
-Runtime trajectory diagnosis
-Recommended remediation category
-Evidence across examples
-Selected component
-Why this component
-Why not other components
-Applicability scope and exclusions
-Cross-case regression risk
-Operational rule shape
-Boundary checks
-Hidden-data boundary check
-Intended behavior change
-```
+Judge、reflection 和 reviewer 的职责刻意不重叠：judge 只评价运行结果、验证
+checkpoint 的语义证据并定位因果责任；reflection 才负责形成具体候选改动；reviewer
+只做提交前的因果匹配、组件边界、证据完整性、泛化、输出契约和最小性检查。reviewer
+不会重新评价 agent 答案，judge 也不会起草 replacement。
 
 This is a review artifact, not hidden chain-of-thought. GEPA still extracts only
 the final fenced block as the new component text. `<side_info>`, expert data,
@@ -578,7 +577,9 @@ successful matching results count as acquired evidence.
 Keep checkpoints atomic: one checkpoint should represent one independently
 judgeable risk mechanism. For example, profitability volatility and profit
 quality should be separate checkpoints when the expert text gives separate
-evidence for both. The cleaner records `metadata.tool_coverage` as `complete`,
+evidence for both. The agent output does not need matching titles or one section
+per checkpoint: one evidence-backed paragraph may receive semantic credit for
+multiple checkpoints. The cleaner records `metadata.tool_coverage` as `complete`,
 `partial`, `none`, or `unmapped`, plus supported/total checkpoint counts. This
 makes the dataset split and post-run report distinguish learnable text defects
 from examples that primarily require new data tools. Exact numeric thresholds
@@ -691,9 +692,11 @@ The evaluator borrows useful ideas from `darwin-skill`, `hermes-agent-self-evolu
 and SkillOpt, but keeps GEPA's standard full-text candidate and Pareto search.
 
 The configured runner uses the reflection model as the primary judge by
-default. One judge call returns the score, failure classification, recommended
-component, boundary assessment, and concise feedback. Deterministic rules are
-kept deliberately narrow and mostly act as safety caps.
+default. One judge call returns the behavior score, checkpoint assessments,
+failure classification, causal trajectory diagnosis, recommended component,
+and concise feedback. It does not design the replacement. Deterministic rules
+are kept deliberately narrow and mostly act as safety caps or authoritative
+runtime facts.
 
 Hard deterministic constraints should be generic and high-confidence:
 
@@ -747,7 +750,12 @@ its declared evidence expectations were satisfied by successful runtime tool
 evidence. Explicit epistemic phrases such as `未取得…记录`, `缺少…资料`,
 `…情况未知`, `无法判断`, or `无法排除` remain data limitations and do not
 satisfy the checkpoint. Negative enterprise facts such as `无强担保` or
-`未按期还款` remain valid evidence. Scoring and mutation
+`未按期还款` remain valid evidence. The judge can recognize semantically
+equivalent coverage without forcing rubric wording or separate headings, but
+each semantic match is accepted only when its `response_evidence` is an exact
+substring of the agent output and the checkpoint's runtime evidence is ready.
+The raw judge output and validated semantic evidence are saved in
+`judge_diagnostics`. Scoring and mutation
 eligibility are separate: a missing expert
 point becomes `SKILL_DEFECT` only when a successful runtime evidence path
 exists; skipping or miscalling a supported path is `EXECUTION_LAPSE`; an
@@ -772,12 +780,16 @@ rules to avoid false positives.
 
 Feedback includes:
 
-- per-dimension scores
-- raw composite score and score caps
-- gate failures
-- with-candidate output
-- baseline output
-- adaptive trace summary
+- judge score and deterministic caps
+- matched/missing checkpoints and validated semantic excerpts
+- deterministic skill/reference read paths
+- tool acquisition, failure, result-coverage, and capability diagnostics
+- mutation eligibility, causal class, remediation action, and target component
+- gate failures and concise judge diagnosis
+
+Agent output, baseline output, expert evidence, and adaptive trace remain
+separate structured reflection-record fields rather than being duplicated in
+the feedback string.
 - trace expectation and tool capability diagnostics
 - weakest dimension
 - failure classification
@@ -827,8 +839,10 @@ minibatches return an empty component selection, so the unchanged proposal is
 rejected rather than teaching prompts to invent unavailable data. The
 no-op-aware adapter reuses the just-completed evaluation for that unchanged
 candidate, so GEPA can record the diagnostic rejection without repeating the
-same expensive agent rollouts. It also recognizes proposals that differ only in
-trailing whitespace, which can arise when GEPA extracts a fenced replacement.
+same expensive agent rollouts. It recognizes both exact replacements and
+proposals that differ only in trailing whitespace, which can arise when GEPA
+extracts a fenced replacement. The reuse cache is consumed once, so a later
+independent evaluation still runs normally.
 The gap is still saved for the tool/MCP backlog.
 
 `INSUFFICIENT_RUNTIME_EVIDENCE` means the evaluator-only opinion identifies a
@@ -840,9 +854,11 @@ independent examples before promoting the lesson.
 The component selector aggregates recommendations across feedback records. It
 prefers component keys that appear most often in low-scoring trajectories. If
 the same component is repeatedly selected for the same candidate without
-producing an accepted improvement, it cools that component down and tries
-another surface. If no valid key is found, it falls back to round-robin
-selection. `TOOL_CAPABILITY_GAP` trajectories are excluded from this vote.
+producing an accepted improvement, it cools that component down. When evaluator
+recommendations are valid but all causally related targets are exhausted, the
+selector returns no component instead of mutating an unrelated surface. It uses
+round-robin only when feedback contains no valid recommendation at all.
+`TOOL_CAPABILITY_GAP` trajectories are excluded from this vote.
 `INSUFFICIENT_RUNTIME_EVIDENCE`, `NO_FAILURE`, and any feedback explicitly
 marked `mutation_eligible: false` are excluded as well.
 
@@ -856,6 +872,12 @@ was consumed. This staged policy avoids attributing an improvement to file text
 that never entered the model context. For trajectories that do not expose file
 reads, managed learned/expert/experience references retain the static
 owning-skill dependency check.
+
+The selected reflection record includes an authoritative component-selection
+context. For an unread configured skill it names the canonical
+`/skills/<name>/SKILL.md` path and asks for only the smallest durable read/follow
+instruction in `AGENTS.md` or the system prompt; domain methodology remains in
+the existing skill/reference tree.
 
 The configured reflection minibatch size defaults to `3`, but the harness caps
 it at the number of unique optimization examples. Structurally identical
@@ -1064,6 +1086,7 @@ proposals/
     metadata.json
     reflective_dataset.json
     new_instructions.json
+    raw_new_instructions.json
     proposal_rationale.json
     proposal_rationale_missing.json
     proposal_rationale/*.txt
@@ -1126,7 +1149,8 @@ agent response, baseline response, score, fitness dimensions, constraints, and a
 serializable raw message trace. Evaluator mutations such as `fitness` are
 written back to the original rollout state before artifact export. The log also
 records the available and seed-capability tool inventories, successful/failed
-tool evidence, matched/missing trace expectations, and tool capability gaps. The
+tool evidence, matched/missing trace expectations, tool capability gaps,
+configured/consumed skill and reference components, and `judge_diagnostics`. The
 feedback prompt uses the filtered, adaptive evaluation trace, while the raw
 trace remains in the detailed rollout artifact for audit. Saving that raw file
 is not part of runtime summarization and is not required by the reflection
@@ -1167,6 +1191,10 @@ external process log.
 `proposals/` records every reflective proposal, including the rendered
 reflection prompt, raw LLM output, explicit proposal rationale, and diffs
 against both the parent candidate and the seed candidate.
+`raw_new_instructions.json` preserves what the proposer/reviewer returned;
+`new_instructions.json` contains only material changes. Exact or trailing-space
+no-ops have an empty `changed_components`, record `semantic_noop_components`,
+and do not produce a fake parent diff.
 Proposal metadata also records `component_consumption` and
 `changed_but_unconsumed`. A changed file-backed component is marked unconsumed
 when candidate trajectories expose file reads but never read that skill or

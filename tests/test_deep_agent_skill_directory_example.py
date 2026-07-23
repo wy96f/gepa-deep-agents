@@ -550,6 +550,34 @@ def test_component_selector_keeps_consumed_reference_as_single_target():
     assert selected == [reference_key]
 
 
+def test_direct_reference_read_is_not_treated_as_whole_skill_tree_unread():
+    example = _load_example_module()
+    reference_key = "skill:credit-risk-review:reference/financial_statement_analysis.md"
+    state = {
+        "candidate_excerpt": {
+            "skill:credit-risk-review:SKILL.md": "Read the relevant reference when needed.",
+            reference_key: "# Financial analysis",
+        },
+        "messages": [
+            {
+                "tool_calls": [
+                    {
+                        "name": "read_file",
+                        "args": {"path": "/skills/credit-risk-review/reference/financial_statement_analysis.md"},
+                    }
+                ]
+            }
+        ],
+    }
+
+    consumption = example.candidate_resource_consumption(state)
+
+    assert consumption["configured_skill_unread"] is True
+    assert consumption["configured_resources_unread"] is False
+    assert consumption["consumed_reference_components"] == [reference_key]
+    assert example.resource_execution_gap(consumption) is False
+
+
 def test_deployment_candidate_selection_preserves_incumbent_on_validation_tie():
     example = _load_example_module()
     result = SimpleNamespace(
@@ -730,11 +758,37 @@ def test_noop_aware_adapter_reuses_trailing_whitespace_only_proposal():
     whitespace_only = {"memory:AGENTS.md": "Keep the current behavior."}
 
     current = adapter.evaluate(batch, parent, capture_traces=True)
+    adapter.make_reflective_dataset(parent, current, ["memory:AGENTS.md"])
     reused = adapter.evaluate(batch, whitespace_only, capture_traces=True)
 
     assert rollout_calls == 1
     assert reused.scores == current.scores
     assert reused.num_metric_calls == 0
+
+
+def test_noop_aware_adapter_does_not_reuse_unrelated_repeated_evaluation():
+    example = _load_example_module()
+    rollout_calls = 0
+
+    def rollout(_candidate, _row):
+        nonlocal rollout_calls
+        rollout_calls += 1
+        return {"messages": [example.AIMessage(content="same behavior")]}
+
+    adapter = example.NoOpAwareLangChainAdapter(
+        rollout_fn=rollout,
+        eval_fn=lambda _row, _state: (0.5, "same"),
+        num_threads=1,
+        show_progress=False,
+    )
+    batch = [{"input": "example"}]
+    candidate = {"memory:AGENTS.md": "Keep the current behavior."}
+
+    adapter.evaluate(batch, candidate, capture_traces=True)
+    repeated = adapter.evaluate(batch, candidate, capture_traces=True)
+
+    assert rollout_calls == 2
+    assert repeated.scores == [0.5]
 
 
 def test_eval_caps_score_when_expected_route_is_missing(tmp_path):
@@ -861,8 +915,8 @@ def test_judge_prompt_treats_expected_as_authoritative(tmp_path):
         failures=[],
     )
 
-    assert "Expected is not `rubric-only`, treat it as the authoritative target" in prompt
-    assert "Operational troubleshooting advice instead of the expected label is a failure" in prompt
+    assert "When Expected is present, it is the authoritative target" in prompt
+    assert "do not draft replacement prompt, skill, reference, or tool text" in prompt
     assert "Expected: engineering" in prompt
 
 
@@ -899,13 +953,13 @@ def test_judge_prompt_includes_expert_data_and_trace_expectations(tmp_path):
 
     assert "Expert evaluation data:" in prompt
     assert "七、项目风险点" in prompt
-    assert "Trace expectations:" in prompt
+    assert '"trace_expectations"' in prompt
     assert "行业周期信息获取" in prompt
-    assert "Do not grow SKILL.md into an industry catalog" in prompt
-    assert "an unread reference edit cannot change behavior" in prompt
-    assert "Partial evidence may support a correspondingly narrow risk finding" in prompt
-    assert "cross_case_regression_risk" in prompt
-    assert "those fields are hidden during rollout" in prompt
+    assert "An unread reference cannot be fixed by editing it alone" in prompt
+    assert "assess semantic coverage, not headings or exact wording" in prompt
+    assert '"checkpoint_assessments"' in prompt
+    assert '"resource_consumption"' in prompt
+    assert "cross_case_regression_risk" not in prompt
 
 
 def test_adaptive_trace_summary_uses_llm_only_after_budget(monkeypatch):
@@ -1822,6 +1876,22 @@ def test_runtime_tool_evidence_can_make_missing_expert_logic_text_actionable():
                 content="",
                 tool_calls=[
                     {
+                        "name": "read_file",
+                        "args": {"file_path": "/skills/credit-risk-review/SKILL.md"},
+                        "id": "read-skill-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="已加载信贷风险审查技能。",
+                tool_call_id="read-skill-1",
+                name="read_file",
+            ),
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
                         "name": "lookup_customers",
                         "args": {"company": "示例制造企业"},
                         "id": "customers-1",
@@ -1854,6 +1924,88 @@ def test_runtime_tool_evidence_can_make_missing_expert_logic_text_actionable():
     assert state["fitness"]["failure_classification"] == "SKILL_DEFECT"
     assert state["fitness"]["remediation_type"] == "IMPROVE_SKILL_OR_REFERENCE"
     assert "- suggested_component: skill:credit-risk-review:reference/learned_expert_patterns.md" in feedback
+
+
+def test_unread_configured_skill_overrides_judge_reference_recommendation():
+    example = _load_example_module()
+    config_path = (
+        Path(__file__).parents[1]
+        / "examples"
+        / "langchain_adapter"
+        / "deepagents_gepa_configs"
+        / "credit_approval.toml"
+    )
+    project = example.build_candidate_from_deep_agent_project(example.load_deepagents_gepa_config(config_path))
+    row = {
+        "input": "示例制造企业",
+        "rubric": "识别客户集中导致的回款风险。",
+        "metadata": {
+            "checkpoints": [
+                {
+                    "label": "客户集中风险",
+                    "keywords": ["客户集中", "回款风险"],
+                    "evidence_expectations": ["客户交易信息获取"],
+                }
+            ],
+            "trace_expectations": [
+                {
+                    "label": "客户交易信息获取",
+                    "tool_names": ["lookup_customers"],
+                }
+            ],
+        },
+    }
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_customers",
+                        "args": {"company": "示例制造企业"},
+                        "id": "customers-unread-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="前五大客户占比较高, 近期回款周期延长。",
+                tool_call_id="customers-unread-1",
+                name="lookup_customers",
+            ),
+            example.AIMessage(content="当前资料需要进一步核验。"),
+        ],
+        "baseline_response": "",
+        "candidate_excerpt": project.candidate,
+        "candidate_constraints": [],
+        "available_tools": [{"owner": "main", "name": "lookup_customers", "description": "查询客户集中和回款。"}],
+    }
+    learned_key = "skill:credit-risk-review:reference/learned_expert_patterns.md"
+
+    _score, feedback = example.evaluate_response_with_judge(
+        row,
+        state,
+        lambda _prompt: json.dumps(
+            {
+                "score": 0.3,
+                "failure_classification": "SKILL_DEFECT",
+                "classification_reason": "缺少客户集中风险逻辑",
+                "mutation_eligible": True,
+                "suggested_component": learned_key,
+                "suggested_component_reason": "沉淀专家经验",
+                "trajectory_diagnosis": "工具已返回客户数据。",
+                "recommended_remediation": "补充客户集中风险规则。",
+                "checkpoint_assessments": [],
+                "feedback": "补充规则。",
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert state["fitness"]["configured_skill_unread"] is True
+    assert state["fitness"]["failure_classification"] == "EXECUTION_LAPSE"
+    assert "- suggested_component: memory:AGENTS.md" in feedback
+    assert "No configured skill/reference read was observed" in feedback
 
 
 def test_skill_defect_remains_primary_when_a_case_also_has_tool_gaps():
@@ -2179,6 +2331,129 @@ def test_rubric_checkpoint_requires_declared_runtime_evidence_when_available():
     assert matched == (["食品安全处罚"], [], 1.0)
 
 
+def test_judge_semantic_checkpoint_credit_accepts_exact_response_evidence():
+    example = _load_example_module()
+    response = "净利润先下降后回升, 年度波动明显, 盈利缺乏稳定支撑。"
+    row = {
+        "input": "示例企业",
+        "rubric": "识别盈利稳定性风险。",
+        "metadata": {
+            "checkpoints": [
+                {
+                    "label": "盈利稳定性风险",
+                    "keywords": ["利润连续稳定"],
+                    "evidence_expectations": ["财务盈利信息获取"],
+                }
+            ],
+            "trace_expectations": [
+                {
+                    "label": "财务盈利信息获取",
+                    "tool_names": ["lookup_financials"],
+                }
+            ],
+        },
+    }
+    state = {
+        "messages": [
+            example.AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_financials",
+                        "args": {"company": "示例企业"},
+                        "id": "financials-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="净利润过去三年先降后升。",
+                tool_call_id="financials-1",
+                name="lookup_financials",
+            ),
+            example.AIMessage(content=response),
+        ],
+        "baseline_response": "",
+        "candidate_excerpt": {"main:system_prompt": "仅输出有证据支持的风险点。"},
+        "candidate_constraints": [],
+        "available_tools": [{"owner": "main", "name": "lookup_financials", "description": "查询企业财务数据。"}],
+    }
+
+    score, _feedback = example.evaluate_response_with_judge(
+        row,
+        state,
+        lambda _prompt: json.dumps(
+            {
+                "score": 0.9,
+                "failure_classification": "NO_FAILURE",
+                "classification_reason": "语义覆盖盈利稳定性风险",
+                "mutation_eligible": False,
+                "suggested_component": "",
+                "checkpoint_assessments": [
+                    {
+                        "label": "盈利稳定性风险",
+                        "covered": True,
+                        "response_evidence": response,
+                        "reason": "描述利润年度波动及稳定性不足",
+                    }
+                ],
+                "feedback": "覆盖充分。",
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert score == pytest.approx(0.9)
+    assert state["fitness"]["matched_rubric_checkpoints"] == ["盈利稳定性风险"]
+    assert state["fitness"]["missing_rubric_checkpoints"] == []
+    assert state["fitness"]["judge_rubric_cap"] == 1.0
+
+
+def test_judge_semantic_checkpoint_credit_rejects_fabricated_response_evidence():
+    example = _load_example_module()
+    row = {
+        "input": "示例企业",
+        "rubric": "识别盈利稳定性风险。",
+        "metadata": {"checkpoints": [{"label": "盈利稳定性风险", "keywords": ["利润连续稳定"]}]},
+    }
+    state = {
+        "messages": [example.AIMessage(content="现有资料仅能确认企业仍在经营。")],
+        "baseline_response": "",
+        "candidate_excerpt": {"main:system_prompt": "仅输出有证据支持的风险点。"},
+        "candidate_constraints": [],
+        "available_tools": [],
+    }
+
+    score, _feedback = example.evaluate_response_with_judge(
+        row,
+        state,
+        lambda _prompt: json.dumps(
+            {
+                "score": 1.0,
+                "failure_classification": "NO_FAILURE",
+                "classification_reason": "声称已覆盖",
+                "mutation_eligible": False,
+                "suggested_component": "",
+                "checkpoint_assessments": [
+                    {
+                        "label": "盈利稳定性风险",
+                        "covered": True,
+                        "response_evidence": "企业利润大幅波动, 盈利稳定性不足。",
+                        "reason": "并非候选输出原文",
+                    }
+                ],
+                "feedback": "覆盖充分。",
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    assert score < 1.0
+    assert state["fitness"]["semantic_checkpoint_evidence"] == {}
+    assert state["fitness"]["missing_rubric_checkpoints"] == ["盈利稳定性风险"]
+    assert state["fitness"]["judge_rubric_cap"] < 1.0
+
+
 def test_strict_metric_budget_shrinks_minibatch_and_stops_before_overshoot():
     example = _load_example_module()
     rows = [{"input": f"case-{index}"} for index in range(4)]
@@ -2198,12 +2473,15 @@ def test_strict_metric_budget_shrinks_minibatch_and_stops_before_overshoot():
     assert minibatch == 1
     assert stopper(SimpleNamespace(total_num_evals=4, program_candidates=[{}])) is False
     assert stopper(SimpleNamespace(total_num_evals=10, program_candidates=[{}, {}])) is True
-    assert example.strict_budgeted_reflection_minibatch_size(
-        3,
-        rows,
-        valset_size=4,
-        metric_budget=9,
-    ) == 0
+    assert (
+        example.strict_budgeted_reflection_minibatch_size(
+            3,
+            rows,
+            valset_size=4,
+            metric_budget=9,
+        )
+        == 0
+    )
 
 
 def test_growth_limit_is_advisory_not_hard_gate(tmp_path):
@@ -2236,23 +2514,18 @@ def test_memory_reflection_template_discourages_copying_skill_content(tmp_path):
     assert "AGENTS.md does not own domain methodology" in template
     assert "change only how AGENTS.md makes the existing resource reachable" in template
     assert "Do not encode domain heuristics" in template
-    assert "Optimize only the selected component" in template
-    assert "rejected proposal lessons" in template
+    assert "The authoritative target and Component selection context determine what to fix" in template
+    assert "Use deterministic trace facts as ground truth" in template
     assert "Proposal rationale" in template
     assert "Component boundary rules" in template
-    assert "Selected component" in template
+    assert "Why this target owns the fix" in template
     assert "missing_rationale" in template
     assert "Do not start with a fenced code block" in template
-    assert "Expert data, rubrics, checkpoints" in template
-    assert "under <side_info> is optimizer-only evidence" in template
-    assert "A TOOL_CAPABILITY_GAP means no current text component" in template
-    assert "Hidden-data boundary check" in template
-    assert "Applicability scope and exclusions" in template
-    assert "Cross-case regression risk" in template
-    assert "short signal -> concern -> consequence reminder" in template
-    assert "do not expand every reminder into a fixed multi-section template" in template
-    assert "Do not force every lesson into a full trigger/evidence/analysis/consequence template" in template
-    assert "Preserve the natural language used by the current component" in template
+    assert "hidden expert data, rubrics, checkpoints" in template
+    assert "smallest reusable change supported by runtime evidence" in template
+    assert "signal -> concern -> consequence cue" in template
+    assert "fixed textbook templates" in template
+    assert "Preserve valid names, paths, frontmatter, output contracts, language" in template
     assert template.rfind("Authoritative target component: `memory:AGENTS.md`") > template.index("<side_info>")
     assert template.rfind("<curr_param>") > template.index("<side_info>")
 
@@ -2280,14 +2553,13 @@ def test_learned_reference_is_preferred_for_domain_knowledge_fallback():
     assert "observable signals or business model" in template
     assert "non-applicability" in template
     assert "signal -> concern -> consequence" in template
-    assert "non-obvious condition, evidence distinction, comparison, or transmission logic" in template
     assert "shared economic mechanism" in template
     assert "do not append one section per evaluation example" in template
     assert "Do not repeat generic finance" in template
-    assert "company name or keyword is only a weak discovery clue" in template
+    assert "entity-name keywords as discovery clues only" in template
     assert "Do not invent fixed cutoffs" in template
-    assert "unread reference needs a reachable routing instruction" in template
-    assert "evidence lists as possible sources" in template
+    assert "If a skill/reference was unread, repair reachability" in template
+    assert "Unknown or missing evidence is not an affirmative risk signal" in template
 
 
 def test_proposal_reviewer_revises_and_persists_original_and_review(tmp_path):
@@ -2752,6 +3024,44 @@ def test_artifact_callback_marks_missing_proposal_rationale(tmp_path):
     assert metadata["missing_proposal_rationale"] == ["main:system_prompt"]
     assert (tmp_path / "run" / "proposals" / "0002" / "proposal_rationale_missing.json").exists()
     assert not (tmp_path / "run" / "proposals" / "0002" / "proposal_rationale.json").exists()
+
+
+def test_artifact_callback_records_semantic_noop_without_fake_changed_component(tmp_path):
+    example = _load_example_module()
+    store = example.RunArtifactStore(tmp_path / "run")
+    callback = store.create_callback()
+    parent = {"memory:AGENTS.md": "Keep the current behavior.\n"}
+
+    callback.on_proposal_start(
+        {
+            "iteration": 3,
+            "parent_candidate": parent,
+            "components": ["memory:AGENTS.md"],
+            "reflective_dataset": {"memory:AGENTS.md": [{"Feedback": "keep current behavior"}]},
+        }
+    )
+    callback.on_proposal_end(
+        {
+            "iteration": 3,
+            "new_instructions": {"memory:AGENTS.md": "Keep the current behavior."},
+            "prompts": {"memory:AGENTS.md": "reflection prompt"},
+            "raw_lm_outputs": {
+                "memory:AGENTS.md": "Proposal rationale:\n- no valid change\n\n"
+                "Final replacement:\n```markdown\nKeep the current behavior.\n```"
+            },
+        }
+    )
+
+    proposal_dir = tmp_path / "run" / "proposals" / "0003"
+    metadata = json.loads((proposal_dir / "metadata.json").read_text(encoding="utf-8"))
+    material = json.loads((proposal_dir / "new_instructions.json").read_text(encoding="utf-8"))
+    raw = json.loads((proposal_dir / "raw_new_instructions.json").read_text(encoding="utf-8"))
+
+    assert metadata["changed_components"] == []
+    assert metadata["semantic_noop_components"] == ["memory:AGENTS.md"]
+    assert material == {}
+    assert raw == {"memory:AGENTS.md": "Keep the current behavior."}
+    assert not (proposal_dir / "diff_against_parent.patch").exists()
 
 
 def test_artifact_callback_marks_changed_reference_that_trace_did_not_read(tmp_path):
@@ -3643,9 +3953,7 @@ def test_configured_optimization_accepts_domain_override_hooks(tmp_path):
     assert artifact_summary["preflight_actionability"]["evaluated_count"] == 1
     assert artifact_summary["overall_metric_calls"] > artifact_summary["total_metric_calls"]
     assert (
-        artifact_summary["metric_calls_by_phase"]["gepa"]
-        + artifact_summary["metric_calls_by_phase"]["preflight"]
-        <= 5
+        artifact_summary["metric_calls_by_phase"]["gepa"] + artifact_summary["metric_calls_by_phase"]["preflight"] <= 5
     )
     assert artifact_summary["metric_budget_plan"]["proposal_budget_available"] is True
 

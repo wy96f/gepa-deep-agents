@@ -766,6 +766,14 @@ judge score is capped to zero. Advisory notes do not cap the score by
 themselves; they are fed to the judge so it can decide whether the issue
 actually matters.
 
+Checkpoint rows that are diagnostic-only are scored deterministically. When a
+row is mutation-ineligible because of `TOOL_CAPABILITY_GAP` or
+`INSUFFICIENT_RUNTIME_EVIDENCE`, its final optimization score is the validated
+checkpoint coverage, recorded as
+`score_source=deterministic_diagnostic_coverage`. The judge still supplies the
+diagnosis and remediation details, but score variance cannot make an unchanged
+tool-blocked trajectory look like a text improvement.
+
 Hard boundary gates catch only high-confidence bad proposals, including:
 
 ```text
@@ -865,8 +873,11 @@ marked `mutation_eligible: false` are excluded as well.
 When a selected component is a reference, the selector checks actual
 `read_file` calls in the failed trajectories. If the reference was consumed, it
 can be optimized directly. If `SKILL.md` was read but the reference was not,
-the current proposal updates only the owning skill's resource routing. If
-neither was read, it updates only the relevant prompt/memory execution surface.
+the current proposal updates only the owning skill's conditional resource
+routing and must not copy the reference lesson into `SKILL.md`. If neither was
+read, it updates only the relevant prompt/memory execution surface. A
+memory/system reachability fix should normally add or replace one skill-read
+instruction while preserving unrelated long-term context verbatim.
 The reference becomes eligible in a later iteration after the trace proves it
 was consumed. This staged policy avoids attributing an improvement to file text
 that never entered the model context. For trajectories that do not expose file

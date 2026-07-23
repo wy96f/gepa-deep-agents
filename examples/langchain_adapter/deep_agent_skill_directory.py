@@ -436,6 +436,30 @@ def component_selection_context(
                 "do_not": "Do not move the missing domain lesson, checkpoint wording, or reference body into this surface.",
             }
         )
+    elif (
+        evaluator_suggestion
+        and ":reference/" in evaluator_suggestion
+        and selected_component == evaluator_suggestion.split(":reference/", maxsplit=1)[0] + ":SKILL.md"
+    ):
+        relative_reference = "reference/" + evaluator_suggestion.split(":reference/", maxsplit=1)[1]
+        context.update(
+            {
+                "selection_reason": "the owning skill was read, but the evaluator-suggested reference was not",
+                "resource_read_facts": {
+                    "read_paths": list(fitness.get("runtime_read_paths") or []),
+                    "consumed_skills": list(fitness.get("consumed_skill_components") or []),
+                    "consumed_references": list(fitness.get("consumed_reference_components") or []),
+                },
+                "required_change": (
+                    f"Add only the smallest conditional routing instruction that makes the skill read "
+                    f"`{relative_reference}` when observable runtime signals make it relevant."
+                ),
+                "do_not": (
+                    "Do not copy the reference's domain lesson, evaluator checkpoint wording, company facts, or "
+                    "sample-derived thresholds into SKILL.md."
+                ),
+            }
+        )
     elif evaluator_suggestion and evaluator_suggestion != selected_component:
         context.update(
             {
@@ -3083,6 +3107,13 @@ def evaluate_response(example: dict[str, Any], state: dict) -> tuple[float, str]
     fitness["failure_classification"] = failure_classification
     fitness["classification_reason"] = classification_reason
     fitness.update(remediation_diagnostics(failure_classification, failures, fitness))
+    diagnostic_score = diagnostic_only_checkpoint_score(example, fitness, failure_classification)
+    if diagnostic_score is not None:
+        composite = diagnostic_score
+        fitness["composite"] = diagnostic_score
+        fitness["score_source"] = "deterministic_diagnostic_coverage"
+    else:
+        fitness["score_source"] = "deterministic_composite"
     state["fitness"] = fitness
     feedback = build_feedback(example, state, response, baseline_response, failures, fitness)
     return composite, feedback
@@ -3305,6 +3336,19 @@ def evaluate_response_with_judge(
     fitness["failure_classification"] = judged_classification
     fitness["classification_reason"] = classification_reason
     fitness.update(remediation_diagnostics(judged_classification, failures, fitness))
+    fitness["suggested_component"] = suggested
+    fitness["suggested_component_reason"] = suggested_component_reason(
+        judged_classification,
+        suggested,
+        weakest_dimension(fitness, failures),
+        failures,
+        fitness,
+    )
+    diagnostic_score = diagnostic_only_checkpoint_score(example, fitness, judged_classification)
+    if diagnostic_score is not None:
+        score = diagnostic_score
+        fitness["composite"] = score
+        fitness["score_source"] = "deterministic_diagnostic_coverage"
     state["fitness"] = fitness
     return score, build_judge_feedback(
         example=example,
@@ -3423,6 +3467,21 @@ def build_judge_prompt(
         "Candidate component excerpts:\n"
         f"{compact_candidate_excerpt(candidate, limit_per_component=400)}"
     )
+
+
+def diagnostic_only_checkpoint_score(
+    example: Mapping[str, Any],
+    fitness: Mapping[str, Any],
+    failure_classification: str,
+) -> float | None:
+    """Return a stable score when a checkpoint row can diagnose, but not teach, a text mutation."""
+    if (
+        not rubric_checkpoints(example)
+        or bool(fitness.get("mutation_eligible", True))
+        or failure_classification not in {TOOL_CAPABILITY_GAP, INSUFFICIENT_RUNTIME_EVIDENCE}
+    ):
+        return None
+    return max(0.0, min(1.0, float(fitness.get("rubric_coverage", 0.0))))
 
 
 def compact_candidate_excerpt(candidate: dict[str, str], limit_per_component: int = 700) -> str:
@@ -3561,7 +3620,8 @@ def build_judge_feedback(
     fitness = state.get("fitness", {})
     mutation_eligible = bool(fitness.get("mutation_eligible", True))
     suggested_reason = str(
-        payload.get("suggested_component_reason")
+        fitness.get("suggested_component_reason")
+        or payload.get("suggested_component_reason")
         or fitness.get("mutation_eligibility_reason")
         or "evaluator causal routing"
     )
@@ -4139,6 +4199,8 @@ def build_feedback(
         f"- rubric_coverage: {fitness.get('rubric_coverage', 1.0):.2f}\n"
         f"- trace_expectation_coverage: {fitness.get('trace_expectation_coverage', 1.0):.2f}\n"
         f"- constraint_cap: {fitness.get('constraint_cap', 1.0):.2f}\n"
+        f"- final_score: {fitness['composite']:.2f}\n"
+        f"- score_source: {fitness.get('score_source', 'deterministic_composite')}\n"
         f"- eval_mode: {fitness['eval_mode']}\n"
         f"- weakest_dimension: {weakest}\n"
         f"- failure_classification: {failure_classification}\n"
@@ -4428,7 +4490,9 @@ def suggested_component_reason(
         return f"{suggested} can remind the agent to use already-available skills, references, and tools"
     if failures:
         return "the component is attached to the first hard-gate failure"
-    if weakest == "effect":
+    if failure_classification == SKILL_DEFECT and fitness.get("runtime_supported_missing_checkpoints"):
+        return f"{suggested} owns the reusable analysis or routing needed for runtime-supported missing checkpoints"
+    if weakest in {"effect", "rubric_coverage"}:
         return "task output is weak, so update the most relevant task knowledge surface"
     if weakest == "specificity":
         return "component contains softened language that can be made more actionable"

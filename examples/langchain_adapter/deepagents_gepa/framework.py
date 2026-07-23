@@ -11,6 +11,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from math import isclose
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -438,7 +439,9 @@ class DefaultReflectionTemplateRegistry:
                 "expert knowledge. When a domain reference is unread or unreachable, make only the smallest "
                 "execution-layer change needed to activate the owning skill/reference; do not move the domain lesson "
                 "into memory. It may name the existing skill or its canonical SKILL.md path when deterministic trace "
-                "evidence shows that ordinary routing was ignored. Avoid large growth unless the feedback requires it."
+                "evidence shows that ordinary routing was ignored. Preserve unrelated current text verbatim; a "
+                "reachability repair should normally add or replace only one instruction. Avoid large growth unless "
+                "the feedback requires it."
             )
         if key.endswith(":SKILL.md"):
             return (
@@ -577,7 +580,8 @@ class DefaultProposalReviewer:
             "1. Causal fit: the edit materially addresses the authoritative Component selection context. Deterministic "
             "resource-read and tool facts override model prose. If an execution surface was selected because a known "
             "skill was unread, a concise instruction to read that skill is valid; do not reject it merely because domain "
-            "knowledge remains owned by a reference.\n"
+            "knowledge remains owned by a reference. Preserve unrelated current text instead of restructuring the whole "
+            "memory or prompt for a one-instruction reachability fix.\n"
             "2. Ownership: prompts/memory own execution and routing, SKILL.md owns invariant workflow, references own "
             "scoped domain cues, and tool descriptions own invocation semantics. Do not copy another component's body.\n"
             "3. Evidence integrity: reject hidden case facts, invented capabilities or paths, unsupported thresholds, and "
@@ -622,6 +626,12 @@ class DefaultProposalReviewer:
         global_surface = component.startswith("memory:") or component.endswith(":system_prompt")
         if current.rstrip() == replacement.rstrip():
             issues.append("replacement is a semantic no-op; reject it instead of spending a rollout")
+        reachability_fix = "configured skill was not read; repair execution-layer reachability" in reflection_prompt
+        if global_surface and reachability_fix and SequenceMatcher(None, current, replacement).ratio() < 0.80:
+            issues.append(
+                "reachability fix rewrites unrelated current text; preserve it verbatim and add or replace only the "
+                "minimal skill-read instruction"
+            )
         if global_surface and growth > 1.0 and len(replacement) - len(current) > 300:
             issues.append(
                 f"global surface grows from {len(current)} to {len(replacement)} chars ({growth:+.0%}); revise to the "

@@ -520,6 +520,30 @@ def test_component_selector_routes_from_consumed_skill_to_unread_reference():
     assert selected == [skill_key]
 
 
+def test_component_selection_context_limits_unread_reference_fix_to_skill_routing():
+    example = _load_example_module()
+    reference_key = "skill:credit-risk-review:reference/financial_statement_analysis.md"
+    skill_key = "skill:credit-risk-review:SKILL.md"
+    candidate = {
+        skill_key: "Read the relevant reference when needed.",
+        reference_key: "# Financial analysis",
+    }
+    record = {
+        "Feedback": f"Scores:\n- failure_classification: SKILL_DEFECT\n- suggested_component: {reference_key}",
+        "Fitness": {
+            "runtime_read_paths": ["/skills/credit-risk-review/SKILL.md"],
+            "consumed_skill_components": [skill_key],
+            "consumed_reference_components": [],
+        },
+    }
+
+    context = example.component_selection_context(skill_key, record, candidate)
+
+    assert context["selection_reason"] == "the owning skill was read, but the evaluator-suggested reference was not"
+    assert "`reference/financial_statement_analysis.md`" in context["required_change"]
+    assert "Do not copy the reference's domain lesson" in context["do_not"]
+
+
 def test_component_selector_keeps_consumed_reference_as_single_target():
     example = _load_example_module()
     reference_key = "skill:credit-risk-review:reference/financial_statement_analysis.md"
@@ -1772,8 +1796,10 @@ def test_checkpoint_with_unavailable_tool_does_not_select_learned_reference():
         ],
     }
 
-    _score, feedback = example.evaluate_response(row, state)
+    score, feedback = example.evaluate_response(row, state)
 
+    assert score == 0.0
+    assert state["fitness"]["score_source"] == "deterministic_diagnostic_coverage"
     assert state["fitness"]["failure_classification"] == "TOOL_CAPABILITY_GAP"
     assert state["fitness"]["mutation_eligible"] is False
     assert state["fitness"]["tool_capability_gaps"] == ["客户交易信息获取"]
@@ -1818,7 +1844,7 @@ def test_reflection_judge_cannot_override_unavailable_tool_gap_into_text_mutatio
         ],
     }
 
-    _score, feedback = example.evaluate_response_with_judge(
+    score, feedback = example.evaluate_response_with_judge(
         row,
         state,
         lambda _prompt: json.dumps(
@@ -1834,8 +1860,11 @@ def test_reflection_judge_cannot_override_unavailable_tool_gap_into_text_mutatio
         ),
     )
 
+    assert score == 0.0
     assert state["fitness"]["failure_classification"] == "TOOL_CAPABILITY_GAP"
     assert state["fitness"]["mutation_eligible"] is False
+    assert state["fitness"]["score_source"] == "deterministic_diagnostic_coverage"
+    assert "- score_source: deterministic_diagnostic_coverage" in feedback
     assert "- suggested_component: none" in feedback
     assert "- mutation_eligible: false" in feedback
 
@@ -2229,9 +2258,10 @@ def test_reflection_judge_score_is_capped_by_missing_rubric_checkpoints(tmp_path
         ),
     )
 
-    assert score == 0.45
+    assert score == pytest.approx(1 / 3)
     assert "- rubric_cap: 0.45" in feedback
     assert "- rubric_coverage: 0.33" in feedback
+    assert "- score_source: deterministic_diagnostic_coverage" in feedback
     assert "- failure_classification: INSUFFICIENT_RUNTIME_EVIDENCE" in feedback
     assert "- mutation_eligible: false" in feedback
     assert "- suggested_component: none" in feedback
@@ -2609,6 +2639,30 @@ def test_proposal_reviewer_revises_and_persists_original_and_review(tmp_path):
     assert (detail_dir / "reviewed_proposal.txt").read_text(encoding="utf-8") == revised
     second_detail_dir = tmp_path / "run" / review_index[1]["detail_dir"]
     assert (second_detail_dir / "original_proposal.txt").read_text(encoding="utf-8") == revised
+
+
+def test_proposal_reviewer_flags_broad_rewrite_for_skill_reachability_fix():
+    example = _load_example_module()
+    prompt = (
+        "Component boundary rules for `memory:AGENTS.md`:\n"
+        "Component selection context:\n"
+        '{"selection_reason":"configured skill was not read; repair execution-layer reachability first"}\n\n'
+        "Current target component (this is the only text you may replace):\n"
+        "```\n# Existing memory\n\nKeep the tone, policy, and all unrelated instructions unchanged.\n```\n\n"
+        "Before answering, verify the replacement."
+    )
+    proposal = (
+        "Proposal rationale:\n- make the skill reachable\n\n"
+        "Final replacement:\n```markdown\n"
+        "# Entirely rewritten operating manual\n\n"
+        "A new structure, new voice, and many unrelated policies. Read /skills/risk/SKILL.md before answering.\n"
+        "```"
+    )
+
+    advisory = example.DefaultProposalReviewer._deterministic_advisory(prompt, proposal)
+
+    assert "reachability fix rewrites unrelated current text" in advisory
+    assert "minimal skill-read instruction" in advisory
 
 
 def test_proposal_reviewer_rejects_to_exact_no_change():
